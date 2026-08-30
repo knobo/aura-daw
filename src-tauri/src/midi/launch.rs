@@ -27,9 +27,17 @@ pub enum LaunchTarget {
         #[serde(alias = "track_ids")]
         track_ids: Vec<String>,
     },
+    /// Kept so a project saved before Task 12's migration still
+    /// deserializes; nothing in this crate constructs one any more.
     Clip {
         #[serde(alias = "clip_id")]
         clip_id: String,
+    },
+    /// Plan V: the binding fires a player. What a `Clip` target becomes on
+    /// open — see [`migrate_clip_targets_to_players`].
+    Player {
+        #[serde(alias = "player_id")]
+        player_id: crate::ids::PlayerId,
     },
 }
 
@@ -112,6 +120,91 @@ pub fn migrate_legacy_maps(
     vec![m]
 }
 
+/// The instrument the clip's source track rendered through, in
+/// `TrackState::instrument_id`'s own vocabulary — what a migrated player
+/// must keep so the pad sounds the same as it did through the track.
+fn instrument_of_track(
+    tracks: &[crate::audio::types::TrackState],
+    track_id: &crate::ids::TrackId,
+) -> Option<String> {
+    tracks.iter().find(|t| &t.id == track_id).and_then(|t| t.instrument_id.clone())
+}
+
+/// Turn every resolvable `LaunchTarget::Clip` into a player (Plan V, V2's
+/// migration gate — Task 12). Idempotent: a binding already pointing at a
+/// player is left alone, so running this twice over the same maps/players
+/// (an unsaved re-open, or a stray double call) mints no second player —
+/// the second pass finds nothing left to convert.
+///
+/// Bindings that name the SAME clip share ONE player — a drum kit's two
+/// pads on one clip is one instrument, and a player that already exists for
+/// that clip (loaded from a previously-saved migration) is reused rather
+/// than re-minted, which is what keeps identity stable across a save/reload
+/// instead of just the count.
+///
+/// A binding whose clip is gone is left EXACTLY as it was — still a `Clip`
+/// target, still dangling — rather than dropped. Before this migration
+/// existed, pressing such a pad did nothing but `log::warn!` (see
+/// `launch_fire_from`'s `Clip` arm); dropping the binding here would be
+/// LOUDER at open time (this same `log::warn!`, moved earlier) but far
+/// LESS recoverable, since the user's note-to-pad mapping would be gone
+/// rather than sitting there, still editable, waiting for a rebind. Failing
+/// the whole open over one dangling reference is worse still — that loses
+/// every OTHER binding in the project too.
+pub fn migrate_clip_targets_to_players(
+    maps: &mut [LaunchMap],
+    midi_clips: &[crate::midi::MidiClip],
+    tracks: &[crate::audio::types::TrackState],
+    players: &mut Vec<crate::audio::player::Player>,
+) -> usize {
+    use crate::audio::player::{Player, PlayerSource};
+
+    let mut by_clip: std::collections::HashMap<String, crate::ids::PlayerId> = players
+        .iter()
+        .filter_map(|p| match &p.source {
+            PlayerSource::MidiClip { clip_id, .. } => Some((clip_id.to_string(), p.id.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut migrated = 0usize;
+
+    for map in maps.iter_mut() {
+        for b in map.bindings.iter_mut() {
+            let LaunchTarget::Clip { clip_id } = &b.target else {
+                continue;
+            };
+            let Some(clip) = midi_clips.iter().find(|c| c.id.as_str() == clip_id.as_str()) else {
+                log::warn!(
+                    "launch: binding {} ({}) names a clip that is gone ({clip_id}); leaving it unbound",
+                    b.id,
+                    b.name
+                );
+                continue;
+            };
+            let clip_id = clip_id.clone();
+            let player_id = by_clip
+                .entry(clip_id)
+                .or_insert_with(|| {
+                    let mut p = Player::new(
+                        crate::ids::PlayerId::for_migrated_clip(clip.id.as_str()),
+                        b.name.clone(),
+                    );
+                    p.source = PlayerSource::MidiClip {
+                        clip_id: clip.id.clone(),
+                        instrument_id: instrument_of_track(tracks, &clip.track_id),
+                    };
+                    let id = p.id.clone();
+                    players.push(p);
+                    id
+                })
+                .clone();
+            b.target = LaunchTarget::Player { player_id };
+            migrated += 1;
+        }
+    }
+    migrated
+}
+
 pub fn all_bindings(maps: &[LaunchMap]) -> Vec<LaunchBinding> {
     maps.iter()
         .flat_map(|m| m.bindings.iter().cloned())
@@ -178,6 +271,54 @@ pub fn drive_in_window(sample: u64, last: u64, pos: u64, play_edge: bool) -> boo
     }
 }
 
+/// Which endings this poll owes the worker a `Release`, and the memory that
+/// keeps the edge an EDGE. `sounding` is the runtime's ledger; `still_on`
+/// answers whether that binding's clock is running.
+///
+/// The drive loop calls this and its test calls this — the same three lines,
+/// not a copy. The first version of the edge memory lived inline in the loop
+/// and its test re-implemented it; the copy had the identical defect, so the
+/// test passed while production was broken (fix round 2, finding 2). A test
+/// that cannot fail for the reason it exists is worse than no test.
+///
+/// TWO rules, and only one of them is about correctness:
+///
+/// * `sent.remove` on the ON EDGE. A binding that is sounding again has spent
+///   whatever we sent for its previous ending. Without this, an id that is
+///   announced and re-fired inside one 8 ms poll gap is still in the ledger
+///   when the next poll runs, so the memory keeps it, and every LATER ending
+///   of that binding is swallowed: no `LaunchFired { playing: false }` ever
+///   reaches the frontend, the pad stays lit, and the id sticks in the ledger
+///   until a transport stop clears it. Retriggering a pad as its clip ends is
+///   ordinary launcher use, and a drive clip with a repeating note does it by
+///   itself.
+/// * `retain` against the ledger is hygiene, not correctness: it bounds the
+///   set to what is actually sounding rather than to every binding ever
+///   fired. It is NOT what makes the edge work — it cannot be, because it
+///   sees the re-fired id as still present.
+///
+/// One `Release` per ending matters because `enqueue_release` is a `try_send`
+/// into an 8-slot channel SHARED with `FireCmd::Start`: duplicates of one
+/// ending fill it and silently drop the user's next pad press.
+pub fn releases_to_enqueue(
+    sent: &mut std::collections::HashSet<String>,
+    sounding: &[String],
+    mut still_on: impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    sent.retain(|id| sounding.iter().any(|s| s == id));
+    let mut out = Vec::new();
+    for id in sounding {
+        if still_on(id) {
+            sent.remove(id);
+            continue;
+        }
+        if sent.insert(id.clone()) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
 /// Clip-as-instrument: match the written key only. Binding `channel` is a
 /// hardware MIDI-in filter; a drive clip must still fire `channel: Some(n)`.
 pub fn resolve_drive<'a>(bindings: &'a [LaunchBinding], key: u8) -> Option<&'a LaunchBinding> {
@@ -239,6 +380,37 @@ pub fn clip_would_self_trigger(
         .any(|(key, ch)| *key == trigger_note && trigger_channel.map(|c| c == *ch).unwrap_or(true))
 }
 
+/// The live drive-loop guard: does firing `target` fire the clip that is
+/// driving it right now? A same-clip `Clip` target names the clip
+/// directly; a `Player` target (what `Clip` becomes on migration) has to
+/// be resolved through `players` to its `PlayerSource::MidiClip`'s
+/// `clip_id` instead. `Region` never self-triggers — a scene names
+/// tracks, never the driving clip.
+///
+/// Extracted so the drive loop and its test call the SAME match, not a
+/// copy (this file's own rule, see `releases_to_enqueue`'s doc): fix
+/// round 1, Important 3 found this guard as an inline `if let` matching
+/// only `Clip`, so a migrated `Player` target never hit it and re-fired
+/// its own player on every drive note-on for the clip it plays.
+pub fn binding_self_triggers(
+    target: &LaunchTarget,
+    players: &[crate::audio::player::Player],
+    driving_clip_id: &str,
+) -> bool {
+    match target {
+        LaunchTarget::Clip { clip_id } => clip_id.as_str() == driving_clip_id,
+        LaunchTarget::Player { player_id } => players.iter().any(|p| {
+            &p.id == player_id
+                && matches!(
+                    &p.source,
+                    crate::audio::player::PlayerSource::MidiClip { clip_id, .. }
+                        if clip_id.as_str() == driving_clip_id
+                )
+        }),
+        LaunchTarget::Region { .. } => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FireOrigin {
@@ -287,8 +459,16 @@ pub struct LaunchRuntime {
     last_learn: Mutex<Option<(u8, u8)>>,
     gen: AtomicU64,
     drive_started: AtomicBool,
-    audible_tracks: Mutex<Vec<String>>,
-    overlay_id: Mutex<Option<String>>,
+    /// Every binding whose scene is currently sounding, as far as the
+    /// FRONTEND has been told. Plural since Task 8: scenes each own a clock
+    /// now, so any number of them can sound at once — this was
+    /// `overlay_id: Option<String>` for exactly as long as there was one
+    /// shadow playhead to be in.
+    ///
+    /// It is not the truth about what is playing (the clock table is); it is
+    /// the drive thread's ledger of which endings it still owes a
+    /// `LaunchFired { playing: false }`, so an ending is announced once.
+    sounding: Mutex<std::collections::HashSet<String>>,
     drive_focus: Mutex<Option<String>>,
 }
 
@@ -304,8 +484,7 @@ impl Default for LaunchRuntime {
             last_learn: Mutex::new(None),
             gen: AtomicU64::new(0),
             drive_started: AtomicBool::new(false),
-            audible_tracks: Mutex::new(Vec::new()),
-            overlay_id: Mutex::new(None),
+            sounding: Mutex::new(std::collections::HashSet::new()),
             drive_focus: Mutex::new(None),
         }
     }
@@ -360,25 +539,28 @@ impl LaunchRuntime {
         *self.fire_tx.lock() = Some(tx);
     }
 
-    pub fn set_audible_tracks(&self, ids: Vec<String>) {
-        *self.audible_tracks.lock() = ids;
+    /// Record that this binding's scene has been fired. Called AFTER the
+    /// clock is actually running, so the drive thread's release edge — "in
+    /// the ledger, but its clock is off" — cannot fire on the gap between
+    /// the two and announce an ending that never happened.
+    pub fn mark_sounding(&self, id: &str) {
+        self.sounding.lock().insert(id.to_string());
     }
 
-    pub fn audible_tracks(&self) -> Vec<String> {
-        self.audible_tracks.lock().clone()
+    /// Take this binding out of the ledger, reporting whether it was in it.
+    /// False means its ending has already been announced, which is what
+    /// makes `stop_drive_launch` idempotent — the guard
+    /// `overlay_id == Some(id)` used to be.
+    pub fn take_sounding(&self, id: &str) -> bool {
+        self.sounding.lock().remove(id)
     }
 
-    pub fn clear_audible_tracks(&self) {
-        self.audible_tracks.lock().clear();
-        *self.overlay_id.lock() = None;
+    pub fn sounding_ids(&self) -> Vec<String> {
+        self.sounding.lock().iter().cloned().collect()
     }
 
-    pub fn set_overlay_id(&self, id: Option<String>) {
-        *self.overlay_id.lock() = id;
-    }
-
-    pub fn overlay_id(&self) -> Option<String> {
-        self.overlay_id.lock().clone()
+    pub fn clear_sounding(&self) {
+        self.sounding.lock().clear();
     }
 
     pub fn set_drive_focus(&self, id: Option<String>) {
@@ -415,10 +597,15 @@ impl LaunchRuntime {
 
     /// Watch the transport and fire launch bindings from clips marked as
     /// launch-map instruments. Hardware `armed` is not involved.
+    /// `tables` is here for the release edge below: whether a scene is still
+    /// sounding is a property of the CURRENT graph's clock table now
+    /// (Plan V — V2), not of a `SharedRt` atomic, so it has to be read where
+    /// the truth lives.
     pub fn attach_drive(
         &self,
         shared: Arc<crate::audio::rt::SharedRt>,
         session: Arc<parking_lot::Mutex<crate::control::Session>>,
+        tables: crate::audio::rt::SharedGraphTables,
     ) {
         if self.drive_started.swap(true, Relaxed) {
             return;
@@ -431,16 +618,32 @@ impl LaunchRuntime {
                 let mut play_started = Instant::now();
                 let mut last_onset: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
-                let mut overlay_was_on = false;
+                // Ids already put on the fire channel as a Release — see
+                // `releases_to_enqueue`, which owns the edge logic so that
+                // this loop and its test run the same code.
+                let mut release_sent: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
-                    let overlay_on = shared.launch_on.load(Relaxed);
-                    if overlay_was_on && !overlay_on {
-                        if let Some(id) = runtime().overlay_id() {
-                            runtime().enqueue_release(id);
-                        }
+                    // The release edge, once per sounding scene. Task 8 made
+                    // this a set rather than one `overlay_was_on` bool: N
+                    // scenes each own a clock, so N of them can reach their
+                    // end independently, and each owes the frontend its own
+                    // `LaunchFired { playing: false }`.
+                    let sounding = runtime().sounding_ids();
+                    for id in releases_to_enqueue(&mut release_sent, &sounding, |id| {
+                        let t = tables.lock();
+                        t.scene_clocks.get(id).is_some_and(|&c| t.clocks.is_on(c))
+                    }) {
+                        runtime().enqueue_release(id);
                     }
-                    overlay_was_on = overlay_on;
+                    // The other half of every ending: hand the tracks back,
+                    // but only once a rendered block has delivered the
+                    // `all_notes_off` the cut left behind. See
+                    // `GraphTables::release_finished_scenes` — this is the
+                    // only caller, and the only place a scene's slots are
+                    // released.
+                    tables.lock().release_finished_scenes();
                     let playing = shared.playing.load(Relaxed);
                     let pos = shared.position.load(Relaxed);
                     if !playing {
@@ -489,7 +692,7 @@ impl LaunchRuntime {
                         last = pos;
                         continue;
                     }
-                    let (clips, ppq, tempo, live_tracks) = {
+                    let (clips, ppq, tempo, live_tracks, players) = {
                         let s = session.lock();
                         let live_tracks: std::collections::HashSet<String> = s
                             .store
@@ -497,7 +700,13 @@ impl LaunchRuntime {
                             .iter()
                             .map(|t| t.id.to_string())
                             .collect();
-                        (s.midi.clips.clone(), s.midi.ppq, s.midi.tempo_events.clone(), live_tracks)
+                        (
+                            s.midi.clips.clone(),
+                            s.midi.ppq,
+                            s.midi.tempo_events.clone(),
+                            live_tracks,
+                            s.store.players.clone(),
+                        )
                     };
                     let Ok(tempo_map) =
                         crate::midi::TempoMap::new(ppq, tempo, shared.sample_rate.load(Relaxed).max(1))
@@ -542,10 +751,8 @@ impl LaunchRuntime {
                                 let Some(b) = resolve_drive(&launcher.bindings, ev.key) else {
                                     continue;
                                 };
-                                if let LaunchTarget::Clip { clip_id } = &b.target {
-                                    if clip_id == clip.id.as_str() {
-                                        continue;
-                                    }
+                                if binding_self_triggers(&b.target, &players, clip.id.as_str()) {
+                                    continue;
                                 }
                                 if ev.velocity == 0 {
                                     if launcher.play_mode == LaunchPlayMode::Gate
@@ -730,6 +937,22 @@ impl crate::control::ControlPlane {
     }
 
     pub fn launch_fire_from(&self, id: &str, origin: FireOrigin) -> Result<(), String> {
+        let player_target = {
+            let s = self.session().lock();
+            let (_, b) = find_binding(&s.midi.launch_maps, id)
+                .ok_or_else(|| format!("unknown launch binding: {id}"))?;
+            match &b.target {
+                LaunchTarget::Player { player_id } => Some(player_id.clone()),
+                _ => None,
+            }
+        };
+        if let Some(player_id) = player_target {
+            // A player owns its own clock and playhead (V-1) and is fired
+            // through `player_fire`, not `fire_scene` — none of the
+            // scene bookkeeping below (tick resolution, track hijack,
+            // `LaunchFired`) applies to it.
+            return self.player_fire(player_id.as_str());
+        }
         let rate = self.transport_state().sample_rate;
         let (start_ticks, length_ticks, ppq, events, track_ids, name) = {
             let s = self.session().lock();
@@ -755,6 +978,7 @@ impl crate::control::ControlPlane {
                         vec![c.track_id.to_string()],
                     )
                 }
+                LaunchTarget::Player { .. } => unreachable!("handled by the early return above"),
             };
             (
                 start_ticks,
@@ -770,35 +994,29 @@ impl crate::control::ControlPlane {
         let end = map
             .tick_to_samples(start_ticks.saturating_add(length_ticks))
             .max(start + 1);
-        runtime().set_audible_tracks(track_ids.clone());
         log::info!(
             "launch: fire id={id} name={name} origin={origin:?} start={start} end={end} tracks={track_ids:?}"
         );
-        match origin {
-            FireOrigin::Drive => {
-                // Keep the arrangement loop and playhead on the clip.
-                // Retrigger rewinds the single overlay (v0.1 has no overlap).
-                runtime().set_overlay_id(Some(id.to_string()));
-                self.arm_drive_launch(&track_ids, start, end);
-            }
-            FireOrigin::Preview => {
-                runtime().set_overlay_id(Some(id.to_string()));
-                self.arm_drive_launch(&track_ids, start, end);
-            }
-            FireOrigin::Hardware => {
-                self.clear_drive_overlay();
-                self.apply_launch_audible(&track_ids);
-                self.transport(crate::control::TransportAction::SetLoop {
-                    enabled: true,
-                    start_samples: start,
-                    end_samples: end,
-                })?;
-                self.transport(crate::control::TransportAction::Seek {
-                    position_samples: start,
-                })?;
-                self.transport(crate::control::TransportAction::Play)?;
-            }
+        // Every origin now does the same thing, because the reason they
+        // differed is gone: `Hardware` used to SetLoop + Seek + Play on the
+        // arrangement transport (design §2.2), which moved the user's
+        // playhead every time they touched a pad. It only ever did that
+        // because there was ONE shadow playhead to share and the transport's
+        // was it. A scene has its own clock now, so firing one is firing one,
+        // whoever pressed it.
+        if !self.fire_scene(id, &track_ids, start, end) {
+            // Dropped, because the graph has not been rebuilt since this
+            // binding was added. Say nothing to the frontend either: a
+            // `LaunchFired { playing: true }` for a scene that is not
+            // sounding lights the launcher up with no ending to switch it
+            // off, since nothing releases a scene that never entered the
+            // ledger. The warn in `fire_scene` is the whole report.
+            return Ok(());
         }
+        // AFTER the clock is running: the drive thread's release edge is
+        // "in the ledger, clock off", and marking first would let a poll
+        // landing in between announce an ending that never happened.
+        runtime().mark_sounding(id);
         self.emit_launch_fired(LaunchFired {
             id: id.to_string(),
             name,
@@ -812,12 +1030,21 @@ impl crate::control::ControlPlane {
         Ok(())
     }
 
+    /// One scene has ended (its clip ran out, a gate note lifted, or a
+    /// stop-all cut it): hand its tracks back to the arrangement and tell the
+    /// frontend. The ledger take is the idempotence guard — the drive thread
+    /// may enqueue the same release twice, and the frontend must be told once.
     pub fn stop_drive_launch(&self, id: &str) {
-        if runtime().overlay_id().as_deref() != Some(id) {
+        if !runtime().take_sounding(id) {
             return;
         }
         launch_trace(format!("drive stop {id}"));
-        self.clear_launch_audible();
+        // CUT, not released: the Gate path reaches here with the clock still
+        // RUNNING (a note-off lifting mid-clip), so `stop` latches a
+        // discontinuity the nodes have not read yet. The drive poll's
+        // `release_finished_scenes` hands the tracks back once a rendered
+        // block has delivered it.
+        self.cut_scene(id);
         self.emit_launch_fired(LaunchFired {
             id: id.to_string(),
             name: String::new(),
@@ -1046,6 +1273,24 @@ mod tests {
                 length_ticks: 2,
                 track_ids: vec!["t".into()],
             }
+        );
+
+        // Player crosses to TypeScript (Task 12): the wire form is pinned
+        // explicitly, not just proven symmetric under Rust's own
+        // serialize/deserialize — a round-trip through this crate alone
+        // would pass even if the frontend expected a different key.
+        let player: LaunchTarget =
+            serde_json::from_str(r#"{"kind":"player","playerId":"p-1"}"#).unwrap();
+        assert_eq!(
+            player,
+            LaunchTarget::Player {
+                player_id: crate::ids::PlayerId::from("p-1")
+            }
+        );
+        let player_wire = serde_json::to_value(&player).unwrap();
+        assert_eq!(
+            player_wire,
+            serde_json::json!({"kind": "player", "playerId": "p-1"})
         );
     }
 
@@ -1391,6 +1636,831 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "exactly two fires — one per play edge"
+        );
+    }
+    // -----------------------------------------------------------------
+    // Plan V — V2, Task 8: a scene owns its clock. These drive a real
+    // `ControlPlane` (no engine thread) with the `GraphTables` a rebuild
+    // would have published for the same document — see `plane`.
+    // -----------------------------------------------------------------
+
+    fn region_on(id: &str, note: u8, tracks: &[&str]) -> LaunchBinding {
+        LaunchBinding {
+            id: id.into(),
+            name: id.into(),
+            note,
+            channel: None,
+            target: LaunchTarget::Region {
+                start_ticks: 0,
+                length_ticks: 960,
+                track_ids: tracks.iter().map(|t| (*t).to_string()).collect(),
+            },
+        }
+    }
+
+    /// A `ControlPlane` over `tracks` and `bindings`, plus the `GraphTables`
+    /// `engine::rebuild` would have published for that document: params and
+    /// clocks sized to the mixer slots, the slot map, and one clock per
+    /// Region binding numbered exactly as `rebuild` numbers them.
+    ///
+    /// Building the tables by hand is not a shortcut — there is no engine
+    /// thread in a unit test, so nothing would ever publish one, and every
+    /// clock write would silently drop (`fire_scene` warns and returns false
+    /// on a binding with no clock). Same reasoning as
+    /// `control::mod::tests::test_plane_with_tracks`, which cannot be reused
+    /// here: it is private to that module's `#[cfg(test)] mod tests`.
+    ///
+    /// The `EngineHandle` receiver is returned, not dropped: `transport`
+    /// commits send on that channel, and a disconnected one silently eats
+    /// them. The emitted-events sink is returned for the same reason — a
+    /// fire's whole visible output to the frontend is `launch://fired`.
+    ///
+    /// `LaunchRuntime` is a PROCESS-WIDE singleton, so its sounding ledger
+    /// outlives any one test; the fixture clears it, which is what keeps
+    /// these independent of each other's leftovers.
+    /// What [`plane`] hands back: the plane itself, the engine channel's
+    /// receiver (kept alive so `transport` commits are not sent into a
+    /// disconnected channel) and the emitted-events sink.
+    type Plane = (
+        crate::control::ControlPlane,
+        crossbeam_channel::Receiver<crate::audio::engine::ControlMsg>,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    );
+
+    fn plane(tracks: &[&str], bindings: Vec<LaunchBinding>) -> Plane {
+        use crate::audio::engine::EngineHandle;
+        use crate::audio::rt::{GraphTables, SharedRt};
+        use crate::audio::types::{derive_slots, mixer_slot_count, Store};
+        use crate::control::Session;
+
+        let mut store = Store::default();
+        for &id in tracks {
+            store.tracks.push(crate::audio::types::testutil::test_track(id));
+        }
+        let mut session = Session::new(store, crate::midi::MidiStore::default());
+        let mut map = LaunchMap::default_map();
+        map.bindings = bindings;
+        session.midi.launch_maps = vec![map];
+
+        let n_slots = mixer_slot_count(&session.store.tracks);
+        let slots = derive_slots(&session.store.tracks);
+        let scene_ids: Vec<String> = crate::audio::engine::scene_binding_ids(&session.midi.launch_maps);
+        let first = 1 + session.store.players.len() as u32;
+        let scene_clocks: std::collections::HashMap<String, u32> = scene_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), first + i as u32))
+            .collect();
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(
+            n_slots,
+            1 + session.store.players.len() + scene_ids.len(),
+        );
+        let shared = Arc::new(SharedRt::default());
+        shared.sample_rate.store(48_000, Relaxed);
+        let tables = Arc::new(Mutex::new(GraphTables {
+            generation: 1,
+            params: Arc::new(crate::audio::rt::ParamTable::with_slots_and_sends(n_slots, 0)),
+            clocks: Arc::new(clocks),
+            scene_clocks,
+            player_clocks: Default::default(),
+            orphan_clock: None,
+            slots,
+            send_slots: Default::default(),
+        }));
+        let (engine, engine_rx) = EngineHandle::for_tests();
+        let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let cp = crate::control::ControlPlane::new(
+            Arc::new(Mutex::new(session)),
+            shared,
+            tables,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+            Arc::new(crate::control::HistoryLog::new()),
+            Arc::new(crate::control::GestureState::new()),
+        );
+        runtime().clear_sounding();
+        (cp, engine_rx, events)
+    }
+
+    /// Design §2.2's defect, killed: pressing a pad must not move the user's
+    /// arrangement. This is the whole reason `FireOrigin::Hardware` existed
+    /// as a separate arm — it did SetLoop + Seek + Play on the transport,
+    /// because the transport's playhead was the only one there was.
+    #[test]
+    fn firing_from_hardware_does_not_move_the_transport() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.transport(crate::control::TransportAction::Seek { position_samples: 96_000 })
+            .unwrap();
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        let before = cp.transport_state();
+
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        let after = cp.transport_state();
+        assert_eq!(after.position_samples, before.position_samples);
+        assert_eq!(after.loop_enabled, before.loop_enabled);
+        assert!(!after.loop_enabled, "and no loop was invented over the region");
+        assert_eq!(after.state, "playing");
+        let tables = cp.tables_for_tests();
+        let clock = tables.scene_clocks["b1"];
+        assert!(tables.clocks.is_on(clock), "the scene sounds on its own clock");
+    }
+
+    /// A hardware press still tells the VIEW to follow — that distinction is
+    /// all `FireOrigin` carries now, and it is why the type survives the
+    /// collapse of the three fire arms into one.
+    #[test]
+    fn follow_view_still_separates_a_hardware_press_from_a_drive_fire() {
+        let (cp, _rx, events) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+
+        let fired: Vec<bool> = events
+            .lock()
+            .iter()
+            .filter(|(name, _)| name == "launch://fired")
+            .map(|(_, p)| p["followView"].as_bool().unwrap_or(false))
+            .collect();
+        assert_eq!(fired, vec![true, false], "the hardware press moves the view; the drive fire does not");
+    }
+
+    /// Two scenes sounding at once is what the single overlay could never do
+    /// — and it is the reason a scene needs its OWN clock rather than a
+    /// shared one.
+    #[test]
+    fn two_scenes_sound_at_once_on_different_clocks() {
+        let (cp, _rx, _ev) = plane(
+            &["t1", "t2"],
+            vec![region_on("b1", 60, &["t1"]), region_on("b2", 61, &["t2"])],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+
+        let c1 = cp.scene_clock_for("b1").expect("b1 has a clock");
+        let c2 = cp.scene_clock_for("b2").expect("b2 has a clock");
+        assert_ne!(c1, c2);
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(c1));
+        assert!(tables.clocks.is_on(c2), "firing b2 must not have stopped b1");
+        assert_eq!(tables.clocks.clock_of(tables.slots[&crate::ids::TrackId::from("t1")]), c1);
+        assert_eq!(tables.clocks.clock_of(tables.slots[&crate::ids::TrackId::from("t2")]), c2);
+    }
+
+    /// V-14. Two scenes naming the same track is newly expressible; ending
+    /// the first must not take the track away from the second.
+    #[test]
+    fn stopping_one_scene_does_not_steal_a_track_the_other_now_owns() {
+        let (cp, _rx, _ev) = plane(
+            &["shared"],
+            vec![
+                region_on("b1", 60, &["shared"]),
+                region_on("b2", 61, &["shared"]),
+            ],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+        let c2 = cp.scene_clock_for("b2").unwrap();
+
+        cp.stop_drive_launch("b1");
+
+        let tables = cp.tables_for_tests();
+        let slot = tables.slots[&crate::ids::TrackId::from("shared")];
+        assert_eq!(tables.clocks.clock_of(slot), c2, "b2 still owns it");
+        assert!(tables.clocks.is_on(c2), "and is still sounding");
+    }
+
+    /// A binding the graph has never seen (added since the last rebuild) has
+    /// no clock, and a fire naming it must drop rather than land on whichever
+    /// index happens to be free — the same rule `ParamTable`'s setters follow
+    /// for an unknown slot.
+    #[test]
+    fn firing_a_binding_with_no_clock_yet_drops_instead_of_firing_another() {
+        let (cp, _rx, ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.session().lock().midi.launch_maps[0]
+            .bindings
+            .push(region_on("b-new", 62, &["t1"]));
+
+        assert_eq!(cp.scene_clock_for("b-new"), None);
+        cp.launch_fire_from("b-new", FireOrigin::Drive).unwrap();
+
+        assert!(
+            !runtime().take_sounding("b-new"),
+            "a dropped fire must not enter the ledger — nothing would ever release it"
+        );
+        assert!(
+            !ev.lock().iter().any(|(name, _)| name == "launch://fired"),
+            "and the frontend is not told a scene is playing when none is"
+        );
+        let tables = cp.tables_for_tests();
+        assert!(
+            !tables.clocks.is_on(tables.scene_clocks["b1"]),
+            "b1's clock is not b-new's to fire"
+        );
+    }
+
+    /// Stop-all cuts every sounding scene, not just the last one fired —
+    /// `launch_stop` is one frozen command over what is now N clocks.
+    #[test]
+    fn stop_all_cuts_every_sounding_scene() {
+        let (cp, _rx, _ev) = plane(
+            &["t1", "t2"],
+            vec![region_on("b1", 60, &["t1"]), region_on("b2", 61, &["t2"])],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+
+        assert!(cp.stop_launch_overlay(), "something was sounding");
+
+        let c1 = cp.scene_clock_for("b1").unwrap();
+        let c2 = cp.scene_clock_for("b2").unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_on(c1));
+        assert!(!tables.clocks.is_on(c2));
+        assert!(
+            tables.clocks.flush_pending(),
+            "both cuts still owe their live nodes an all-notes-off"
+        );
+        assert_eq!(
+            tables.clocks.clock_of(tables.slots[&crate::ids::TrackId::from("t1")]),
+            c1,
+            "and the slots stay bound so they can read it (the drive thread releases)"
+        );
+    }
+
+    /// The frontend must be told a scene ended exactly once, however many
+    /// times the drive poller enqueues the release.
+    #[test]
+    fn a_scene_ending_is_announced_once() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        assert!(runtime().take_sounding("b1"), "fired, and in the ledger");
+        runtime().mark_sounding("b1");
+
+        cp.stop_drive_launch("b1");
+        cp.stop_drive_launch("b1");
+        assert!(!runtime().take_sounding("b1"), "taken once, by the first call");
+    }
+
+    /// Fix round 1, finding 1. The Gate path cuts a clock that is STILL
+    /// RUNNING (a note-off lifting mid-clip), so the flush `ClockTable::stop`
+    /// latches has not been read by anyone yet. Releasing the slot in the
+    /// same breath — which is what `stop_scene` did — means the live node
+    /// never sees the `all_notes_off` and keeps the note.
+    #[test]
+    fn cutting_a_running_scene_keeps_its_tracks_bound_until_the_flush_is_read() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        let clock = cp.scene_clock_for("b1").unwrap();
+
+        cp.stop_drive_launch("b1"); // the Gate note-off path
+
+        {
+            let t = cp.tables_for_tests();
+            let slot = t.slots[&crate::ids::TrackId::from("t1")];
+            assert!(!t.clocks.is_on(clock), "cut");
+            assert!(t.clocks.flush_pending_for(clock), "and owing one jump");
+            assert_eq!(
+                t.clocks.clock_of(slot),
+                clock,
+                "the track stays bound, or nothing ever reads that jump"
+            );
+            // The release pass must refuse while the flush is unread.
+            t.release_finished_scenes();
+            assert_eq!(t.clocks.clock_of(slot), clock, "still owed");
+            // A rendered block latches it, and the node has had its
+            // all-notes-off.
+            t.clocks.begin_block();
+            t.release_finished_scenes();
+            assert_eq!(
+                t.clocks.clock_of(slot),
+                crate::audio::clock::TRANSPORT_CLOCK,
+                "now the track goes back to the arrangement"
+            );
+        }
+    }
+
+    /// V-14 at the release pass, which is where the release lives now: two
+    /// scenes may name the same track, and handing back a track the other one
+    /// is still playing would silence it mid-clip.
+    #[test]
+    fn the_release_pass_leaves_a_track_a_second_scene_is_still_playing() {
+        let (cp, _rx, _ev) = plane(
+            &["shared"],
+            vec![
+                region_on("b1", 60, &["shared"]),
+                region_on("b2", 61, &["shared"]),
+            ],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+        let c2 = cp.scene_clock_for("b2").unwrap();
+        cp.stop_drive_launch("b1");
+
+        let t = cp.tables_for_tests();
+        t.clocks.begin_block();
+        t.release_finished_scenes();
+        let slot = t.slots[&crate::ids::TrackId::from("shared")];
+        assert_eq!(t.clocks.clock_of(slot), c2, "b2 is still sounding on it");
+    }
+
+    /// Fix round 1, finding 1 again, at the transport-stop path: pressing
+    /// Stop with a scene sounding used to release the slots in the same
+    /// breath as the cut, so a held note stayed held in the live node.
+    #[test]
+    fn stopping_the_transport_cuts_the_scenes_without_dropping_their_flush() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        let clock = cp.scene_clock_for("b1").unwrap();
+
+        cp.transport(crate::control::TransportAction::Stop).unwrap();
+
+        let t = cp.tables_for_tests();
+        let slot = t.slots[&crate::ids::TrackId::from("t1")];
+        assert!(!t.clocks.is_on(clock), "the scene ends with the song");
+        assert!(t.clocks.flush_pending_for(clock), "owing its node one jump");
+        assert_eq!(t.clocks.clock_of(slot), clock, "still bound to read it");
+    }
+
+    /// Fix round 1, finding 4. The ledger test is level-triggered — an id
+    /// sits there with its clock off until the worker drains it — so the
+    /// drive loop has to remember what it already sent. `enqueue_release` is
+    /// a `try_send` into an 8-slot channel SHARED with `FireCmd::Start`:
+    /// duplicates of one ending fill it and drop the user's next pad press.
+    ///
+    /// Drives `releases_to_enqueue`, which is what the drive loop calls.
+    /// Round 2 finding 2: the first version of this test re-implemented those
+    /// three lines inline and the copy carried the same defect production
+    /// had, so it passed while the loop was broken.
+    #[test]
+    fn the_release_edge_enqueues_once_per_ending_not_once_per_poll() {
+        let mut sent = std::collections::HashSet::new();
+        let sounding = vec!["b1".to_string()];
+
+        let first = releases_to_enqueue(&mut sent, &sounding, |_| false);
+        assert_eq!(first, vec!["b1".to_string()], "the ending, announced");
+        for _ in 0..4 {
+            assert!(
+                releases_to_enqueue(&mut sent, &sounding, |_| false).is_empty(),
+                "one Release per ending — the channel is shared with pad presses"
+            );
+        }
+    }
+
+    /// Round 2, finding 1. `take_sounding` (worker) and `mark_sounding`
+    /// (re-fire) both land between two polls, so the memory cannot be cleared
+    /// by watching the ledger: the id is still in it. Clearing on the ON EDGE
+    /// is what makes a re-fired pad announce its NEXT ending — without it the
+    /// binding is silently mute to the frontend forever after, the pad stays
+    /// lit, and the id never leaves the ledger.
+    ///
+    /// Retriggering a pad as its clip ends is ordinary launcher use.
+    #[test]
+    fn a_binding_refired_inside_one_poll_gap_still_announces_its_next_ending() {
+        let mut sent = std::collections::HashSet::new();
+        let sounding = vec!["b1".to_string()];
+
+        // Poll N: b1 has ended. One Release goes out.
+        assert_eq!(
+            releases_to_enqueue(&mut sent, &sounding, |_| false),
+            vec!["b1".to_string()]
+        );
+        // Between the polls: the worker announces it and empties the ledger,
+        // then the user re-fires the same pad and it goes back in. The ledger
+        // looks identical from here — which is the whole trap.
+        // Poll N+1: sounding again.
+        assert!(releases_to_enqueue(&mut sent, &sounding, |_| true).is_empty());
+        // Poll N+2: the SECOND ending must be announced too.
+        assert_eq!(
+            releases_to_enqueue(&mut sent, &sounding, |_| false),
+            vec!["b1".to_string()],
+            "an ending after a re-fire is still an ending"
+        );
+    }
+
+    /// The other half: an id the worker took out of the ledger and that never
+    /// came back must not stay in the memory. Correctness comes from the ON
+    /// edge above; this is what bounds the set to what is sounding rather than
+    /// to every binding ever fired.
+    #[test]
+    fn the_release_memory_does_not_grow_with_every_binding_ever_fired() {
+        let mut sent = std::collections::HashSet::new();
+        releases_to_enqueue(&mut sent, &["b1".to_string()], |_| false);
+        assert_eq!(sent.len(), 1);
+        releases_to_enqueue(&mut sent, &[], |_| false);
+        assert!(sent.is_empty(), "gone with the ledger entry");
+    }
+
+    /// The loop and the runtime meet here: what the drive thread actually
+    /// feeds `releases_to_enqueue` is the ledger and a clock-table lookup.
+    #[test]
+    fn the_drive_loops_release_edge_reads_the_ledger_and_the_clock_table() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        let mut sent = std::collections::HashSet::new();
+        let still_on = |id: &str| {
+            let t = cp.tables_for_tests();
+            t.scene_clocks.get(id).is_some_and(|&c| t.clocks.is_on(c))
+        };
+
+        let sounding = runtime().sounding_ids();
+        assert!(
+            releases_to_enqueue(&mut sent, &sounding, still_on).is_empty(),
+            "still sounding"
+        );
+        cp.stop_launch_overlay(); // Escape
+        assert_eq!(
+            releases_to_enqueue(&mut sent, &sounding, still_on),
+            vec!["b1".to_string()]
+        );
+    }
+
+    // ---- Plan V — V2, Task 12: migrating clip bindings to players ----
+
+    fn test_midi_clip(id: &str, track_id: &str) -> crate::midi::types::MidiClip {
+        crate::midi::types::MidiClip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: id.into(),
+            timeline_start_ticks: 0,
+            length_ticks: 960,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track_id),
+            content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
+        }
+    }
+
+    fn one_binding_map(binding: LaunchBinding) -> LaunchMap {
+        LaunchMap {
+            bindings: vec![binding],
+            ..LaunchMap::default_map()
+        }
+    }
+
+    #[test]
+    fn migrate_turns_a_clip_target_into_a_player_naming_the_track_instrument() {
+        let mut track = crate::audio::types::testutil::test_track("t1");
+        track.instrument_id = Some("plugin:i1".into());
+        let tracks = vec![track];
+        let clips = vec![test_midi_clip("mc1", "t1")];
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &tracks, &mut players);
+
+        assert_eq!(n, 1);
+        assert_eq!(players.len(), 1, "the binding became one player");
+        assert_eq!(
+            players[0].source,
+            crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc1".into(),
+                instrument_id: Some("plugin:i1".into()),
+            },
+            "the player plays what the binding played, through the clip's own instrument"
+        );
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Player { player_id: players[0].id.clone() }
+        );
+        assert_eq!(maps[0].bindings[0].note, 36, "the note it was learned on is untouched");
+    }
+
+    #[test]
+    fn migrate_shares_one_player_across_two_bindings_on_the_same_clip() {
+        let clips = vec![test_midi_clip("mc1", "t1")];
+        let mut players = Vec::new();
+        let mut maps = vec![LaunchMap {
+            bindings: vec![clip("b1", 36, "mc1"), clip("b2", 37, "mc1")],
+            ..LaunchMap::default_map()
+        }];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+
+        assert_eq!(n, 2);
+        assert_eq!(players.len(), 1, "one clip, one player");
+        assert_eq!(maps[0].bindings[0].target, maps[0].bindings[1].target);
+    }
+
+    /// Fix round 1, Important 4: the reviewer replaced the assignment with
+    /// `players[0].id.clone()` — always the first player — and every
+    /// existing test still passed, because no fixture in this file had two
+    /// DISTINCT clips. `players[0]` cannot be wrong when there is only ever
+    /// one player to index. This is the test that can only pass if each
+    /// binding resolves to ITS OWN clip's player.
+    #[test]
+    fn migrate_assigns_each_binding_the_player_for_its_own_clip() {
+        let mut t1 = crate::audio::types::testutil::test_track("t1");
+        t1.instrument_id = Some("plugin:i1".into());
+        let mut t2 = crate::audio::types::testutil::test_track("t2");
+        t2.instrument_id = Some("plugin:i2".into());
+        let tracks = vec![t1, t2];
+        let clips = vec![test_midi_clip("mc1", "t1"), test_midi_clip("mc2", "t2")];
+        let mut players = Vec::new();
+        let mut maps = vec![LaunchMap {
+            bindings: vec![clip("b1", 36, "mc1"), clip("b2", 37, "mc2")],
+            ..LaunchMap::default_map()
+        }];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &tracks, &mut players);
+
+        assert_eq!(n, 2);
+        assert_eq!(players.len(), 2, "two distinct clips, two distinct players");
+
+        let player_for = |binding_idx: usize| {
+            let LaunchTarget::Player { player_id } = &maps[0].bindings[binding_idx].target else {
+                panic!("expected a Player target");
+            };
+            players
+                .iter()
+                .find(|p| &p.id == player_id)
+                .expect("the referenced player exists")
+        };
+
+        assert_eq!(
+            player_for(0).source,
+            crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc1".into(),
+                instrument_id: Some("plugin:i1".into()),
+            },
+            "b1 must resolve to mc1's player, not merely SOME player"
+        );
+        assert_eq!(
+            player_for(1).source,
+            crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc2".into(),
+                instrument_id: Some("plugin:i2".into()),
+            },
+            "b2 must resolve to mc2's player, not merely SOME player"
+        );
+        assert_ne!(
+            player_for(0).id,
+            player_for(1).id,
+            "distinct clips must not share a player"
+        );
+    }
+
+    /// The exact shape task 12's brief names as the risky one: run the
+    /// migration twice over the SAME maps/players (an unsaved reopen looks
+    /// like this at the function level) and check identity, not just a
+    /// flag — a bug that re-mints on the second pass would still leave
+    /// `players.len()` looking plausible if the assertion stopped there.
+    #[test]
+    fn migrate_is_idempotent_across_two_runs_over_the_same_maps_and_players() {
+        let clips = vec![test_midi_clip("mc1", "t1")];
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+
+        let first = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+        assert_eq!(first, 1);
+        let player_id_after_first = match &maps[0].bindings[0].target {
+            LaunchTarget::Player { player_id } => player_id.clone(),
+            other => panic!("expected a Player target, got {other:?}"),
+        };
+
+        let second = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+
+        assert_eq!(second, 0, "nothing left to migrate — the binding already names a player");
+        assert_eq!(players.len(), 1, "a second run must not mint a second player");
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Player { player_id: player_id_after_first },
+            "and it is still the SAME player, not a fresh one"
+        );
+    }
+
+    /// The close-without-saving case, which the two-runs test above cannot
+    /// see: the migration is IN-MEMORY ONLY, so an unsaved project arrives
+    /// at the next open with its `Clip` targets intact and no players — a
+    /// fresh run over fresh maps, not a second run over migrated ones.
+    ///
+    /// A control-surface pad bound to a migrated player stores
+    /// `player:<id>` in localStorage, which outlives the session. If the id
+    /// were random the pad would point at nothing after that reopen, and
+    /// would be silently dead.
+    #[test]
+    fn migrating_the_same_unsaved_project_twice_mints_the_same_player_id() {
+        let clips = vec![test_midi_clip("mc1", "t1")];
+
+        let run = || {
+            let mut players = Vec::new();
+            let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+            migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+            match &maps[0].bindings[0].target {
+                LaunchTarget::Player { player_id } => player_id.clone(),
+                other => panic!("expected a Player target, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            run(),
+            run(),
+            "an unsaved project reopened must land on the SAME player id, or every \
+             surface pad bound to it dies"
+        );
+    }
+
+    #[test]
+    fn migrate_reuses_an_existing_player_already_on_the_same_clip() {
+        // A project reopened after an earlier migration was saved: the
+        // player already exists, but a second binding on the same clip
+        // (added since) is still a bare `Clip` target. A DECOY player for
+        // a different clip sits first in the vec — fix round 1, Important
+        // 4 — so a `players[0]` shortcut resolves to the wrong player
+        // instead of trivially passing.
+        let clips = vec![test_midi_clip("mc1", "t1"), test_midi_clip("mc-decoy", "t1")];
+        let mut decoy =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("decoy-p"), "DECOY");
+        decoy.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc-decoy".into(),
+            instrument_id: None,
+        };
+        let mut existing =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("existing-p"), "PAD");
+        existing.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc1".into(),
+            instrument_id: None,
+        };
+        let mut players = vec![decoy, existing];
+        let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+
+        assert_eq!(n, 1);
+        assert_eq!(players.len(), 2, "reused, not duplicated — the decoy is untouched");
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Player { player_id: crate::ids::PlayerId::from("existing-p") },
+            "b1 must resolve to the EXISTING mc1 player, not players[0] (the decoy)"
+        );
+    }
+
+    #[test]
+    fn migrate_leaves_a_dangling_clip_binding_unbound_rather_than_dropping_it() {
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(clip("b1", 36, "gone"))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &[], &[], &mut players);
+
+        assert_eq!(n, 0);
+        assert!(players.is_empty());
+        assert_eq!(maps[0].bindings.len(), 1, "the binding stays — the pad mapping is not lost");
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Clip { clip_id: "gone".into() }
+        );
+    }
+
+    #[test]
+    fn migrate_leaves_a_region_binding_untouched() {
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(region("b1", 60, None))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &[], &[], &mut players);
+
+        assert_eq!(n, 0);
+        assert!(players.is_empty());
+        assert!(matches!(maps[0].bindings[0].target, LaunchTarget::Region { .. }));
+    }
+
+    /// Fix round 1, Important 3: the guard that used to be an inline
+    /// `if let LaunchTarget::Clip` in the drive loop, non-exhaustive by
+    /// construction. A `Player` target whose source names the driving
+    /// clip must self-trigger exactly like a `Clip` target naming it
+    /// directly did before migration.
+    #[test]
+    fn binding_self_triggers_resolves_a_player_target_through_its_source_clip() {
+        let mut sounding =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("p1"), "PAD");
+        sounding.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc1".into(),
+            instrument_id: None,
+        };
+        let mut other =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("p2"), "OTHER");
+        other.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc2".into(),
+            instrument_id: None,
+        };
+        let players = vec![sounding, other];
+
+        assert!(
+            binding_self_triggers(
+                &LaunchTarget::Player { player_id: crate::ids::PlayerId::from("p1") },
+                &players,
+                "mc1",
+            ),
+            "the player's own source clip is the one driving it"
+        );
+        assert!(
+            !binding_self_triggers(
+                &LaunchTarget::Player { player_id: crate::ids::PlayerId::from("p2") },
+                &players,
+                "mc1",
+            ),
+            "a DIFFERENT clip driving must not suppress a player it does not play"
+        );
+        assert!(
+            !binding_self_triggers(
+                &LaunchTarget::Region {
+                    start_ticks: 0,
+                    length_ticks: 960,
+                    track_ids: vec!["t1".into()],
+                },
+                &players,
+                "mc1",
+            ),
+            "a scene never self-triggers — it names tracks, not the driving clip"
+        );
+        assert!(
+            binding_self_triggers(&LaunchTarget::Clip { clip_id: "mc1".into() }, &[], "mc1"),
+            "the pre-migration shape still works too"
+        );
+    }
+
+    /// Point 4 of the migration's own brief: a `Player` target must reach
+    /// `player_fire`, not fall through to the scene path (which would
+    /// panic on the `unreachable!()` guarding the old Region/Clip match, or
+    /// silently do nothing at all). The clock actually turning on is the
+    /// only proof that is not just "did it return Ok".
+    #[test]
+    fn launch_fire_from_a_player_target_routes_to_player_fire() {
+        use crate::audio::engine::EngineHandle;
+        use crate::audio::player::{Player, PlayerSource};
+        use crate::audio::rt::{GraphTables, SharedRt};
+        use crate::audio::types::{derive_slots, mixer_slot_count, Store};
+        use crate::control::Session;
+
+        let mut store = Store::default();
+        store.tracks.push(crate::audio::types::testutil::test_track("t1"));
+        let player_id = crate::ids::PlayerId::from("p1");
+        let mut player = Player::new(player_id.clone(), "PAD");
+        player.source = PlayerSource::MidiClip { clip_id: "mc1".into(), instrument_id: None };
+        store.players.push(player);
+
+        let mut session = Session::new(store, crate::midi::MidiStore::default());
+        session.midi.clips.push(crate::midi::types::MidiClip {
+            id: "mc1".into(),
+            track_id: "t1".into(),
+            name: "pad".into(),
+            timeline_start_ticks: 0,
+            length_ticks: 960,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
+        });
+        session.midi.launch_maps = vec![one_binding_map(LaunchBinding {
+            id: "b1".into(),
+            name: "b1".into(),
+            note: 36,
+            channel: None,
+            target: LaunchTarget::Player { player_id: player_id.clone() },
+        })];
+
+        let n_slots = mixer_slot_count(&session.store.tracks);
+        let slots = derive_slots(&session.store.tracks);
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(n_slots, 2);
+        let shared = Arc::new(SharedRt::default());
+        shared.sample_rate.store(48_000, Relaxed);
+        let mut player_clocks = std::collections::HashMap::new();
+        player_clocks.insert(player_id, 1u32);
+        let tables = Arc::new(Mutex::new(GraphTables {
+            generation: 1,
+            params: Arc::new(crate::audio::rt::ParamTable::with_slots_and_sends(n_slots, 0)),
+            clocks: Arc::new(clocks),
+            scene_clocks: Default::default(),
+            player_clocks,
+            orphan_clock: None,
+            slots,
+            send_slots: Default::default(),
+        }));
+        let (engine, _engine_rx) = EngineHandle::for_tests();
+        let cp = crate::control::ControlPlane::new(
+            Arc::new(Mutex::new(session)),
+            shared,
+            tables,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Box::new(|_e, _p| {}),
+            Arc::new(crate::control::HistoryLog::new()),
+            Arc::new(crate::control::GestureState::new()),
+        );
+
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        let t = cp.tables_for_tests();
+        assert!(
+            t.clocks.is_on(1),
+            "the player's own clock is running — launch_fire_from routed the Player target to player_fire"
         );
     }
 }

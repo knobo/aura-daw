@@ -1,9 +1,12 @@
 <script lang="ts">
-  import type { SurfaceWidget } from "../../utils/control-surface";
+  import type { SurfaceTarget, SurfaceWidget } from "../../utils/control-surface";
   import { meterTrackId, padIndex } from "../../utils/control-surface";
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
   import { surface } from "../../state/surface.svelte";
+  import { launch } from "../../state/launch.svelte";
+  import { firePlayer, playerById, stopPlayer } from "../../state/players.svelte";
+  import type { PlayerTriggerMode } from "../../types/ipc";
   import Pad from "../controls/Pad.svelte";
   import BindPicker from "./BindPicker.svelte";
 
@@ -18,15 +21,67 @@
   const rows = $derived(widget.rows ?? 2);
   const cells = $derived(widget.cells ?? []);
 
-  function clipOf(index: number) {
-    const id = cells[index];
-    return id ? midi.clipById(id) : undefined;
+  function cellTarget(index: number): SurfaceTarget | null {
+    return cells[index] ?? null;
   }
 
-  function colorOf(clipId: string | null | undefined): string | undefined {
-    if (!clipId) return undefined;
-    const clip = midi.clipById(clipId);
+  function triggerMode(playerId: string): PlayerTriggerMode {
+    return playerById(playerId)?.trigger?.mode ?? "oneShot";
+  }
+
+  /** What the pad shows, for any target kind a cell can now hold. */
+  function cellLabel(index: number, target: SurfaceTarget | null): string {
+    if (!target) return `${index + 1}`;
+    if (target.kind === "clipLaunch") return midi.clipById(target.clipId)?.name ?? `${index + 1}`;
+    if (target.kind === "launchBinding") {
+      return launch.bindings.find((b) => b.id === target.bindingId)?.name ?? `${index + 1}`;
+    }
+    if (target.kind === "player") return playerById(target.playerId)?.name ?? `${index + 1}`;
+    if (target.kind === "trackMute") return project.trackById(target.trackId)?.name ?? `${index + 1}`;
+    return `${index + 1}`;
+  }
+
+  function cellColor(target: SurfaceTarget | null): string | undefined {
+    if (target?.kind !== "clipLaunch") return undefined;
+    const clip = midi.clipById(target.clipId);
     return clip ? project.trackById(clip.trackId)?.color : undefined;
+  }
+
+  /** Same dispatch a loose pad's `pressPad` uses (`SurfacePanel.svelte`) — a
+   * cell fires whatever it names instead of only a clip. */
+  function pressCell(target: SurfaceTarget | null) {
+    if (!target) return;
+    if (target.kind === "clipLaunch") {
+      void surface.fireClip(target.clipId);
+      return;
+    }
+    if (target.kind === "launchBinding") {
+      void surface.fireBinding(target.bindingId);
+      return;
+    }
+    if (target.kind === "player") {
+      // Gate fires on the pointer pair below, never on click — see
+      // SurfacePanel's `pressPad` for why.
+      if (triggerMode(target.playerId) === "gate") return;
+      void firePlayer(target.playerId);
+      return;
+    }
+    // A cell's options ARE a loose pad's (`cellOptions` is literally
+    // `bindOptions("pad", ctx)`), so a cell can name a track mute and
+    // `isLit` already lights it from the track's state. Without this arm the
+    // cell reads the mute correctly and does nothing when pressed.
+    if (target.kind === "trackMute") {
+      const tr = project.trackById(target.trackId);
+      if (tr) void surface.writeMute(target.trackId, !tr.muted);
+    }
+  }
+
+  function cellPointerDown(target: SurfaceTarget | null) {
+    if (target?.kind === "player" && triggerMode(target.playerId) === "gate") void firePlayer(target.playerId);
+  }
+
+  function cellPointerUp(target: SurfaceTarget | null) {
+    if (target?.kind === "player" && triggerMode(target.playerId) === "gate") void stopPlayer(target.playerId);
   }
 </script>
 
@@ -38,26 +93,32 @@
     {#each Array.from({ length: rows }, (_, r) => r) as r (r)}
       {#each Array.from({ length: cols }, (_, c) => c) as c (c)}
         {@const index = padIndex(cols, rows, c, r)}
-        {@const clip = clipOf(index)}
+        {@const target = cellTarget(index)}
         <div class="slot">
           <!-- In edit mode a pad assigns its cell instead of firing it; an
                empty grid from the `+` menu is otherwise eight dead pads. -->
           <Pad
-            label={clip?.name ?? `${index + 1}`}
-            meterTrackId={clip ? meterTrackId({ ...widget, target: { kind: "clipLaunch", clipId: clip.id } }, midi.clips) : null}
-            lit={clip ? surface.isClipPlaying(clip.id) : false}
-            color={colorOf(clip?.id)}
-            disabled={!clip && !edit}
+            label={cellLabel(index, target)}
+            meterTrackId={target ? meterTrackId({ ...widget, target }, midi.clips) : null}
+            lit={surface.isLit(target)}
+            color={cellColor(target)}
+            disabled={!target && !edit}
             ariaLabel={edit
-              ? clip
-                ? `Assign pad ${index + 1} — now ${clip.name}`
+              ? target
+                ? `Assign pad ${index + 1} — now ${cellLabel(index, target)}`
                 : `Assign pad ${index + 1}`
-              : clip
-                ? `Play ${clip.name}`
+              : target
+                ? `${target.kind === "trackMute" ? "Mute" : "Play"} ${cellLabel(index, target)}`
                 : "Empty pad"}
             onpress={() => {
               if (edit) surface.toggleBind(surface.cellKey(widget.id, index));
-              else if (clip) void surface.fireClip(clip.id);
+              else pressCell(target);
+            }}
+            onpointerdown={() => {
+              if (!edit) cellPointerDown(target);
+            }}
+            onpointerup={() => {
+              if (!edit) cellPointerUp(target);
             }}
           />
           {#if edit && surface.bindFor === surface.cellKey(widget.id, index)}
@@ -85,17 +146,29 @@
   .slot {
     position: relative;
   }
+  /* The same chip SurfacePanel's handles became: this one removes the whole
+     pad grid and was left behind by that fix, so it stayed a faint glyph on
+     a transparent ground — the shape the owner could not see at all. */
   .kill {
     position: absolute;
     top: 4px;
     right: 6px;
-    border: none;
-    background: transparent;
-    color: var(--text-faint);
-    cursor: pointer;
     z-index: 1;
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 50%;
+    background: rgb(var(--bg-sunken-rgb) / 0.92);
+    color: var(--text-mid);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
   }
   .kill:hover {
     color: var(--red);
+    border-color: var(--red);
   }
 </style>

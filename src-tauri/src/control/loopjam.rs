@@ -905,10 +905,17 @@ fn render_region_stereo(
             samples: Arc::new(RtClipData { channels, data }),
         });
     }
-    let mut graph = RtGraph::new(
+    // `with_buses`, not `new`: this is a production path and it has the rate.
+    // Its row carries no live node, so the allowance is 0 either way — but a
+    // production caller sitting on `new`'s 48 kHz default is the trap the
+    // constructor's doc warns about, and not being the exception is cheaper
+    // than being one.
+    let mut graph = RtGraph::with_buses(
         vec![RtTrack::clips(0, rt_clips)],
+        Vec::new(),
         0,
         Arc::new(ParamTable::default()),
+        engine_rate,
     );
     let frames = (end - start) as usize;
     let mut buf = vec![0.0f32; frames * 2];

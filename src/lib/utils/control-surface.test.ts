@@ -47,6 +47,10 @@ const ctx: SurfaceContext = {
     { id: "c2", name: "snare", trackId: "t1" },
     { id: "c3", name: "hat", trackId: "t1" },
   ],
+  launchBindings: [
+    { id: "lb1", name: "Scene 1" },
+    { id: "lb2", name: "Scene 2" },
+  ],
   automations: [
     { id: "a1", trackId: "t1", trackName: "Drums", paramLabel: "gain", target: { kind: "trackGain", trackId: "t1" } },
     { id: "a2", trackId: "t2", trackName: "Bass", paramLabel: "pan", target: { kind: "trackPan", trackId: "t2" } },
@@ -63,7 +67,7 @@ const ctx: SurfaceContext = {
 describe("empty layout", () => {
   it("starts with one blank page and no widgets", () => {
     const layout = emptyLayout();
-    expect(layout.version).toBe(2);
+    expect(layout.version).toBe(3);
     expect(layout.pages).toHaveLength(1);
     expect(layout.activePageId).toBe(layout.pages[0].id);
     expect(activePage(layout).widgets).toEqual([]);
@@ -91,9 +95,9 @@ describe("pad numbering (LPD8 origin)", () => {
     expect(grid.cols).toBe(4);
     expect(grid.rows).toBe(2);
     // c1 → P1 (bottom-left), c2 → P2, c3 → P3
-    expect(grid.cells?.[padIndex(4, 2, 0, 1)]).toBe("c1");
-    expect(grid.cells?.[padIndex(4, 2, 1, 1)]).toBe("c2");
-    expect(grid.cells?.[padIndex(4, 2, 2, 1)]).toBe("c3");
+    expect(grid.cells?.[padIndex(4, 2, 0, 1)]).toEqual({ kind: "clipLaunch", clipId: "c1" });
+    expect(grid.cells?.[padIndex(4, 2, 1, 1)]).toEqual({ kind: "clipLaunch", clipId: "c2" });
+    expect(grid.cells?.[padIndex(4, 2, 2, 1)]).toEqual({ kind: "clipLaunch", clipId: "c3" });
     expect(grid.cells?.[padIndex(4, 2, 0, 0)]).toBeNull();
   });
 });
@@ -187,7 +191,7 @@ describe("racks", () => {
     const grid = rack.find((w) => w.kind === "padGrid");
     expect(grid?.cols).toBe(4);
     expect(grid?.rows).toBe(2);
-    expect(grid?.cells?.[padIndex(4, 2, 0, 1)]).toBe("c1");
+    expect(grid?.cells?.[padIndex(4, 2, 0, 1)]).toEqual({ kind: "clipLaunch", clipId: "c1" });
   });
 
   it("gives the knobs the tracks and the pads the clips, in order", () => {
@@ -276,11 +280,11 @@ describe("remove and bind", () => {
     expect(activePage(next).widgets[0].padMode).toBe("toggle");
   });
 
-  it("setGridCell writes a clip into a pad", () => {
+  it("setGridCell writes a target into a pad", () => {
     const layout = addWidget(emptyLayout(), padGridForClips([]));
     const id = activePage(layout).widgets[0].id;
-    const next = setGridCell(layout, id, padIndex(4, 2, 0, 1), "c1");
-    expect(activePage(next).widgets[0].cells?.[0]).toBe("c1");
+    const next = setGridCell(layout, id, padIndex(4, 2, 0, 1), { kind: "clipLaunch", clipId: "c1" });
+    expect(activePage(next).widgets[0].cells?.[0]).toEqual({ kind: "clipLaunch", clipId: "c1" });
   });
 });
 
@@ -293,25 +297,77 @@ describe("parse and storage", () => {
   });
 
   it("rejects a wrong version or an empty page list", () => {
-    expect(parseLayout({ version: 3, pages: [], activePageId: "x" })).toBeNull();
-    expect(parseLayout({ version: 2, pages: [], activePageId: "x" })).toBeNull();
+    expect(parseLayout({ version: 4, pages: [], activePageId: "x" })).toBeNull();
+    expect(parseLayout({ version: 0, pages: [], activePageId: "x" })).toBeNull();
     expect(parseLayout(null)).toBeNull();
   });
 
-  it("opens a saved v1 lpd8 deck as a rack", () => {
+  it("opens a saved v1 lpd8 deck as a rack, and migrates its bare-string cells too", () => {
     const knob = { id: "w1", kind: "knob", label: "Drums", target: { kind: "trackGain", trackId: "t1" } };
-    const grid = { id: "w2", kind: "padGrid", label: "PADS", target: null, cols: 4, rows: 2, cells: Array(8).fill(null) };
+    const grid = {
+      id: "w2",
+      kind: "padGrid",
+      label: "PADS",
+      target: null,
+      cols: 4,
+      rows: 2,
+      cells: ["c1", null, null, null, null, null, null, null],
+    };
     const parsed = parseLayout({
       version: 1,
       activePageId: "p1",
       pages: [{ id: "p1", name: "Deck", templateId: "lpd8", widgets: [knob, grid] }],
     });
-    expect(parsed?.version).toBe(2);
+    expect(parsed?.version).toBe(3);
     const grouped = groupWidgets(parsed!.pages[0]);
     expect(grouped.racks).toHaveLength(1);
     expect(grouped.racks[0].device.id).toBe("lpd8");
     expect(grouped.racks[0].widgets.map((w) => w.id)).toEqual(["w1", "w2"]);
     expect(grouped.loose).toHaveLength(0);
+    // migrateV1Page only wraps widgets in a rack group; it never touches
+    // cells, so the v1→v3 cell migration must run on this path too.
+    const migratedGrid = grouped.racks[0].widgets.find((w) => w.id === "w2");
+    expect(migratedGrid?.cells?.[0]).toEqual({ kind: "clipLaunch", clipId: "c1" });
+    expect(migratedGrid?.cells?.[1]).toBeNull();
+  });
+
+  it("opens a saved v2 deck and turns a bare-string cell into a clipLaunch target", () => {
+    const grid = {
+      id: "w1",
+      kind: "padGrid",
+      label: "PADS",
+      target: null,
+      cols: 4,
+      rows: 2,
+      cells: ["c1", null, null, null, null, null, null, null],
+    };
+    const parsed = parseLayout({
+      version: 2,
+      activePageId: "p1",
+      pages: [{ id: "p1", name: "Deck", widgets: [grid] }],
+    });
+    expect(parsed?.version).toBe(3);
+    const cells = parsed!.pages[0].widgets[0].cells;
+    expect(cells?.[0]).toEqual({ kind: "clipLaunch", clipId: "c1" });
+    expect(cells?.[1]).toBeNull();
+  });
+
+  it("leaves an already-migrated v3 cell alone", () => {
+    const grid = {
+      id: "w1",
+      kind: "padGrid",
+      label: "PADS",
+      target: null,
+      cols: 4,
+      rows: 2,
+      cells: [{ kind: "player", playerId: "p1" }, null],
+    };
+    const parsed = parseLayout({
+      version: 3,
+      activePageId: "p1",
+      pages: [{ id: "p1", name: "Deck", widgets: [grid] }],
+    });
+    expect(parsed?.pages[0].widgets[0].cells?.[0]).toEqual({ kind: "player", playerId: "p1" });
   });
 
   it("leaves a v1 deck that was never a device alone", () => {
@@ -411,6 +467,26 @@ describe("target keys", () => {
   });
 });
 
+describe("player targets", () => {
+  it("gives a player target a stable key distinct from a clip's", () => {
+    expect(targetKey({ kind: "player", playerId: "p1" })).toBe("player:p1");
+    expect(targetKey({ kind: "player", playerId: "p1" })).not.toBe(
+      targetKey({ kind: "clipLaunch", clipId: "p1" }),
+    );
+  });
+
+  it("accepts a player target on a pad", () => {
+    // Brief's snippet calls `blankLayout()` / `addWidget(layout, "pad")`;
+    // neither exists on this branch's API (`emptyLayout()` +
+    // `addWidget(layout, widget)`, per the neighbouring tests in this
+    // file). Using the real signatures — same assertion.
+    const layout = addWidget(emptyLayout(), unboundWidget("pad"));
+    const pad = layout.pages[0].widgets[0];
+    const bound = bindWidget(layout, pad.id, { kind: "player", playerId: "p1" });
+    expect(bound.pages[0].widgets[0].target).toEqual({ kind: "player", playerId: "p1" });
+  });
+});
+
 describe("bind options", () => {
   it("offers levels, pans and automated plugin params to a knob", () => {
     const opts = bindOptions("knob", ctx);
@@ -453,12 +529,12 @@ describe("bind options", () => {
     expect(bindOptions("padGrid", ctx)).toEqual([]);
   });
 
-  it("offers only clips for a pad-grid cell", () => {
-    expect(cellOptions(ctx).map((o) => o.target)).toEqual([
-      { kind: "clipLaunch", clipId: "c1" },
-      { kind: "clipLaunch", clipId: "c2" },
-      { kind: "clipLaunch", clipId: "c3" },
-    ]);
+  it("gives a pad-grid cell the same option set a loose pad gets — clip, launcher and mute", () => {
+    // A cell holds a full SurfaceTarget now, the same union a loose pad's
+    // `target` holds, so it is no longer clip-only.
+    expect(cellOptions(ctx)).toEqual(bindOptions("pad", ctx));
+    const kinds = new Set(cellOptions(ctx).map((o) => o.target.kind));
+    expect(kinds).toEqual(new Set(["clipLaunch", "launchBinding", "trackMute"]));
   });
 });
 
@@ -472,5 +548,22 @@ describe("bindWidget", () => {
     expect(w.target).toEqual({ kind: "trackArm", trackId: "t1" });
     expect(w.lampRole).toBe("arm");
     expect(w.label).toBe("ARM");
+  });
+});
+
+describe("launcher bindings on a pad", () => {
+  it("offers every launch binding, keyed apart from a clip of the same id", () => {
+    const opts = bindOptions("pad", ctx);
+    const launcher = opts.filter((o) => o.target.kind === "launchBinding");
+    expect(launcher.map((o) => o.label)).toEqual(["Scene 1", "Scene 2"]);
+    expect(launcher[0].key).toBe("launchBinding:lb1");
+    expect(targetKey({ kind: "launchBinding", bindingId: "x" })).not.toBe(
+      targetKey({ kind: "clipLaunch", clipId: "x" }),
+    );
+  });
+
+  it("offers every launch binding to a pad-grid cell too", () => {
+    const launcher = cellOptions(ctx).filter((o) => o.target.kind === "launchBinding");
+    expect(launcher.map((o) => o.label)).toEqual(["Scene 1", "Scene 2"]);
   });
 });

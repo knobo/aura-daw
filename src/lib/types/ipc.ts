@@ -92,7 +92,9 @@ export interface MidiOutputStatus {
 
 export type LaunchTarget =
   | { kind: "region"; startTicks: number; lengthTicks: number; trackIds: string[] }
-  | { kind: "clip"; clipId: string };
+  /** Kept so a project saved before Plan V's player migration still deserializes; nothing produces one any more. */
+  | { kind: "clip"; clipId: string }
+  | { kind: "player"; playerId: string };
 
 export interface LaunchBinding {
   id: string;
@@ -117,6 +119,33 @@ export interface LaunchMap {
 
 export interface LaunchSnapshot {
   maps: LaunchMap[];
+}
+
+// ── players (Plan V — V2) ────────────────────────────────────────────────
+// Mirror of `crate::audio::player::{Player, PlayerSource, Trigger,
+// TriggerMode}`. Task 12 added just enough (`id`/`name`/`source`) to
+// resolve a `LaunchTarget::Player` back to its clip; task 13 (the control
+// surface) additionally needs `raw` (V-6's marker) and `trigger.mode`
+// (gate vs. one-shot vs. loop) to render and fire a player pad.
+
+export type PlayerSource =
+  | { kind: "audioClip"; clipId: string }
+  | { kind: "midiClip"; clipId: string; instrumentId?: string | null }
+  | { kind: "none" };
+
+export type PlayerTriggerMode = "oneShot" | "gate" | "loop";
+
+export interface PlayerInfo {
+  id: string;
+  name: string;
+  source: PlayerSource;
+  /** V-6: absolute — the file at unity, bypassing the source track.
+   * Optional (defaults false) so Task 12's fixtures, built before this
+   * field existed, keep type-checking — the wire form from `players_get`
+   * always carries it (Rust's `#[serde(default)]` mirrors the same
+   * default). */
+  raw?: boolean;
+  trigger?: { mode: PlayerTriggerMode };
 }
 
 export type LaunchFireOrigin = "hardware" | "drive" | "preview";

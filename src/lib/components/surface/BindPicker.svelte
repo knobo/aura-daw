@@ -5,25 +5,59 @@
    * thing you could do with one was delete it again.
    *
    * The option list is pure (`bindOptions`); this is the popover around it.
+   * Root shows one drill tile per group (`CLIP ›`, `LEVEL ›`, …) rather than
+   * a flat list — a project with real content runs a flat list into the
+   * bottom of the window, the same reason PR 116 (written without a hash,
+   * which the theme guard would read as a three-digit colour) made the `+`
+   * menu's rack list a drill-down, and the same reason "Add pad from
+   * clip ›" was already one. `level` carries either sentinel ("root",
+   * "player") or a group name — picking a tile drills into that group.
    */
   import { surface } from "../../state/surface.svelte";
-  import { targetKey, type BindOption, type SurfaceWidget } from "../../utils/control-surface";
+  import { targetKey, type BindOption, type SurfaceTarget, type SurfaceWidget } from "../../utils/control-surface";
   import { popoverBox } from "../../utils/popover.svelte";
   import { portal } from "../../utils/portal";
+  import { project } from "../../state/project.svelte";
+  import { addAudioPlayer } from "../../state/players.svelte";
 
-  /** `cell` set = the picker is filling one pad-grid slot, not the widget. */
+  /** `cell` set = the picker is filling one pad-grid slot, not the widget.
+   * A cell now holds a full `SurfaceTarget` (same union a loose pad's
+   * `target` does), so it gets the same option set — clip, launcher row,
+   * track mute, and "Add pad from clip ›". */
   const { widget, cell }: { widget: SurfaceWidget; cell?: number } = $props();
 
+  let level = $state<string>("root");
+  let raw = $state(true);
+  const canAddPlayerPad = $derived(cell != null || widget.kind === "pad");
+  const audioClips = $derived(project.clips);
+
+  function goPlayerLevel() {
+    level = "player";
+  }
+  function goRoot() {
+    level = "root";
+  }
+
+  async function pickClip(clipId: string, name: string) {
+    const id = await addAudioPlayer(clipId, raw);
+    const target: SurfaceTarget = { kind: "player", playerId: id };
+    if (cell != null) surface.bindCell(widget.id, cell, target);
+    else surface.bind(widget.id, target, name);
+    level = "root";
+  }
+
   const options = $derived(cell == null ? surface.options(widget.kind) : surface.cellChoices());
-  const current = $derived(
-    cell == null
-      ? targetKey(widget.target)
-      : targetKey(cellClip(cell) ? { kind: "clipLaunch", clipId: cellClip(cell) as string } : null),
+
+  /** Groups in first-seen order — the tiles the root level drills into. */
+  const groups = $derived(
+    options.reduce<string[]>((acc, o) => (acc.includes(o.group) ? acc : [...acc, o.group]), []),
   );
 
-  function cellClip(index: number): string | null {
+  function cellTarget(index: number): SurfaceTarget | null {
     return widget.cells?.[index] ?? null;
   }
+
+  const current = $derived(cell == null ? targetKey(widget.target) : targetKey(cellTarget(cell)));
 
   function isCurrent(o: BindOption): boolean {
     if (current === null || targetKey(o.target) !== current) return false;
@@ -32,7 +66,7 @@
 
   function pick(o: BindOption) {
     if (cell != null) {
-      surface.bindCell(widget.id, cell, o.target.kind === "clipLaunch" ? o.target.clipId : null);
+      surface.bindCell(widget.id, cell, o.target);
       return;
     }
     surface.bind(widget.id, o.target, o.widgetLabel, o.lampRole ? { lampRole: o.lampRole } : undefined);
@@ -43,13 +77,16 @@
     else surface.bind(widget.id, null);
   }
 
-  const canClear = $derived(cell == null ? !!widget.target : cellClip(cell) !== null);
+  const canClear = $derived(cell == null ? !!widget.target : cellTarget(cell) !== null);
 
   function onKey(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      e.stopPropagation();
-      surface.bindFor = null;
+    if (e.key !== "Escape") return;
+    e.stopPropagation();
+    if (level !== "root") {
+      goRoot();
+      return;
     }
+    surface.bindFor = null;
   }
 
   // Placed `fixed` against the widget's own box: the deck scrolls
@@ -92,13 +129,45 @@
   aria-label={cell == null ? `Bind ${widget.label}` : `Assign pad ${cell + 1}`}
   onkeydown={onKey}
 >
-  {#if options.length === 0}
-    <p class="silk empty">Nothing to bind yet — this project has no matching target.</p>
+  {#if level === "player"}
+    <button class="back" role="menuitem" type="button" onclick={goRoot}>
+      <span class="chev back-chev">‹</span>
+      <span class="silk">PLAYER</span>
+    </button>
+    <label class="raw-toggle">
+      <input type="checkbox" bind:checked={raw} />
+      <span class="silk">raw (V-6: unity, no chain)</span>
+    </label>
+    {#if audioClips.length === 0}
+      <p class="silk empty">This project has no audio clips yet.</p>
+    {:else}
+      {#each audioClips as c (c.id)}
+        <button class="item" role="menuitem" type="button" onclick={() => pickClip(c.id, c.name)}>
+          {c.name}
+        </button>
+      {/each}
+    {/if}
+  {:else if level === "root"}
+    {#if options.length === 0 && !canAddPlayerPad}
+      <p class="silk empty">Nothing to bind yet — this project has no matching target.</p>
+    {:else}
+      {#each groups as g (g)}
+        <button class="item drill" role="menuitem" type="button" aria-haspopup="menu" onclick={() => (level = g)}>
+          {g} <span class="chev">›</span>
+        </button>
+      {/each}
+    {/if}
+    {#if canAddPlayerPad}
+      <button class="item drill" role="menuitem" type="button" aria-haspopup="menu" onclick={goPlayerLevel}>
+        Add pad from clip<span class="chev">›</span>
+      </button>
+    {/if}
   {:else}
-    {#each options as o, i (o.key)}
-      {#if i === 0 || options[i - 1].group !== o.group}
-        <p class="silk heading">{o.group}</p>
-      {/if}
+    <button class="back" role="menuitem" type="button" onclick={goRoot}>
+      <span class="chev back-chev">‹</span>
+      <span class="silk">{level}</span>
+    </button>
+    {#each options.filter((o) => o.group === level) as o (o.key)}
       <button
         class="item"
         class:on={isCurrent(o)}
@@ -110,7 +179,7 @@
       </button>
     {/each}
   {/if}
-  {#if canClear}
+  {#if level === "root" && canClear}
     <button class="item clear" role="menuitem" type="button" onclick={clear}>
       {cell == null ? "Unbind" : "Clear pad"}
     </button>
@@ -131,12 +200,6 @@
     border-radius: var(--ctrl-radius);
     box-shadow: var(--bevel-raised), var(--relief-2);
     text-align: left;
-  }
-  .heading {
-    padding: 4px 6px 2px;
-    color: var(--text-faint);
-    font-size: 8px;
-    letter-spacing: 0.16em;
   }
   .item {
     display: block;
@@ -168,5 +231,44 @@
     color: var(--text-dim);
     max-width: 190px;
     white-space: normal;
+  }
+  .drill {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .chev {
+    margin-left: 6px;
+    color: var(--text-faint);
+  }
+  .back {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 4px 6px;
+    border: none;
+    background: transparent;
+    color: var(--text-dim);
+    border-radius: calc(var(--ctrl-radius) - 2px);
+    cursor: pointer;
+    text-align: left;
+  }
+  .back:hover {
+    background: rgb(var(--line-rgb) / 0.12);
+    color: var(--text);
+  }
+  .back-chev {
+    font-size: 14px;
+    line-height: 1;
+  }
+  .raw-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    color: var(--text-dim);
+    font-size: 11px;
+    cursor: pointer;
   }
 </style>

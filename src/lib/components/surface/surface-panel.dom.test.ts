@@ -7,6 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
+import { tick } from "svelte";
 import type { TrackState } from "../../types/ipc";
 
 const calls: string[] = [];
@@ -43,8 +44,29 @@ vi.mock("../../tauri", () => ({
       calls.push(`fire:${id}`);
       return Promise.resolve();
     },
+    transportSeek: (samples: number) => {
+      calls.push(`seek:${samples}`);
+      return Promise.resolve();
+    },
     pluginGetParams: () => Promise.resolve([]),
     pluginList: () => Promise.resolve({ plugins: [], scanned: true, instances: [] }),
+    playersGet: () => Promise.resolve([]),
+    playerFire: (id: string) => {
+      calls.push(`player_fire:${id}`);
+      return Promise.resolve();
+    },
+    playerStop: (id: string) => {
+      calls.push(`player_stop:${id}`);
+      return Promise.resolve();
+    },
+    playerAdd: (source: unknown, raw?: boolean) => {
+      calls.push(`player_add:${JSON.stringify(source)}:${raw}`);
+      return Promise.resolve({ id: "new-p1", name: "new pad", source, raw: !!raw });
+    },
+    playerSetTriggerMode: (id: string, mode: string) => {
+      calls.push(`player_set_trigger_mode:${id}:${mode}`);
+      return Promise.resolve();
+    },
   },
 }));
 
@@ -52,10 +74,12 @@ const AddMenu = (await import("./AddMenu.svelte")).default;
 const ChannelStrip = (await import("./ChannelStrip.svelte")).default;
 const PadGrid = (await import("./PadGrid.svelte")).default;
 const BindPicker = (await import("./BindPicker.svelte")).default;
+const SurfacePanel = (await import("./SurfacePanel.svelte")).default;
 const { surface } = await import("../../state/surface.svelte");
 const { project } = await import("../../state/project.svelte");
 const { midi } = await import("../../state/midi.svelte");
 const { launch } = await import("../../state/launch.svelte");
+const { players } = await import("../../state/players.svelte");
 const Rack = (await import("./Rack.svelte")).default;
 const { addWidget, deviceById, emptyLayout, rackWidgets, stripWidgets, unboundWidget } =
   await import("../../utils/control-surface");
@@ -98,6 +122,8 @@ beforeEach(() => {
     },
   ] as unknown as typeof launch.maps;
   launch.activeMapId = launch.maps[0].id;
+  players.list = [];
+  project.clips = [];
 });
 
 afterEach(() => {
@@ -244,10 +270,38 @@ describe("a channel strip", () => {
 
 describe("a pad grid", () => {
   it("fires the clip in a filled cell", async () => {
-    const widget = { ...unboundWidget("padGrid"), cells: ["c1", null, null, null, null, null, null, null] };
+    const widget = {
+      ...unboundWidget("padGrid"),
+      cells: [{ kind: "clipLaunch" as const, clipId: "c1" }, null, null, null, null, null, null, null],
+    };
     render(PadGrid, { widget });
     await pressPad(screen.getByRole("button", { name: /play verse/i }));
     await vi.waitFor(() => expect(calls).toContain("fire:b1"));
+    // Fix round 1 regression, caught mutation-testing the Critical-2 fix:
+    // `fireClip` briefly delegated straight to `launch.mapClip`, which
+    // also focuses/seeks on a HIT — so firing a pad that already has a
+    // binding started moving the transport on every press, the same
+    // class of defect Task 8 killed on the Rust side. A pad already
+    // mapped must only fire, never seek.
+    expect(calls.some((c) => c.startsWith("seek:"))).toBe(false);
+  });
+
+  it("fires a player cell exactly like a loose player pad, including gate mode", async () => {
+    players.list = [
+      { id: "p1", name: "KICK", source: { kind: "audioClip", clipId: "c1" }, raw: true, trigger: { mode: "gate" } },
+    ];
+    const widget = {
+      ...unboundWidget("padGrid"),
+      cells: [{ kind: "player" as const, playerId: "p1" }, null, null, null, null, null, null, null],
+    };
+    render(PadGrid, { widget });
+    const pad = screen.getByRole("button", { name: "Play KICK" });
+    Object.assign(pad, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await fireEvent.pointerDown(pad, { button: 0, pointerId: 1 });
+    await fireEvent.pointerUp(pad, { pointerId: 1 });
+    // A gate cell must not ALSO fire on the click a pointer pair produces.
+    await fireEvent.click(pad);
+    expect(calls).toEqual(["player_fire:p1", "player_stop:p1"]);
   });
 
   it("assigns an empty cell from the picker in edit mode", async () => {
@@ -256,10 +310,61 @@ describe("a pad grid", () => {
     render(PadGrid, { widget, edit: true });
     // In edit mode the pad opens its cell picker instead of firing.
     await pressPad(screen.getByRole("button", { name: /assign pad 1/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^clip/i }));
     await fireEvent.click(screen.getByRole("menuitem", { name: "Verse" }));
     const cells = surface.page.widgets.find((w) => w.id === widget.id)?.cells;
-    expect(cells?.[0]).toBe("c1");
+    expect(cells?.[0]).toEqual({ kind: "clipLaunch", clipId: "c1" });
     expect(calls).toEqual([]); // assigning a cell is layout chrome, not a command
+  });
+
+  it("mutes a track from a grid cell, because a cell's options are a loose pad's", async () => {
+    // `cellOptions` IS `bindOptions("pad", ctx)`, so a cell can name a track
+    // mute — and `isLit` already lights it from the track's state. Without a
+    // trackMute arm in `pressCell` the cell reads the mute correctly and does
+    // nothing when pressed: lit, live-looking, inert.
+    const base = unboundWidget("padGrid");
+    const cells = [...(base.cells ?? [])];
+    cells[0] = { kind: "trackMute", trackId: "t1" };
+    const widget = { ...base, cells };
+    surface.layout = addWidget(emptyLayout(), widget);
+    render(PadGrid, { widget, edit: false });
+    // Named for its track, not "1" — the label arm was missing too, so the
+    // cell was both inert AND unlabelled.
+    await pressPad(screen.getByRole("button", { name: "Mute Drums" }));
+    await vi.waitFor(() => expect(calls).toContain("mute:t1:true"));
+  });
+
+  it("adds a pad from an audio clip into a cell, same as a loose pad", async () => {
+    const widget = unboundWidget("padGrid");
+    surface.layout = addWidget(emptyLayout(), widget);
+    project.clips = [
+      {
+        id: "ac1",
+        trackId: "t1",
+        name: "KICK.wav",
+        sourcePath: "audio/kick.wav",
+        sourceChannels: 2,
+        sourceSampleRate: 48000,
+        sourceLengthSamples: 4800,
+        timelineStartSamples: 0,
+        offsetSamples: 0,
+        lengthSamples: 4800,
+        gainDb: 0,
+        fadeInSamples: 0,
+        fadeOutSamples: 0,
+      },
+    ];
+    render(PadGrid, { widget, edit: true });
+    await pressPad(screen.getByRole("button", { name: /assign pad 1/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: /add pad from clip/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "KICK.wav" }));
+    await vi.waitFor(() =>
+      expect(surface.page.widgets.find((w) => w.id === widget.id)?.cells?.[0]).toEqual({
+        kind: "player",
+        playerId: "new-p1",
+      }),
+    );
+    expect(calls).toEqual([`player_add:${JSON.stringify({ kind: "audioClip", clipId: "ac1" })}:true`]);
   });
 });
 
@@ -268,6 +373,9 @@ describe("the bind picker", () => {
     const widget = unboundWidget("knob");
     surface.layout = addWidget(emptyLayout(), widget);
     render(BindPicker, { widget });
+    // Root is now one drill tile per group; the flat list runs into the
+    // bottom of the window once a project has real content.
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^level/i }));
     await fireEvent.click(screen.getByRole("menuitem", { name: /drums — level/i }));
     const bound = surface.page.widgets.find((w) => w.id === widget.id);
     expect(bound?.target).toEqual({ kind: "trackGain", trackId: "t1" });
@@ -275,11 +383,28 @@ describe("the bind picker", () => {
     expect(surface.bindFor).toBe(null);
   });
 
+  it("drills into a group and back out again", async () => {
+    const widget = unboundWidget("knob");
+    surface.layout = addWidget(emptyLayout(), widget);
+    render(BindPicker, { widget });
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^level/i }));
+    expect(screen.getByRole("menuitem", { name: /drums — level/i })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /^pan/i })).toBeNull();
+    const menu = screen.getByRole("menu");
+    await fireEvent.keyDown(menu, { key: "Escape" });
+    // Escape from a group peels one level rather than closing the picker —
+    // the root's tiles (LEVEL, PAN, …) are back, not the leaf items.
+    expect(screen.getByRole("menuitem", { name: /^level/i })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /^pan/i })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /drums — level/i })).toBeNull();
+  });
+
   it("carries the lamp role a lamp needs to act", async () => {
     const widget = unboundWidget("lamp");
     surface.layout = addWidget(emptyLayout(), widget);
     render(BindPicker, { widget });
-    await fireEvent.click(screen.getAllByRole("menuitem", { name: "Drums" })[1]); // SOLO group
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^solo/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Drums" }));
     const bound = surface.page.widgets.find((w) => w.id === widget.id);
     expect(bound?.target).toEqual({ kind: "trackSolo", trackId: "t1" });
     expect(bound?.lampRole).toBe("solo");
@@ -291,5 +416,105 @@ describe("the bind picker", () => {
     render(BindPicker, { widget });
     await fireEvent.click(screen.getByRole("menuitem", { name: /unbind/i }));
     expect(surface.page.widgets.find((w) => w.id === widget.id)?.target).toBe(null);
+  });
+
+  it("adds a pad from an audio clip, raw ticked, and binds the pad to the new player", async () => {
+    const widget = unboundWidget("pad");
+    surface.layout = addWidget(emptyLayout(), widget);
+    project.clips = [
+      {
+        id: "ac1",
+        trackId: "t1",
+        name: "KICK.wav",
+        sourcePath: "audio/kick.wav",
+        sourceChannels: 2,
+        sourceSampleRate: 48000,
+        sourceLengthSamples: 4800,
+        timelineStartSamples: 0,
+        offsetSamples: 0,
+        lengthSamples: 4800,
+        gainDb: 0,
+        fadeInSamples: 0,
+        fadeOutSamples: 0,
+      },
+    ];
+    render(BindPicker, { widget });
+    await fireEvent.click(screen.getByRole("menuitem", { name: /add pad from clip/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "KICK.wav" }));
+    // raw defaults to ticked — V-6 is the point of the whole plan. The bind
+    // itself lands after `addAudioPlayer`'s await, one tick past the click.
+    await vi.waitFor(() =>
+      expect(surface.page.widgets.find((w) => w.id === widget.id)?.target).toEqual({
+        kind: "player",
+        playerId: "new-p1",
+      }),
+    );
+    expect(calls).toEqual([`player_add:${JSON.stringify({ kind: "audioClip", clipId: "ac1" })}:true`]);
+  });
+});
+
+describe("a player pad", () => {
+  // `SurfacePanel`'s mount effect calls `surface.hydrate`, which on its
+  // FIRST call this file makes replaces `surface.layout` wholesale (nothing
+  // in localStorage yet, so it lands on `emptyLayout()`) — setting the
+  // layout before `render` loses the race to it. Render first, then set
+  // the layout the same way a bind picker or a live edit would.
+  async function renderWithPlayerPad(target: { playerId: string }) {
+    render(SurfacePanel);
+    surface.layout = addWidget(emptyLayout(), unboundWidget("pad", { target: { kind: "player", ...target } }));
+    await tick();
+  }
+
+  it("shows a player pad's source and raw flag", async () => {
+    players.list = [
+      {
+        id: "p1",
+        name: "KICK",
+        source: { kind: "audioClip", clipId: "c1" },
+        raw: true,
+        trigger: { mode: "oneShot" },
+      },
+    ];
+    await renderWithPlayerPad({ playerId: "p1" });
+    expect(screen.getByTestId("pad-p1-source").textContent).toContain("KICK");
+    expect(screen.getByTestId("pad-p1-raw")).toBeTruthy();
+  });
+
+  it("fires the player on pointerdown and stops it on pointerup in gate mode", async () => {
+    players.list = [
+      { id: "p1", name: "KICK", source: { kind: "audioClip", clipId: "c1" }, raw: true, trigger: { mode: "gate" } },
+    ];
+    await renderWithPlayerPad({ playerId: "p1" });
+    const pad = screen.getByRole("button", { name: "KICK" });
+    Object.assign(pad, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await fireEvent.pointerDown(pad, { button: 0, pointerId: 1 });
+    await fireEvent.pointerUp(pad, { pointerId: 1 });
+    // A gate pad must not ALSO fire on the click a pointer pair produces —
+    // that would double-trigger the very press this test presses once.
+    await fireEvent.click(pad);
+    expect(calls).toEqual(["player_fire:p1", "player_stop:p1"]);
+  });
+
+  it("degrades a dead player id to the pad's own label, never throws", async () => {
+    // No matching row in `players.list` — a project switch or a removed
+    // player. `launch.clipIdForPlayer`'s degrade-to-null contract, mirrored
+    // here: the pad falls back to its own stored label instead of crashing.
+    players.list = [];
+    render(SurfacePanel);
+    // Setting the layout after mount is what would throw, if it throws —
+    // a bad lookup inside the template runs during this reactive update,
+    // not during `render`'s initial (player-less) empty deck.
+    surface.layout = addWidget(
+      emptyLayout(),
+      unboundWidget("pad", { label: "GONE", target: { kind: "player", playerId: "dead" } }),
+    );
+    await tick();
+    const pad = screen.getByRole("button", { name: "GONE" }) as HTMLButtonElement;
+    expect(pad).toBeTruthy();
+    // The ledger's ruling, and the half this test used to miss: it must LOOK
+    // unbound. Enabled, it is indistinguishable from a working pad and does
+    // nothing when pressed — silence, which is the failure this branch keeps
+    // producing.
+    expect(pad.disabled).toBe(true);
   });
 });

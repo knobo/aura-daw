@@ -40,6 +40,15 @@
       const clip = midi.clipById(b.target.clipId);
       return clip ? `clip · ${clip.name}` : "clip · missing";
     }
+    if (b.target.kind === "player") {
+      // Fix round 1, Critical 2: resolve through `launch.players` (the
+      // same registry `mapClip`/`clipSelfTriggers` use) rather than
+      // showing a bare id, or throwing on `b.target.trackIds` below —
+      // this was the exact crash the panel had on every migrated pad.
+      const clipId = launch.clipIdForPlayer(b.target.playerId);
+      const clip = clipId ? midi.clipById(clipId) : null;
+      return clip ? `player · ${clip.name}` : "player · unresolved";
+    }
     const names = b.target.trackIds
       .map((id) => project.trackById(id)?.name ?? "?")
       .join(", ");
@@ -242,6 +251,7 @@
 
     <div class="list" role="table" aria-label="Launch bindings">
       <div class="headrow silk" role="row">
+        <span></span>
         <span>name</span>
         <span>note</span>
         <span>ch</span>
@@ -259,13 +269,23 @@
           class:play={launch.overlay?.id === b.id}
           role="row"
           tabindex="0"
-          title="Click the name to play · F2 to rename · click target to jump"
+          title="▶ to play · click the name to rename · click target to jump"
           onclick={() => onRowClick(b.id)}
           ondblclick={() => onRowDblClick(b.id)}
           onkeydown={(e) => {
             if (e.key === "Enter") playScene(b.id);
           }}
         >
+          <button
+            type="button"
+            class="play-btn"
+            title="Play {b.name}"
+            aria-label="Play {b.name}"
+            onclick={(e) => {
+              e.stopPropagation();
+              playScene(b.id);
+            }}>▶</button
+          >
           {#if editNameId === b.id}
             <input
               class="name mono"
@@ -283,10 +303,11 @@
             <button
               type="button"
               class="name playlab mono"
-              title="Play {b.name}"
+              title="Rename {b.name}"
               onclick={(e) => {
                 e.stopPropagation();
-                playScene(b.id);
+                launch.selectedId = b.id;
+                startNameEdit(b.id, b.name);
               }}>{b.name}</button
             >
           {/if}
@@ -506,7 +527,7 @@
   .headrow,
   .row {
     display: grid;
-    grid-template-columns: 1fr 72px 52px 1.4fr auto;
+    grid-template-columns: 22px 1fr 72px 52px 1.4fr auto;
     gap: 6px;
     align-items: center;
   }
@@ -546,6 +567,19 @@
   button.name.playlab {
     text-align: left;
     cursor: pointer;
+  }
+  .play-btn {
+    background: transparent;
+    border: var(--border-width) solid transparent;
+    color: var(--text-faint);
+    padding: 0;
+    font: inherit;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .play-btn:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
   }
   button.name.playlab:hover {
     color: var(--cyan);

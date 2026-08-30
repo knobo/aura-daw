@@ -57,6 +57,9 @@ import type {
   LaunchMap,
   LaunchSnapshot,
   OpenSidecarEvent,
+  PlayerInfo,
+  PlayerSource,
+  PlayerTriggerMode,
   PluginCatalog,
   PluginCatalogPatch,
   PluginDescriptor,
@@ -514,6 +517,23 @@ export interface Backend {
   launchStop?(): Promise<void>;
   launchLearnArm?(id: string | null): Promise<void>;
   launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
+
+  // ── players (Plan V — V2, Task 9; Task 13 adds fire/stop/add) ──
+  /** Every player in the document. Read-only; fix round 1, Critical 2
+   * uses it to resolve a `LaunchTarget::Player` back to its clip, and
+   * Task 13's `players.svelte.ts` uses it to mirror the whole registry. */
+  playersGet?(): Promise<PlayerInfo[]>;
+  /** Fire a player's own playhead from 0 (frozen name, Task 9). */
+  playerFire?(playerId: string): Promise<void>;
+  /** Cut a player's playhead (frozen name, Task 9) — gate mode's release. */
+  playerStop?(playerId: string): Promise<void>;
+  /** Create a player — undoable, journaled (frozen name, Task 9). */
+  playerAdd?(source: PlayerSource, raw?: boolean, name?: string | null): Promise<PlayerInfo>;
+  /** Set a player's trigger mode — undoable, journaled (frozen name,
+   * Task 11's `player_set_trigger_mode`; the reachability seam Task 13's
+   * pad wires up, per the ledger's ruling that a pad inspector for this
+   * belongs here and not to a later task). */
+  playerSetTriggerMode?(playerId: string, mode: PlayerTriggerMode): Promise<void>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -1164,6 +1184,22 @@ class TauriBackend implements Backend {
   }
   launchLearnTake() {
     return invoke<{ note: number; channel: number } | null>("launch_learn_take");
+  }
+
+  playersGet() {
+    return invoke<PlayerInfo[]>("players_get");
+  }
+  async playerFire(playerId: string) {
+    await invoke("player_fire", { playerId });
+  }
+  async playerStop(playerId: string) {
+    await invoke("player_stop", { playerId });
+  }
+  playerAdd(source: PlayerSource, raw = false, name: string | null = null) {
+    return invoke<PlayerInfo>("player_add", { source, raw, name });
+  }
+  async playerSetTriggerMode(playerId: string, mode: PlayerTriggerMode) {
+    await invoke("player_set_trigger_mode", { playerId, mode });
   }
 
   libraryScan(dir: string) {

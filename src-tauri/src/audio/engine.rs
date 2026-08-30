@@ -45,7 +45,7 @@ use super::rt::{
     SharedRt, TrackRamps, NO_PARK,
 };
 use super::transport;
-use super::types::{derive_slots, mixer_slot_count, Clip, MeterFrame, Store};
+use super::types::{Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
@@ -61,6 +61,58 @@ fn audio_row_for(tracks: &[RtTrack], slot: usize) -> Option<usize> {
         .iter()
         .position(|r| r.slot == slot && r.live.is_some())
         .or_else(|| tracks.iter().position(|r| r.slot == slot))
+}
+
+/// The one `RtClip` a player's audio source becomes: the clip's SOURCE
+/// region, rebased to position 0.
+///
+/// Position 0 is what "an ephemeral placement" means to the renderer — a
+/// player's playhead starts at 0 on press (V-2: a player has no absolute
+/// placement, so it cannot sit anywhere else).
+///
+/// V-16 lives here. A RAW player takes the source's samples for the clip's
+/// region at unity — no clip gain, no fades — so a raw pad is the same
+/// signal as auditioning the file in the browser. A non-raw player keeps
+/// the clip's own gain and fades, because then the pad is playing the CLIP,
+/// not the file.
+///
+/// A source that is not decoded yet is silence (an empty row), not a panic:
+/// `ensure_loaded` caches by `SourceId` over `s.clips`, so this only happens
+/// when the file failed to load — the same tolerance the track loop's
+/// `filter_map` has.
+fn player_clip_row(
+    c: &Clip,
+    raw: bool,
+    cache: &HashMap<SourceId, CachedSource>,
+) -> Vec<RtClip> {
+    let Some(samples) = cache.get(&c.source_id).map(|e| e.data.clone()) else {
+        return Vec::new();
+    };
+    vec![RtClip {
+        start: 0,
+        offset: c.offset_samples,
+        len: c.length_samples,
+        gain: if raw { 1.0 } else { mixer::db_to_linear(c.gain_db) },
+        fade_in: if raw { 0 } else { c.fade_in_samples },
+        fade_out: if raw { 0 } else { c.fade_out_samples },
+        samples,
+    }]
+}
+
+/// Every launch binding that needs a clock of its own, in DOCUMENT order —
+/// which is what makes a clock index stable between one rebuild and the next
+/// for an unchanged map, and why `rebuild` still pairs the two ends by
+/// binding id when it is not (adding a binding shifts every later index).
+///
+/// Region targets only: a Clip target names a clip, not a set of tracks, and
+/// becomes a player after the migration (Task 13) — a player's clock is
+/// allocated ahead of these, from the reserved player range.
+pub(crate) fn scene_binding_ids(maps: &[crate::midi::launch::LaunchMap]) -> Vec<String> {
+    maps.iter()
+        .flat_map(|m| m.bindings.iter())
+        .filter(|b| matches!(b.target, crate::midi::launch::LaunchTarget::Region { .. }))
+        .map(|b| b.id.clone())
+        .collect()
 }
 
 /// Meter frame cadence (~60 Hz).
@@ -518,6 +570,19 @@ impl OutputCb {
             match self.graph_rx.pop() {
                 Ok(gp) => {
                     let fresh = gp.into_box();
+                    // Plan V — V2: the fresh table's clocks were snapshotted
+                    // when the rebuild BUILT it, and the graph being retired
+                    // here has been advancing its own copy ever since. Re-take
+                    // those positions now, at the instant of the swap, or a
+                    // scene sounding across a rebuild restarts a callback
+                    // block behind — a backwards jump with no discontinuity
+                    // flag, which is a click for audio and a re-emitted
+                    // note-on for MIDI. `reconcile_adoption` is bounded,
+                    // lock-free and allocation-free; it leaves alone any
+                    // clock fired or stopped since the snapshot.
+                    if let Some(old) = self.graph.as_ref() {
+                        fresh.clocks.reconcile_adoption(&old.clocks, old.generation);
+                    }
                     if let Some(old) = self.graph.replace(fresh) {
                         // slots() > 0 was checked: push cannot fail (and no
                         // dealloc can happen here on the RT thread).
@@ -720,32 +785,46 @@ impl OutputCb {
             return;
         }
 
-        let overlay_ended = self.shared.take_launch_ended();
-        let overlay = self
-            .shared
-            .launch_overlay()
-            .map(|mut ov| {
-                ov.exclusive = !playing;
-                ov
-            })
-            .or_else(|| {
-                overlay_ended.then_some(crate::audio::rt::LaunchPlayhead {
-                    pos: base,
-                    discontinuity: true,
-                    exclusive: false,
-                    ended: true,
-                })
-            });
-        let overlay_on = overlay.is_some();
-        match (&mut self.graph, playing, overlay_on) {
+        // V-13: clock 0's `on` flag IS the transport's play state, and this
+        // callback is the only reader of it — so it is also the writer. One
+        // relaxed store per block, taken from the same `playing` load every
+        // other decision in this block already uses, which makes the two
+        // provably identical without a lock and without caring which of the
+        // control plane's many transport paths wrote `SharedRt::playing`.
+        // `rebuild` seeds a fresh table with the same value so a graph is
+        // never published disagreeing with the transport.
+        if let Some(g) = self.graph.as_ref() {
+            g.clocks.set_transport_playing(playing);
+        }
+        // Any clock of its own running is what makes the graph render while
+        // the transport is stopped — the old `LaunchPlayhead::exclusive`
+        // preview, now read off the clock table instead of a flag.
+        //
+        // `flush_pending` is the block AFTER that: a clock that ends or is
+        // cut is no longer running, but the discontinuity it left behind has
+        // to be latched by a `begin_block` and read by the nodes still bound
+        // to it, and only a rendered block does either. Neither
+        // `render_live_input_only` nor the silent arm calls `begin_block`, so
+        // without this the `all_notes_off` is simply dropped whenever the
+        // transport is stopped — which is exactly the mainline
+        // `FireOrigin::Preview` case, a pad auditioned without Play. This is
+        // the old `LaunchPlayhead { ended: true }`, which kept `overlay_on`
+        // true for one more block for the same reason.
+        let clocks_running = self
+            .graph
+            .as_ref()
+            .is_some_and(|g| g.clocks.any_running() || g.clocks.flush_pending());
+        match (&mut self.graph, playing, clocks_running) {
             (Some(g), true, _) | (Some(g), false, true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                // Overlay-only (stopped + preview) still renders launched
-                // tracks so a double-click audition does not need Play.
-                let dropped = mixer::render_rt_launch(
+                // Clock-only (stopped + preview) still renders the nodes on
+                // that clock so a double-click audition does not need Play;
+                // every node still on the transport is silenced by clock 0's
+                // `on` flag inside `mixer::node_playhead`.
+                let dropped = mixer::render_rt_with_input(
                     g,
                     base,
                     &lp,
@@ -755,7 +834,6 @@ impl OutputCb {
                     discontinuity,
                     steady_base,
                     live_in,
-                    overlay,
                     Some(&mut self.meter_tx),
                 );
                 if dropped > 0 {
@@ -806,8 +884,13 @@ impl OutputCb {
             self.shared.position.store(next, Relaxed);
             self.next_pos = next;
         }
-        if overlay_on {
-            self.shared.advance_launch(frames);
+        // After the render, once per block — the mirror image of
+        // `begin_block`. The transport is advanced above, by the code that
+        // owns `SharedRt::position`; `advance` deliberately skips clock 0,
+        // because two writers on one playhead is the bug the table exists to
+        // make impossible.
+        if let Some(g) = self.graph.as_ref() {
+            g.clocks.advance(frames);
         }
         self.was_playing = playing;
     }
@@ -1747,8 +1830,11 @@ impl Control {
             // structural commit in the whole backend test suite runs through
             // here) would be a silent behavior change this refactor must not
             // smuggle in.
-            let slots_s = derive_slots(&s.tracks);
-            let mut tracks = Vec::with_capacity(s.tracks.len());
+            // Plan V — V2: players take mixer slots AFTER every track's, so
+            // the map a track's row is keyed by is unchanged by their
+            // presence (`types::derive_slots_with_players`' prefix property).
+            let slots_s = crate::audio::types::derive_slots_with_players(&s.tracks, &s.players);
+            let mut tracks = Vec::with_capacity(s.tracks.len() + s.players.len());
             for t in s.tracks.iter() {
                 let Some(&slot) = slots_s.get(&t.id) else {
                     continue; // automation tracks own no mixer slot or RtTrack
@@ -1818,7 +1904,12 @@ impl Control {
             // block).
             // The compiler's one input (Plan V1): built once here so Task 4
             // can hand the SAME slice to `compile_routing` a few lines down.
-            let nodes = crate::audio::node::mix_nodes(&s.tracks);
+            // Plan V — V2: players are compiled by the SAME call. V-6 is
+            // already enforced inside `From<&Player>`, so a raw player
+            // arrives here with no inserts and no sends and the two
+            // compilers below produce nothing for it without ever testing
+            // the word "raw".
+            let nodes = crate::audio::node::mix_nodes_with_players(&s.tracks, &s.players);
             let (mut compiled, failed) = crate::audio::insert::compile_inserts(
                 &nodes,
                 &s.plugins,
@@ -1872,7 +1963,6 @@ impl Control {
                 }
                 tracks[i].output = plan.output.get(slot).copied().flatten();
             }
-            routing = Some(plan);
             // The timeline boundary belongs to the material, so it is
             // derived exactly where the material is assembled — same helper
             // the offline bounce uses, so live and export agree on where the
@@ -1880,6 +1970,95 @@ impl Control {
             self.shared
                 .song_end
                 .store(offline::song_end(&tracks), Relaxed);
+            // PLAYERS (Plan V — V2, ruling V-1/V-2). One row per player,
+            // appended LAST — and specifically after `song_end` above, which
+            // is the whole reason they are not pushed with the tracks.
+            // `song_end` is the TIMELINE boundary, and a player's clip sits
+            // at position 0 by construction; folding it in would let a pad's
+            // 30-second sample declare the song 30 seconds long on an empty
+            // arrangement, and would lengthen every export. A pad
+            // performance is not arrangement material (V-15's argument,
+            // applied to the live graph's one timeline-shaped output).
+            //
+            // The chain, the two PDC lines and the output are attached here
+            // rather than in the loop above for the same ordering reason —
+            // the row has to exist first. Everything they read
+            // (`compiled`, `plan`) was compiled from the SAME `nodes` slice
+            // the tracks were, so a non-raw player gets exactly what a track
+            // with the same strip would; a raw one gets nothing, because
+            // `From<&Player>` gave the compilers nothing (V-6).
+            let mut live_players: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for p in s.players.iter() {
+                let node_id = crate::ids::TrackId::from(p.id.as_str());
+                let Some(&slot) = slots_s.get(&node_id) else { continue };
+                let mut live = None;
+                let clips = match &p.source {
+                    crate::audio::player::PlayerSource::AudioClip { clip_id } => {
+                        match s.clips.iter().find(|c| &c.id == clip_id) {
+                            Some(c) => player_clip_row(c, p.raw, &self.cache),
+                            // A source the document no longer has is
+                            // SILENCE, not a panic: the pad stays on the
+                            // page, it just has nothing to sound.
+                            None => Vec::new(),
+                        }
+                    }
+                    // R3 (Task 10): a MIDI pad's instrument is a live node no
+                    // TRACK owns, so the row carries no clips at all — the
+                    // instrument IS the source, fed the clip's notes rebased
+                    // onto the pad's own playhead. `PlayerSource::None` is a
+                    // knobs-only pad (R5) and renders silence by definition.
+                    crate::audio::player::PlayerSource::MidiClip { .. } => {
+                        live = crate::midi::playback::live_source_for_player(
+                            &s,
+                            p,
+                            self.cache_rate,
+                            bank.as_deref(),
+                            &mut self.live_nodes,
+                        );
+                        if live.is_some() {
+                            live_players
+                                .insert(crate::midi::playback::player_node_key(p.id.as_str()));
+                        }
+                        Vec::new()
+                    }
+                    crate::audio::player::PlayerSource::None => Vec::new(),
+                };
+                let i = tracks.len();
+                tracks.push(RtTrack::clips(slot, clips));
+                tracks[i].live = live;
+                if let Some(chain) = compiled.remove(&node_id) {
+                    if !chain.is_empty() {
+                        tracks[i].inserts = chain;
+                    }
+                }
+                if let Some(&delay) = plan.track_pdc.get(slot) {
+                    if delay > 0 {
+                        tracks[i].pdc = Some(crate::audio::pdc::DelayLine::new(
+                            delay,
+                            crate::audio::rt::MAX_LIVE_BLOCK,
+                            2,
+                        ));
+                    }
+                }
+                let out_delay = plan.out_delay.get(slot).copied().unwrap_or(0);
+                if out_delay > 0 {
+                    tracks[i].out_pdc = Some(crate::audio::pdc::DelayLine::new(
+                        out_delay,
+                        crate::audio::rt::MAX_LIVE_BLOCK,
+                        2,
+                    ));
+                }
+                tracks[i].output = plan.output.get(slot).copied().flatten();
+            }
+            // A pad that stopped rendering live releases its instrument. This
+            // is the player half of `append_from`'s `retain_tracks` and has to
+            // run HERE rather than there: `append_from` runs before this loop,
+            // so pruning the player namespace inside it would retire every
+            // pad's node on every rebuild and re-instantiate it a few
+            // statements later — the sound cut, and the loaded patch redone.
+            self.live_nodes.retain_players(&live_players);
+            routing = Some(plan);
             assembled = Some((slots_s, tracks));
         }
         #[cfg(test)]
@@ -1914,21 +2093,30 @@ impl Control {
         // enumerated sites where a command swaps the document and
         // republishes a few statements later; there, live truth is what [C1]
         // requires and the image is momentarily behind it.
-        let (params, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks) = {
+        let (params, clocks, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks) = {
             let session = self.session.lock(); // read-only: param VALUES + slot map + automation compile — short, no assembly
             let store = &session.store;
-            let slots = derive_slots(&store.tracks);
+            // Plan V — V2: tracks THEN players, in that order, everywhere.
+            // The player entries are appended after every track's, so adding
+            // a pad never renumbers a track's slot and a fader knob written
+            // against the old numbering can never land on a different strip
+            // (`types::derive_slots_with_players`' prefix property).
+            let slots = crate::audio::types::derive_slots_with_players(&store.tracks, &store.players);
             // Plan G2: the send-amount lanes are derived from the LIVE
             // document for the same reason the slot map is — a send added
             // during phase 1 must reach this rebuild's table, or its knob
             // would resolve into a lane no graph reads.
-            let send_slots = crate::audio::types::derive_send_slots(&store.tracks);
+            let send_slots = crate::audio::types::derive_send_slots_with_players(
+                &store.tracks,
+                &store.players,
+            );
             // Sized to mixer slots, not store track count: automation tracks
             // take no slot (design §3.6) and must not shift later rows.
-            let n_slots = mixer_slot_count(&store.tracks);
+            let n_slots =
+                crate::audio::types::mixer_slot_count_with_players(&store.tracks, &store.players);
             let params = Arc::new(ParamTable::with_slots_and_sends(
                 n_slots,
-                crate::audio::types::send_slot_count(&store.tracks),
+                crate::audio::types::send_slot_count_with_players(&store.tracks, &store.players),
             ));
             for t in store.tracks.iter() {
                 let Some(&slot) = slots.get(&t.id) else { continue };
@@ -1942,22 +2130,247 @@ impl Control {
                     params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
                 }
             }
-            let launch_ids = crate::midi::launch::runtime().audible_tracks();
-            for t in store.tracks.iter() {
-                if !launch_ids.iter().any(|id| id == t.id.as_str()) {
-                    continue;
+            // Plan V — V2: a player's fader values come from its COMPILED
+            // node, never from the document directly, so V-6 is applied here
+            // without this loop knowing the word "raw" — a raw player is
+            // unity/centre/unmuted because that is what it compiled to.
+            //
+            // Solo is deliberately absent: `From<&Player>` reports every
+            // player unsoloed (a pad that goes quiet because someone soloed
+            // a track is the deck cutting out mid-performance), and the
+            // player's slot reads its own clock, which `audible_with_launch`
+            // already lets override another track's solo.
+            for p in store.players.iter() {
+                let node = crate::audio::node::MixNode::from(p);
+                let Some(&slot) = slots.get(&node.id) else { continue };
+                params.set_gain_pair_linear(slot, mixer::db_to_linear(node.gain_db));
+                params.set_pan(slot, node.pan as f32);
+                params.set_flag(slot, super::rt::FLAG_MUTE, node.muted);
+                for snd in &node.sends {
+                    let Some(&idx) = send_slots.get(&snd.id) else { continue };
+                    params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
                 }
-                let Some(&slot) = slots.get(&t.id) else { continue };
-                params.set_flag(slot, super::rt::FLAG_LAUNCH, true);
             }
             params.any_solo.store(store.any_solo(), Relaxed);
-            // THE [C1] PUBLISH SITE — still under `session`, see above.
-            *self.tables.lock() = GraphTables {
+            // Plan V — V2: this graph's playheads, sized here on the control
+            // thread exactly like the `ParamTable` above. Clock 0 is the
+            // transport (V-13), then ONE PER PLAYER (Task 9 fills those; the
+            // range is reserved here so the two cuts cannot collide), then
+            // one per scene binding, then AT MOST ONE ORPHAN (below).
+            //
+            // Sizing from the DOCUMENT is what makes firing a pad an atomic
+            // write into a lane that already exists: a pad press must never
+            // rebuild the graph (the RT contract), so every binding that
+            // could be fired needs its clock before it is.
+            let scene_ids = scene_binding_ids(&session.midi.launch_maps);
+            let first_scene_clock = 1 + store.players.len() as u32;
+            // The reserved range itself, `1 ..= players.len()`, in document
+            // order. Duplicate player ids collapse in the map exactly as
+            // duplicate binding ids do below, and for the same reason the
+            // warn there exists — but a duplicate cannot arise from user
+            // data here: `Op::PlayerAdd` refuses an id the store already has.
+            let player_clocks: HashMap<crate::ids::PlayerId, u32> = store
+                .players
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.id.clone(), 1 + i as u32))
+                .collect();
+            let scene_clocks: HashMap<String, u32> = scene_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.clone(), first_scene_clock + i as u32))
+                .collect();
+            // Binding ids are the key of everything below — the clock map,
+            // the carry pairing, the drive thread's ledger — and nothing in
+            // `launch_set`/`launch_set_map` enforces that they are unique.
+            // Duplicates collapse silently: one map entry, one clock nothing
+            // reaches, and both bindings firing whichever won. Say so rather
+            // than let it look like a clock-allocation bug later.
+            // A warn, NOT a `debug_assert`: `launch_set_map` takes a whole
+            // `LaunchMap` from the frontend and from MCP, and a loaded project
+            // file can carry duplicates too — an assert here takes a dev build
+            // down on user data at the next rebuild.
+            if scene_clocks.len() != scene_ids.len() {
+                log::warn!(
+                    "launch: {} bindings share an id with another — they will share one clock",
+                    scene_ids.len() - scene_clocks.len()
+                );
+            }
+            // ONE guard, from the read of the retired tables to the publish.
+            // Dropping it in between would open a window in which a
+            // `fire_scene` writes its SLOT BINDINGS into the table this loop
+            // has already read: the clock state survives (adoption reconciles
+            // it), but the bindings do not, and that scene would then play the
+            // arrangement instead of its own material for the whole life of
+            // this graph. The publish has to happen under the session lock
+            // either way ([C1], see above); this makes it one critical
+            // section rather than two.
+            let mut published = self.tables.lock();
+            // Which of the retired table's scene-bound slots this graph can
+            // still account for. Computed BEFORE the clock table is built,
+            // because an orphan needs a clock of its own and therefore
+            // changes the size.
+            let (carried_slots, orphaned_slots) = {
+                let prev_binding_of: HashMap<u32, &String> =
+                    published.scene_clocks.iter().map(|(id, &c)| (c, id)).collect();
+                let mut carried: Vec<(usize, u32)> = Vec::new();
+                let mut orphaned: Vec<usize> = Vec::new();
+                for (tid, &slot) in slots.iter() {
+                    let Some(&prev_slot) = published.slots.get(tid) else { continue };
+                    let prev_clock = published.clocks.clock_of(prev_slot);
+                    let dst = prev_binding_of
+                        .get(&prev_clock)
+                        .and_then(|b| scene_clocks.get(b.as_str()));
+                    if let Some(&dst) = dst {
+                        carried.push((slot, dst));
+                        continue;
+                    }
+                    // Nothing in the new document owns this slot's clock. Two
+                    // ways that happens, and one way it does not:
+                    //   * the binding was DELETED while its scene sounded;
+                    //   * the slot is on the PREVIOUS graph's orphan clock and
+                    //     that clock's own flush has not been delivered yet —
+                    //     the debt has to travel with it, or a rebuild inside
+                    //     that window drops it;
+                    //   * anything else (the transport, or a player's clock —
+                    //     Task 9) is bound at graph build by the code that
+                    //     owns it, and is not ours to strand.
+                    let was_ours = prev_binding_of.contains_key(&prev_clock)
+                        || published.orphan_clock == Some(prev_clock);
+                    if !was_ours {
+                        continue;
+                    }
+                    // Only if something is still OWED. A scene that has both
+                    // ended and been flushed has already rejoined the
+                    // arrangement, and fabricating a second `all_notes_off`
+                    // would cut arrangement notes mid-song — the very thing
+                    // `ClockTable::stop`'s guard exists for.
+                    //
+                    // `flush_pending_for` beside `is_on` is not belt and
+                    // braces: a scene cut by Escape or by transport-stop is
+                    // `!is_on` with the flush still pending, and if the fresh
+                    // graph is adopted before the retired one renders another
+                    // block, NOBODY latches it — the same hung note, reached
+                    // through a one-block door.
+                    //
+                    // THE PRICE, named rather than left for the next reader
+                    // to find: the retired graph normally does render one
+                    // more block after the publish, and delivers that pending
+                    // flush itself — so the orphan minted here can hand the
+                    // SAME live node a SECOND `all_notes_off` one block
+                    // later, cutting any arrangement note started in between.
+                    // One clipped note is accepted over a hung one, which is
+                    // unbounded; closing it needs the blocks-rendered counter
+                    // `flush_pending_for`'s doc already books as a follow-up.
+                    if published.clocks.is_on(prev_clock)
+                        || published.clocks.flush_pending_for(prev_clock)
+                    {
+                        orphaned.push(slot);
+                    }
+                }
+                (carried, orphaned)
+            };
+            // The orphan clock: a stopped clock owing one discontinuity, and
+            // the only way the tracks of a deleted-while-sounding scene get
+            // the `all_notes_off` every other ending gets. Without it their
+            // slots default to the transport in the fresh table with no
+            // discontinuity anywhere, and a live node hangs the note it was
+            // holding. One clock serves all of them, because what they are
+            // owed is identical and none of them has an identity left. It is
+            // allocated ONLY when something is orphaned, so the common graph
+            // (and the perf harness) is not given a clock to iterate for a
+            // case that is not happening.
+            //
+            // It is PUBLISHED, and `release_finished_scenes` hands its slots
+            // back once the flush lands, exactly like a scene's. Leaving them
+            // bound was the first version and was wrong: a slot on any
+            // non-transport clock reads as `own_clock`, which overrides
+            // another track's SOLO (`mixer::audible_with_launch`), and no
+            // rebuild is scheduled by a mute/solo `Set` — so soloing a track
+            // would silently fail to silence the stranded one for as long as
+            // nobody happened to edit anything.
+            let orphan_clock = (!orphaned_slots.is_empty())
+                .then(|| first_scene_clock + scene_ids.len() as u32);
+            let clocks = Arc::new(
+                crate::audio::clock::ClockTable::with_slots_clocks_and_players(
+                    n_slots,
+                    1 + store.players.len() + scene_ids.len() + usize::from(orphan_clock.is_some()),
+                    store.players.len(),
+                ),
+            );
+            clocks.set_transport_playing(self.shared.playing.load(Relaxed));
+            // Each player's slot is bound to its clock for the LIFE of this
+            // graph, and nothing ever releases it — unlike a scene, a player
+            // does not BORROW a timeline track's slot, it owns its own. That
+            // is why the range is marked exclusive above: an idle player
+            // renders silence rather than the arrangement (V-2, and see
+            // `ClockTable::with_slots_clocks_and_players`).
+            //
+            // Binding here, at graph build, is what makes a pad press a
+            // single atomic write: `player_fire` finds a lane that already
+            // exists, so it never rebuilds the graph (the RT contract).
+            for (id, &clock) in player_clocks.iter() {
+                let Some(&slot) = slots.get(&crate::ids::TrackId::from(id.as_str())) else {
+                    continue;
+                };
+                clocks.bind_slot(slot, clock);
+            }
+            // Every sounding scene survives the rebuild. The overlay this
+            // replaces lived on `SharedRt`, so editing a clip while a pad
+            // sounded did not rewind it; the table is per-graph, so that only
+            // stays true if the state is carried across by hand.
+            //
+            // BY BINDING ID, never by index: an index is "the i-th Region
+            // binding in document order", and this rebuild may be running
+            // *because* a binding was added or removed. Pairing by index
+            // there would move one scene's playhead onto another scene.
+            //
+            // The SLOT bindings are carried the same way, by track id — the
+            // set of tracks a scene has claimed lives in the retired table's
+            // `slot_clock`, which is the only place that knows it per scene
+            // now that scenes are not singular.
+            //
+            // What is copied here is a SNAPSHOT taken while the retired graph
+            // is still rendering; `ClockTable::reconcile_adoption` re-takes
+            // it on the audio thread at the moment the swap actually happens,
+            // which is what makes it exact (see that method).
+            clocks.set_carry_source(published.generation);
+            // A SOUNDING PAD survives the rebuild, by the same argument and
+            // the same mechanism as a sounding scene: the table is per-graph,
+            // so editing anything while a pad plays would otherwise rewind
+            // it. By PLAYER ID, never by index — the index is "the i-th
+            // player in document order", and adding or removing a pad ahead
+            // of a sounding one renumbers it.
+            for (id, &dst) in player_clocks.iter() {
+                let Some(&src) = published.player_clocks.get(id) else { continue };
+                clocks.carry_over(&published.clocks, src, dst);
+            }
+            for (id, &dst) in scene_clocks.iter() {
+                let Some(&src) = published.scene_clocks.get(id) else { continue };
+                clocks.carry_over(&published.clocks, src, dst);
+            }
+            for (slot, dst) in carried_slots {
+                clocks.bind_slot(slot, dst);
+            }
+            if let Some(orphan) = orphan_clock {
+                clocks.owe_flush(orphan);
+                for slot in orphaned_slots {
+                    clocks.bind_slot(slot, orphan);
+                }
+            }
+            // THE [C1] PUBLISH SITE — still under `session`, and through the
+            // same guard the carry above read from, see there.
+            *published = GraphTables {
                 generation: self.generation,
                 params: params.clone(),
+                clocks: clocks.clone(),
+                scene_clocks,
+                player_clocks,
+                orphan_clock,
                 slots: slots.clone(),
                 send_slots: send_slots.clone(),
             };
+            drop(published);
             // Same generation, same slot map, published alongside the
             // tables (Task 6) — the meter fold resolves blocks under
             // whichever generation produced them, not the current tables.
@@ -1992,7 +2405,7 @@ impl Control {
                 self.cache_rate,
                 self.shared.song_end.load(Relaxed),
             );
-            (params, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks)
+            (params, clocks, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks)
         };
         // Task 10, pass-end trigger 2 (mode change — spec §4.5): a track
         // that WAS Write/Touch/Latch and no longer is has just ended its
@@ -2115,13 +2528,17 @@ impl Control {
             }
         }
 
-        let mut g = RtGraph::with_buses(tracks, buses, self.generation, params);
+        let mut g = RtGraph::with_buses(tracks, buses, self.generation, params, self.cache_rate);
         // RCU: the ramp table is attached BEFORE the graph is published, so
         // the callback only ever sees a snapshot whose ramps already belong
         // to it — and a retired graph keeps reading its own table, exactly
         // like `params`.
         g.set_track_ramps(track_ramps);
         g.clicks = Arc::new(clicks);
+        // RCU, same as the ramps: the table is attached BEFORE publication,
+        // so the callback only ever sees a snapshot whose playheads already
+        // belong to it.
+        g.clocks = clocks;
         let graph = Box::new(g);
 
         let Some(out) = self.output.as_mut() else { return };
@@ -4137,6 +4554,9 @@ pub fn load_wav(path: &Path) -> Result<(u16, u32, Vec<f32>), String> {
 mod tests {
     use super::*;
     use crate::audio::types::AutomationMode;
+    // Task 9 moved `rebuild` onto the `_with_players` variants; the tests
+    // below still exercise the track-only helpers directly.
+    use crate::audio::types::{derive_slots, mixer_slot_count};
     use std::sync::atomic::AtomicUsize;
 
     struct NullEvents;
@@ -4208,6 +4628,60 @@ mod tests {
             evt_rx,
             (graph_tx, retire_rx, meter_rx),
         )
+    }
+
+    /// The deleted `ending_a_sounding_overlay_hands_the_engine_one_flush_frame`,
+    /// re-homed at the level that actually decides it.
+    ///
+    /// A scene fired with the transport STOPPED (`FireOrigin::Preview` — a
+    /// pad auditioned without pressing Play) that reaches its end leaves
+    /// `any_running` false. If that were the whole gate the callback would
+    /// render nothing that block, no `begin_block` would run, and the
+    /// `all_notes_off` owed to the live nodes still bound to the clock would
+    /// be dropped — freezing the voice in the node, to resurrect the next
+    /// time anything renders it (arming the track for monitoring, say).
+    /// `flush_pending` buys exactly the one extra block
+    /// `LaunchPlayhead { ended: true }` used to buy.
+    ///
+    /// A pushed meter chunk is the observable "this block was rendered":
+    /// nothing else in the callback pushes one, and the silent arm does not.
+    #[test]
+    fn a_scene_ending_while_stopped_still_gets_its_one_flush_block() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, mut peers) = output_cb(shared.clone());
+        // Transport STOPPED throughout — this is the preview path.
+        shared.playing.store(false, Relaxed);
+
+        let mut graph = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(1)));
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(1, 2);
+        clocks.fire(1, 0, 64, false); // ends inside the very first block
+        clocks.bind_slot(0, 1);
+        graph.clocks = Arc::new(clocks);
+        peers
+            .0
+            .push(GraphPtr::new(Box::new(graph)))
+            .map_err(|_| "graph queue")
+            .expect("queue has room");
+
+        let mut out = vec![0.0f32; 128 * 2];
+        let mut rendered = |cb: &mut OutputCb, rx: &mut rtrb::Consumer<RawMeterBlock>| {
+            cb.render(&mut out);
+            let mut any = false;
+            while rx.pop().is_ok() {
+                any = true;
+            }
+            any
+        };
+
+        assert!(rendered(&mut cb, &mut peers.2), "the scene is sounding");
+        assert!(
+            rendered(&mut cb, &mut peers.2),
+            "the block after it ends is the flush frame, and must still render"
+        );
+        assert!(
+            !rendered(&mut cb, &mut peers.2),
+            "and exactly one: a stopped transport with nothing owed renders nothing"
+        );
     }
 
     /// The RT half of auto-stop, end to end and deterministic: the callback
@@ -4320,6 +4794,8 @@ mod tests {
             sends: Vec::new(),
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),
@@ -4377,6 +4853,8 @@ mod tests {
                 sends: Vec::new(),
                 out_pdc: None,
                 output: None,
+                tail_frames: 0,
+                flush_left: 0,
                 win: Default::default(),
                 slot,
                 clips: Vec::new(),
@@ -4406,6 +4884,8 @@ mod tests {
                 sends: Vec::new(),
                 out_pdc: None,
                 output: None,
+                tail_frames: 0,
+                flush_left: 0,
                 win: Default::default(),
                 slot,
                 clips: Vec::new(),
@@ -4775,6 +5255,10 @@ mod tests {
             send_slots: Default::default(),
             generation: 0,
             params: Arc::new(ParamTable::default()),
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
+            player_clocks: Default::default(),
+            orphan_clock: None,
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
@@ -4815,6 +5299,10 @@ mod tests {
             send_slots: Default::default(),
             generation: 0,
             params: Arc::new(ParamTable::default()),
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
+            player_clocks: Default::default(),
+            orphan_clock: None,
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
@@ -4919,6 +5407,1646 @@ mod tests {
                 AutomationPoint { tick: 3840, value: 0.0 },
             ],
         }
+    }
+
+    // ---- Plan V — V2, Task 8: the clock table is sized by the document ----
+
+    fn region_binding(id: &str, note: u8, tracks: &[&str]) -> crate::midi::launch::LaunchBinding {
+        crate::midi::launch::LaunchBinding {
+            id: id.into(),
+            name: id.into(),
+            note,
+            channel: None,
+            target: crate::midi::launch::LaunchTarget::Region {
+                start_ticks: 0,
+                length_ticks: 960,
+                track_ids: tracks.iter().map(|t| (*t).to_string()).collect(),
+            },
+        }
+    }
+
+    /// The allocation the whole cut rests on: clock 0 is the transport,
+    /// `1 ..= players.len()` is RESERVED for players (Task 9 fills it), and
+    /// the scenes start after that. Reserving the player range even with no
+    /// player row rendering yet is what keeps the two cuts from colliding.
+    ///
+    /// A Clip binding gets NO clock — it names a clip, not a set of tracks,
+    /// and becomes a player at the migration (Task 13).
+    #[test]
+    fn rebuild_gives_every_region_binding_a_clock_after_the_reserved_player_range() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.players.push(crate::audio::player::Player::new(
+                crate::ids::PlayerId::from("p-1"),
+                "Player 1",
+            ));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![
+                region_binding("b1", 60, &["t-1"]),
+                crate::midi::launch::LaunchBinding {
+                    target: crate::midi::launch::LaunchTarget::Clip { clip_id: "c-1".into() },
+                    ..region_binding("b-clip", 61, &["t-1"])
+                },
+                region_binding("b2", 62, &["t-1"]),
+            ];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        assert_eq!(t.scene_clocks.get("b1"), Some(&2), "after transport + one player");
+        assert_eq!(t.scene_clocks.get("b2"), Some(&3));
+        assert_eq!(t.scene_clocks.get("b-clip"), None, "a Clip target is not a scene");
+        assert_eq!(t.clocks.clocks(), 4, "transport + player + two scenes");
+    }
+
+    // ---- Plan V — V2, Task 9: audio-clip players in the live graph ----
+
+    fn test_player(id: &str, clip: &str, raw: bool) -> crate::audio::player::Player {
+        let mut p = crate::audio::player::Player::new(crate::ids::PlayerId::from(id), id);
+        p.source = crate::audio::player::PlayerSource::AudioClip { clip_id: clip.into() };
+        p.raw = raw;
+        p
+    }
+
+    /// A source whose every sample is distinguishable, so an offset or a
+    /// length error shows up as the WRONG samples rather than as silence.
+    fn ramp_source(frames: usize) -> Arc<RtClipData> {
+        Arc::new(RtClipData {
+            channels: 1,
+            data: (0..frames).map(|i| (i + 1) as f32 / 1000.0).collect(),
+        })
+    }
+
+    fn cache_with(sid: &SourceId, data: Arc<RtClipData>) -> HashMap<SourceId, CachedSource> {
+        let mut cache = HashMap::new();
+        cache.insert(
+            sid.clone(),
+            CachedSource { source_path: "audio/x.wav".into(), data },
+        );
+        cache
+    }
+
+    /// A trimmed, gained, faded clip — everything V-16 says a RAW player
+    /// must ignore.
+    fn trimmed_clip() -> (Clip, SourceId) {
+        let sid = SourceId::mint();
+        let mut c = crate::audio::types::testutil::test_clip("c1", "t-1");
+        c.source_id = sid.clone();
+        c.timeline_start_samples = 500_000; // the placement's bar-40 position
+        c.offset_samples = 10;
+        c.length_samples = 100;
+        c.gain_db = -6.0;
+        c.fade_in_samples = 20;
+        c.fade_out_samples = 20;
+        (c, sid)
+    }
+
+    /// V-16: a raw player is the SOURCE region at unity. Not the clip's gain,
+    /// not its fades — and not its timeline position either, because a player
+    /// has no absolute placement (V-2): the row's clip sits at 0, which is
+    /// where a pad's playhead starts on press.
+    #[test]
+    fn a_raw_players_row_is_the_source_region_at_unity_placed_at_zero() {
+        let (c, sid) = trimmed_clip();
+        let cache = cache_with(&sid, ramp_source(200));
+        let row = player_clip_row(&c, true, &cache);
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].start, 0, "the ephemeral placement, not bar 40");
+        assert_eq!(row[0].offset, 10, "the clip's trim IS the source region");
+        assert_eq!(row[0].len, 100);
+        assert_eq!(row[0].gain, 1.0, "unity: no clip gain");
+        assert_eq!(row[0].fade_in, 0);
+        assert_eq!(row[0].fade_out, 0);
+    }
+
+    /// The other half of V-16: not raw means the pad is playing the CLIP, so
+    /// the clip's own gain and fades come with it.
+    #[test]
+    fn a_non_raw_players_row_keeps_the_clips_gain_and_fades() {
+        let (c, sid) = trimmed_clip();
+        let cache = cache_with(&sid, ramp_source(200));
+        let row = player_clip_row(&c, false, &cache);
+        assert_eq!(row[0].start, 0, "still no absolute placement (V-2)");
+        assert!((row[0].gain - mixer::db_to_linear(-6.0)).abs() < 1e-6);
+        assert_eq!(row[0].fade_in, 20);
+        assert_eq!(row[0].fade_out, 20);
+    }
+
+    /// A source that never decoded is SILENCE, not a panic — the same
+    /// tolerance the track loop's `filter_map` has.
+    #[test]
+    fn a_player_whose_source_never_decoded_is_an_empty_row() {
+        let (c, _sid) = trimmed_clip();
+        assert!(player_clip_row(&c, true, &HashMap::new()).is_empty());
+    }
+
+    /// The whole cut, at the level that decides it. Players take mixer slots
+    /// AFTER every track's (so no track is renumbered), each owns one clock
+    /// from the reserved range, and its slot is bound to it at graph build so
+    /// a pad press is one atomic store rather than a rebuild.
+    #[test]
+    fn rebuild_gives_every_player_a_slot_a_clock_and_a_binding() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.tracks.push(test_track("t-2"));
+            s.store.players.push(test_player("p-1", "c1", false));
+            s.store.players.push(test_player("p-2", "c1", true));
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        assert_eq!(t.slots[&crate::ids::TrackId::from("t-1")], 0);
+        assert_eq!(t.slots[&crate::ids::TrackId::from("t-2")], 1);
+        assert_eq!(t.slots[&crate::ids::TrackId::from("p-1")], 2, "after every track");
+        assert_eq!(t.slots[&crate::ids::TrackId::from("p-2")], 3);
+        assert_eq!(t.player_clocks[&crate::ids::PlayerId::from("p-1")], 1);
+        assert_eq!(t.player_clocks[&crate::ids::PlayerId::from("p-2")], 2);
+        assert_eq!(t.clocks.clocks(), 3, "transport + two players, no scenes");
+        assert_eq!(t.clocks.clock_of(2), 1, "p-1's slot reads p-1's clock");
+        assert_eq!(t.clocks.clock_of(3), 2);
+        assert_eq!(t.clocks.clock_of(0), 0, "and a track still reads the transport");
+        assert_eq!(t.params.len(), 4, "the param table grew with them");
+    }
+
+    /// Task 10, R3, at the seam that decides it: a MIDI player's row in the
+    /// PUBLISHED graph carries a live node — an instrument instance no track
+    /// owns — with the clip's notes rebased onto the pad's own playhead.
+    ///
+    /// Through the real non-headless `rebuild` on purpose. The unit tests in
+    /// `midi::playback` cover `live_source_for_player` itself; this is the
+    /// only thing that can say the compiler ATTACHES it, which is exactly the
+    /// hole Task 9 left behind (`_ => Vec::new()`).
+    #[test]
+    fn a_midi_players_row_carries_the_live_node_its_instrument_renders_through() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+        {
+            let mut s = session.lock();
+            let mut p = crate::audio::player::Player::new(
+                crate::ids::PlayerId::from("p-1"),
+                "PAD",
+            );
+            p.source = crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc1".into(),
+                instrument_id: Some("plugin:i1".into()),
+            };
+            s.store.players.push(p);
+            // The clip sits at bar 5 of an arrangement whose track it names
+            // does not even exist — a pad's clip is not arrangement material.
+            s.midi.clips.push(crate::midi::types::MidiClip {
+                id: "mc1".into(),
+                track_id: "no-track".into(),
+                name: "pad".into(),
+                timeline_start_ticks: 15_360,
+                length_ticks: 960,
+                notes: vec![crate::midi::types::MidiNote {
+                    tick: 0,
+                    length_ticks: 480,
+                    key: 60,
+                    velocity: 100,
+                    channel: 0,
+                    note_id: crate::ids::NoteId(0),
+                }],
+                next_note_id: 1,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("no-track"),
+                content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
+            });
+            // R3 itself: the instance belongs to NO track.
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "i1".into(),
+                uid: "lv2:http://zynaddsubfx.sourceforge.net".into(),
+                name: "ZynAddSubFX".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.republish_full();
+        }
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+
+        let graph = graph_rx.pop().expect("the tick published a graph").into_box();
+        let slot = ctl.tables.lock().slots[&crate::ids::TrackId::from("p-1")];
+        let row = graph
+            .tracks
+            .iter()
+            .find(|t| t.slot == slot)
+            .expect("the player has a row");
+        let live = row.live.as_ref().expect("a MIDI pad has an instrument to play");
+        assert_eq!(
+            live.events[0].sample, 0,
+            "the pad's playhead starts at 0, not at the clip's bar-5 position"
+        );
+        assert_eq!(live.events[0].velocity, 100);
+        assert_eq!(live.events[1].sample, 12_000, "and the note keeps its length");
+        assert!(row.clips.is_empty(), "the instrument IS the source; there is no clip row");
+        assert_eq!(
+            ctl.live_nodes.len(),
+            1,
+            "and the node is REGISTERED, so the next rebuild reuses it"
+        );
+
+        // Delete the pad: its instrument is released. The prune has to live on
+        // the player side of `rebuild` — `append_from`'s track prune runs
+        // before the player rows exist and deliberately skips the namespace.
+        {
+            let mut s = session.lock();
+            s.store.players.clear();
+            s.republish_full();
+        }
+        ctl.rebuild();
+        assert!(ctl.live_nodes.is_empty(), "a deleted pad does not leak its instrument");
+    }
+
+    /// V-6, at the one place the graph's fader values are written: a raw
+    /// player's strip is unity/centre/unmuted whatever the document holds,
+    /// because that is what `From<&Player>` compiled it to.
+    #[test]
+    fn rebuild_writes_a_raw_players_fader_at_unity_whatever_the_document_says() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            let mut raw = test_player("p-raw", "c1", true);
+            raw.node.gain_db = -24.0;
+            raw.node.pan = -1.0;
+            raw.node.muted = true;
+            let mut norm = test_player("p-norm", "c1", false);
+            norm.node.gain_db = -6.0;
+            norm.node.pan = 0.5;
+            s.store.players.push(raw);
+            s.store.players.push(norm);
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let raw_slot = t.slots[&crate::ids::TrackId::from("p-raw")];
+        assert!((f32::from_bits(t.params.gain[raw_slot].load(Relaxed)) - 1.0).abs() < 1e-6);
+        assert_eq!(f32::from_bits(t.params.pan[raw_slot].load(Relaxed)), 0.0);
+        assert_eq!(
+            t.params.flags[raw_slot].load(Relaxed) & super::super::rt::FLAG_MUTE,
+            0,
+            "a stale mute does not silence a raw pad"
+        );
+
+        let norm_slot = t.slots[&crate::ids::TrackId::from("p-norm")];
+        let g = f32::from_bits(t.params.gain[norm_slot].load(Relaxed));
+        assert!((g - mixer::db_to_linear(-6.0)).abs() < 1e-4, "got {g}");
+        assert_eq!(f32::from_bits(t.params.pan[norm_slot].load(Relaxed)), 0.5);
+    }
+
+    /// A SOUNDING pad survives a rebuild, by player id — the same argument
+    /// as a sounding scene. Adding a pad ahead of one that is playing
+    /// renumbers its clock, so pairing by index would hand one pad's
+    /// playhead to another; and without carrying at all, editing anything
+    /// would rewind whatever was playing.
+    #[test]
+    fn a_rebuild_carries_a_sounding_player_by_id_not_by_index() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.players.push(test_player("p-late", "c1", true));
+        ctl.rebuild();
+
+        {
+            let t = ctl.tables.lock();
+            assert_eq!(t.player_clocks[&crate::ids::PlayerId::from("p-late")], 1);
+            t.clocks.fire(1, 0, 100_000, false);
+            t.clocks.advance(64);
+        }
+
+        session
+            .lock()
+            .store
+            .players
+            .insert(0, test_player("p-early", "c1", true));
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let moved = t.player_clocks[&crate::ids::PlayerId::from("p-late")];
+        assert_eq!(moved, 2, "renumbered by the insertion");
+        assert!(t.clocks.is_on(moved), "still sounding, at its new index");
+        assert!(!t.clocks.is_on(t.player_clocks[&crate::ids::PlayerId::from("p-early")]));
+        assert_eq!(
+            t.clocks.clock_of(t.slots[&crate::ids::TrackId::from("p-late")]),
+            moved,
+            "and its slot followed it"
+        );
+    }
+
+    /// The one that makes a player make a sound, end to end at the mixer.
+    ///
+    /// Two claims in one render, because they are the same wiring seen from
+    /// both sides:
+    ///
+    /// * V-2 — while the pad is IDLE and the transport rolls straight over
+    ///   position 0, the row is silent. Its clip sits at 0, so without the
+    ///   exclusive player range (`ClockTable::with_slots_clocks_and_players`)
+    ///   every pad's sample would sound at bar 1 of every playthrough.
+    /// * V-16 — once fired, the output IS the source's samples from the
+    ///   clip's offset, at unity. The only thing between them is the centre
+    ///   pan law every unity-gain source goes through, which is exactly what
+    ///   makes the pad the same signal as auditioning the file.
+    #[test]
+    fn a_fired_raw_player_renders_the_sources_samples_and_is_silent_until_it_is() {
+        use crate::audio::transport::LoopSpec;
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2; // centre pan
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let cache = cache_with(&sid, source.clone());
+        let row = player_clip_row(&c, true, &cache);
+
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
+        // What `rebuild` publishes for one player: one slot, one player
+        // clock, bound.
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert_eq!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            0.0,
+            "V-2: the arrangement rolled over position 0 and the pad stayed silent"
+        );
+
+        g.clocks.fire(1, 0, c.length_samples, false);
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        for i in 0..64 {
+            let want = source.data[c.offset_samples as usize + i] * K;
+            assert!(
+                (out[i * 2] - want).abs() < 1e-6 && (out[i * 2 + 1] - want).abs() < 1e-6,
+                "frame {i}: got {}, want {want} (the source's own samples, at unity)",
+                out[i * 2]
+            );
+        }
+    }
+
+    /// V-2/V-15, in the LIVE graph's one timeline-shaped output.
+    /// `SharedRt::song_end` is the arrangement's boundary — it drives
+    /// stop-at-end, the export length and the ruler — and a player's clip
+    /// sits at position 0 by construction, so folding player rows into it
+    /// would let a pad's 30-second sample declare an empty song 30 seconds
+    /// long. The rows therefore have to be pushed AFTER `song_end` is taken.
+    ///
+    /// Phase 1 does not run headlessly (`self.output.is_none()`) and there is
+    /// no seam a test can wedge between the two statements, so this asserts
+    /// the SOURCE order that keeps them apart — the same device
+    /// `rebuild_takes_the_tables_lock_exactly_once` uses, and for the same
+    /// reason: reordering these two lines breaks it silently.
+    #[test]
+    fn rebuild_takes_song_end_before_it_appends_any_player_row() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/engine.rs"),
+        )
+        .expect("read engine.rs");
+        let start = src.find("    fn rebuild(&mut self) {").expect("rebuild");
+        let body = &src[start..];
+        let end = body[1..].find("\n    fn ").map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        let song_end = body.find(".song_end").expect("rebuild stores song_end");
+        // A LITERAL match on the loop header, which is the weakness of this
+        // device: extracting the player loop into a helper preserves the
+        // ordering this test is about and still fails it. If you do extract
+        // it, re-point this needle at whatever the call site reads (e.g.
+        // `self.append_player_rows(`) rather than deleting the test — the
+        // ordering is the invariant, the string is only how it is reached.
+        let players = body.find("for p in s.players.iter()").expect("rebuild appends player rows");
+        assert!(
+            song_end < players,
+            "the timeline boundary must be taken from the TRACK rows only: a \
+             player's clip is placed at 0, so a pad appended before this line \
+             would set the song's end from a pad's sample length"
+        );
+    }
+
+    /// V-2's other half, on the release side. A player OWNS its mixer slot
+    /// for the life of the graph — unlike a scene, which BORROWS a timeline
+    /// track's and has to hand it back — so the drive thread's poll must
+    /// never unbind one. Were a player's clock ever folded into
+    /// `release_finished_scenes`' set, the poll after a one-shot ended would
+    /// put the pad's slot back on the transport, and its clip (placed at 0
+    /// by construction) would then sound at bar 1 of every playthrough: the
+    /// exact defect `Playhead::exclusive` exists to prevent, reached through
+    /// the release path instead of the render path.
+    ///
+    /// A scene binding has to exist for this to prove anything:
+    /// `release_finished_scenes` returns early when there is nothing of its
+    /// own to release, which would mask the very fold this pins.
+    #[test]
+    fn the_scene_poll_never_hands_a_players_slot_back_to_the_transport() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.players.push(test_player("p-1", "c1", true));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let clock = t.player_clocks[&crate::ids::PlayerId::from("p-1")];
+        let slot = t.slots[&crate::ids::TrackId::from("p-1")];
+        t.clocks.fire(clock, 0, 64, false);
+        t.clocks.begin_block();
+        // Run the one-shot off its end: the clock stops itself and leaves a
+        // flush behind, which is precisely the state a scene gets released in.
+        t.clocks.advance(128);
+        assert!(!t.clocks.is_on(clock), "the one-shot ended");
+        t.clocks.begin_block(); // the flush block a scene's release waits for
+        t.release_finished_scenes();
+        assert_eq!(
+            t.clocks.clock_of(slot),
+            clock,
+            "a pad keeps its own playhead; nothing releases it"
+        );
+        assert_ne!(t.clocks.clock_of(slot), crate::audio::clock::TRANSPORT_CLOCK);
+    }
+
+    /// A pad is a performance, not a track: soloing a vocal must not cut the
+    /// deck. `mixer::audible_with_launch`'s `own_clock` argument is what buys
+    /// that, and a player's slot reports it in BOTH states — running (its
+    /// clock is on) and idle (`Playhead::exclusive`) — so this is the one
+    /// place the two halves are checked against a real render rather than
+    /// against the predicate in isolation.
+    #[test]
+    fn a_soloed_track_does_not_silence_a_sounding_pad() {
+        use crate::audio::transport::LoopSpec;
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let row = player_clip_row(&c, true, &cache_with(&sid, source.clone()));
+
+        // Slot 0 is a soloed timeline track, slot 1 the pad.
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        params.set_flag(0, super::super::rt::FLAG_SOLO, true);
+        params.any_solo.store(true, Relaxed);
+        let mut g = RtGraph::new(
+            vec![RtTrack::clips(0, Vec::new()), RtTrack::clips(1, row)],
+            2,
+            params,
+        );
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+
+        g.clocks.fire(1, 0, c.length_samples, false);
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
+            "a solo elsewhere in the mixer must not cut the pad"
+        );
+    }
+
+    /// Fix round 1, finding 1. An idle pad must cost NOTHING and, more to the
+    /// point, must PRODUCE nothing — including into its own pre-fader send.
+    ///
+    /// `on = false` was not enough. It is consumed inside `apply_fader_into`,
+    /// which runs after the clip read, after the inserts and after the
+    /// pre-fader taps; and because an off clock never advances, an unpressed
+    /// pad sat at `pos = 0` and re-read the first `frames` of its own sample
+    /// on every block, forever. Pre-fader taps are deliberately NOT gated by
+    /// `on` — a muted track's reverb should keep ringing — so that fragment
+    /// went into the bus continuously: "every pad sounds at bar 1" reached
+    /// through the send path instead of the master path.
+    ///
+    /// The bus is the assertion because it is the leak that was audible. The
+    /// master is checked too, since it was already silent and must stay so.
+    #[test]
+    fn an_idle_pad_leaks_nothing_into_its_pre_fader_bus() {
+        use crate::audio::transport::LoopSpec;
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let row = player_clip_row(&c, false, &cache_with(&sid, source));
+
+        // Slot 0 = a return bus, slot 1 = the pad, tapping it PRE-fader.
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 1));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        params.set_send_amount_linear(0, 1.0);
+        let mut pad = RtTrack::clips(1, row);
+        pad.sends = vec![crate::audio::rt::RtSend {
+            bus: 0,
+            amount: 0,
+            pre_fader: true,
+            delay: None,
+        }];
+        let bus = crate::audio::rt::RtBus {
+            slot: 0,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            output: None,
+            out_pdc: None,
+            win: Default::default(),
+        };
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params, 48_000);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+
+        // Two blocks, because the defect was per-block and forever.
+        let mut out = vec![0.0f32; 64 * 2];
+        for _ in 0..2 {
+            out.fill(0.0);
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            assert_eq!(
+                out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+                0.0,
+                "an unpressed pad reaches neither the master nor, through the \
+                 bus it sends to, anything else"
+            );
+        }
+
+        // ...and the row is not merely muted: firing it still works, so the
+        // early-out skipped a row that had nothing to give, not a live one.
+        g.clocks.fire(1, 0, c.length_samples, false);
+        out.fill(0.0);
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
+            "and the pad still sounds when it IS pressed"
+        );
+    }
+
+    /// A pad whose PRE-fader send into bus 0 carries `delay` samples of edge
+    /// compensation (V-17's surviving half). The pad is MUTED, so its dry
+    /// path contributes nothing and everything reaching the master came
+    /// through the send and the bus — which is what makes the sums below
+    /// measure the send copy and only the send copy.
+    fn compensated_send_pad(delay: Option<usize>) -> (RtGraph, u64) {
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 1));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        params.set_send_amount_linear(0, 1.0);
+        params.set_flag(1, super::super::rt::FLAG_MUTE, true);
+        let mut pad = RtTrack::clips(1, row);
+        pad.sends = vec![crate::audio::rt::RtSend {
+            bus: 0,
+            amount: 0,
+            pre_fader: true,
+            delay: delay.map(|d| crate::audio::pdc::DelayLine::new(d, 64, 2)),
+        }];
+        let bus = crate::audio::rt::RtBus {
+            slot: 0,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            output: None,
+            out_pdc: None,
+            win: Default::default(),
+        };
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params, 48_000);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        (g, c.length_samples)
+    }
+
+    /// One press through `compensated_send_pad`, block by block, exactly as
+    /// the stream callback drives it: render, then advance the clocks.
+    fn press_and_collect(g: &mut RtGraph, len: u64, blocks: usize) -> Vec<Vec<f32>> {
+        use crate::audio::transport::LoopSpec;
+        const FRAMES: usize = 64;
+        g.clocks.fire(1, 0, len, false);
+        let mut out = vec![0.0f32; FRAMES * 2];
+        let mut blocks_out = Vec::with_capacity(blocks);
+        for _ in 0..blocks {
+            out.fill(0.0);
+            mixer::render(g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            g.clocks.advance(FRAMES as u64);
+            blocks_out.push(out.clone());
+        }
+        blocks_out
+    }
+
+    /// Fix round 2, finding A. The exclusive-idle early-out skips
+    /// `tap_into_bus`, and `DelayLine::process` inside it is the ONLY thing
+    /// that advances a send edge's compensating delay. `DelayLine` has no
+    /// reset, so the last `delay` samples of every press used to sit in the
+    /// line and never reach the bus: the send copy of a one-shot was
+    /// TRUNCATED at its tail.
+    ///
+    /// The invariant is conservation — a delay moves energy in time, it does
+    /// not destroy it — so the same press through a compensated edge and
+    /// through an uncompensated one must deliver the same total into the bus,
+    /// given enough blocks for the delay to clear.
+    #[test]
+    fn an_idle_pad_still_flushes_its_compensated_send_tail_into_the_bus() {
+        let total = |delay: Option<usize>| -> f64 {
+            let (mut g, len) = compensated_send_pad(delay);
+            press_and_collect(&mut g, len, 8)
+                .iter()
+                .flat_map(|b| b.iter())
+                .map(|s| *s as f64)
+                .sum()
+        };
+        let compensated = total(Some(32));
+        let straight = total(None);
+        assert!(straight > 0.0, "the rig has to deliver something at all");
+        assert!(
+            (compensated - straight).abs() < 1e-6,
+            "the compensated send must deliver the WHOLE press into the bus, \
+             not stop 32 samples short of its tail: {compensated} vs {straight}"
+        );
+    }
+
+    /// The other half of the same defect, and the audible one. Whatever the
+    /// line still held when the pad went idle was replayed at the ONSET of
+    /// the next press — the previous hit's tail on top of the new one.
+    ///
+    /// Two identical presses of the same one-shot must produce identical
+    /// audio, block for block. They do not if the second one starts by
+    /// emptying the first one's leftovers.
+    #[test]
+    fn a_second_press_does_not_carry_the_first_press_s_tail_into_its_bus() {
+        let (mut g, len) = compensated_send_pad(Some(32));
+        let first = press_and_collect(&mut g, len, 4);
+        let second = press_and_collect(&mut g, len, 4);
+        assert!(
+            first[0].iter().any(|s| *s != 0.0),
+            "the first press has to reach the bus at all"
+        );
+        assert_eq!(
+            second[0], first[0],
+            "the second press's first block is contaminated by the tail the \
+             idle early-out stranded in the send's delay line"
+        );
+    }
+
+    /// A pad on slot 1 whose insert chain holds `latency` samples of REAL
+    /// pipeline — `LatencyDummy` is a delay line, not a declaration — routed
+    /// straight to the master. With `latency` longer than the clip, every
+    /// sample of a press is still inside the chain by the time the clock
+    /// stops, which is the whole point of the scenario.
+    fn latency_chain_pad(latency: usize) -> (RtGraph, u64) {
+        latency_chain_pad_len(latency, 100)
+    }
+
+    /// [`latency_chain_pad`] with the clip's length under the caller's
+    /// control, so a press can be cut MID-clip and compared against one that
+    /// is only that long and ends by itself.
+    fn latency_chain_pad_len(latency: usize, clip_len: u64) -> (RtGraph, u64) {
+        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use crate::audio::dsp::AudioProcessor;
+
+        let (mut c, sid) = trimmed_clip();
+        c.length_samples = clip_len;
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        let mut node = LatencyDummy::new(latency);
+        node.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(1, row);
+        pad.inserts = vec![InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency,
+            proc: InsertNodeCell::new(Box::new(node)),
+        }];
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, Vec::new()), pad], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        (g, c.length_samples)
+    }
+
+    /// Fix round 3, item 1. `ClockTable::advance` turns a one-shot's clock
+    /// off at the clip end, so the row is `exclusive_idle` from the next
+    /// block — while every real sample of the press is still inside the
+    /// insert chain's pipeline. A bare skip therefore swallowed THE WHOLE
+    /// PRESS: nothing ever reached the master, and the samples surfaced at
+    /// the onset of a later press instead.
+    #[test]
+    fn a_pad_whose_chain_outlasts_its_clip_still_reaches_the_master() {
+        let (mut g, len) = latency_chain_pad(256);
+        let blocks = press_and_collect(&mut g, len, 10);
+        let energy: f64 = blocks
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(|s| (*s as f64).abs())
+            .sum();
+        assert!(
+            energy > 0.0,
+            "a press whose audio is still in the insert chain when the clock \
+             stops must still leave the row — the whole press was inaudible"
+        );
+    }
+
+    /// The other half: what the flush window guarantees is that the NEXT
+    /// press is not the previous one's leftovers. Two identical presses of
+    /// the same one-shot through the same chain must render identically,
+    /// block for block.
+    #[test]
+    fn a_second_press_through_a_long_chain_is_not_the_first_press_s_audio() {
+        let (mut g, len) = latency_chain_pad(256);
+        let first = press_and_collect(&mut g, len, 10);
+        let second = press_and_collect(&mut g, len, 10);
+        assert!(
+            first.iter().flat_map(|b| b.iter()).any(|s| *s != 0.0),
+            "the first press has to reach the master at all"
+        );
+        assert_eq!(second, first, "the second press replays the first's tail");
+    }
+
+    /// Fix round 4, item 1. The flush strip suppresses the clip read
+    /// (`!flushing`), and until now nothing distinguished that from the
+    /// ordinary strip: both round-3 rigs let the clip run to its NATURAL
+    /// end, where the frozen position is already past `length_samples` and
+    /// `clip_sample` returns zeros whether the read runs or not.
+    ///
+    /// Stopping MID-clip is the case that bites. Escape → `stopAllSound` →
+    /// `ClockTable::stop` freezes the clock INSIDE the clip, so a flush block
+    /// that still read clips would re-read the same fragment every block,
+    /// through the chain and out the fader — fix round 1's defect, bounded to
+    /// `tail_frames`.
+    ///
+    /// The invariant is conservation: a pad cut after one block delivers the
+    /// frames of that block and nothing else — exactly what a clip only that
+    /// long, ending by itself, delivers.
+    ///
+    /// Two presses, because one cannot see it. `tail_frames` is the row's
+    /// whole path latency, so material entering the chain at the START of the
+    /// flush leaves exactly as the window CLOSES: a re-read fragment is
+    /// stranded in the chain for the rest of the press and surfaces at the
+    /// onset of the next one, which is the audible half of the same defect.
+    #[test]
+    fn a_pad_stopped_mid_clip_delivers_only_the_frames_it_read() {
+        use crate::audio::transport::LoopSpec;
+        const FRAMES: usize = 64;
+
+        let energy = |clip_len: u64, cut: bool| -> f64 {
+            let (mut g, len) = latency_chain_pad_len(256, clip_len);
+            let mut out = vec![0.0f32; FRAMES * 2];
+            let mut sum = 0.0f64;
+            for _press in 0..2 {
+                g.clocks.fire(1, 0, len, false);
+                for b in 0..10 {
+                    out.fill(0.0);
+                    mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+                    g.clocks.advance(FRAMES as u64);
+                    if cut && b == 0 {
+                        g.clocks.stop(1);
+                    }
+                    sum += out.iter().map(|s| (*s as f64).abs()).sum::<f64>();
+                }
+            }
+            sum
+        };
+        let stopped = energy(100, true);
+        let whole = energy(FRAMES as u64, false);
+        assert!(whole > 0.0, "the rig has to deliver something at all");
+        assert!(
+            (stopped - whole).abs() < 1e-6,
+            "a pad cut after one block delivered {stopped} where the frames it \
+             actually read are worth {whole}: the frozen fragment was re-read \
+             on every block of the flush window"
+        );
+    }
+
+    /// Fix round 4, item 2. `render_live_into` queues every scheduled event
+    /// inside `[pos, pos + run)` before the node processes. A flushing row's
+    /// `pos` is FROZEN, so without a gate an event inside the frozen window is
+    /// re-queued once per flush block: a MIDI pad whose clock stops with a
+    /// note-on under it re-triggers that note `ceil(tail_frames / block)`
+    /// times.
+    ///
+    /// The stop lands between the render and the `advance` — which is when a
+    /// control-thread `stopAllSound` naturally lands, and `advance` skips a
+    /// clock it finds already off. The position therefore freezes on the
+    /// window the row has just played, and the flush replays exactly the
+    /// events that window already delivered.
+    ///
+    /// The graph compiler could not build this row when the case was found:
+    /// `rebuild`'s player loop gave a MIDI player no live node at all. Task 10
+    /// — "MIDI players with an instrument no track owns" — is what made it
+    /// reachable, and
+    /// `a_midi_players_row_carries_the_live_node_its_instrument_renders_through`
+    /// is where that half is now pinned. This one stays what it always was:
+    /// the RT half, on a hand-built row, independent of how the compiler
+    /// happens to reach it.
+    #[test]
+    fn a_flushing_row_does_not_re_queue_the_events_under_its_frozen_playhead() {
+        use crate::audio::dsp::{AudioProcessor, LiveInstrument, ProcessBlock};
+        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use crate::audio::rt::{LiveNodeCell, LiveSource};
+        use crate::audio::transport::LoopSpec;
+        use crate::midi::schedule::AbsNoteEvent;
+        use crate::midi::synth::BlockNoteEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct EventCounter {
+            queued: Arc<AtomicUsize>,
+            processed: Arc<AtomicUsize>,
+        }
+        impl AudioProcessor for EventCounter {
+            fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
+            fn process(&mut self, _io: &mut ProcessBlock<'_>) {
+                self.processed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            fn reset(&mut self) {}
+        }
+        impl LiveInstrument for EventCounter {
+            fn queue_event(&mut self, _ev: BlockNoteEvent) -> bool {
+                self.queued.fetch_add(1, AtomicOrdering::Relaxed);
+                true
+            }
+            fn all_notes_off(&mut self) {}
+        }
+
+        const FRAMES: usize = 64;
+        let queued = Arc::new(AtomicUsize::new(0));
+        let processed = Arc::new(AtomicUsize::new(0));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        let mut dummy = LatencyDummy::new(256);
+        dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(1, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(EventCounter {
+                queued: queued.clone(),
+                processed: processed.clone(),
+            })),
+            events: Arc::new(vec![AbsNoteEvent { sample: 32, key: 60, velocity: 100, channel: 0 }]),
+        });
+        // A tail, so the row actually flushes rather than taking the bare skip.
+        pad.inserts = vec![InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency: 256,
+            proc: InsertNodeCell::new(Box::new(dummy)),
+        }];
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, Vec::new()), pad], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        // Task 10 fix round 3: the row carries a LIVE node, so its window is
+        // its 256-frame chain PLUS the live allowance — the release runs
+        // inside the node and its output still has to traverse that chain.
+        // The premise this test needs is "the row has a window and therefore
+        // flushes rather than taking the bare skip", which is unchanged; only
+        // its LENGTH moved, so the block counts below follow it rather than
+        // the other way round.
+        let window = 256 + crate::audio::rt::live_tail_frames(48_000);
+        assert_eq!(g.tracks[1].tail_frames, window, "the row has to have a tail");
+        let flush_blocks = window / FRAMES;
+
+        let mut out = vec![0.0f32; FRAMES * 2];
+        g.clocks.fire(1, 0, 10_000, false);
+        for b in 0..flush_blocks + 5 {
+            out.fill(0.0);
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            if b == 0 {
+                assert_eq!(
+                    queued.load(AtomicOrdering::Relaxed),
+                    1,
+                    "the note under the live block has to be delivered once"
+                );
+                g.clocks.stop(1);
+            }
+            g.clocks.advance(FRAMES as u64);
+        }
+        assert_eq!(
+            queued.load(AtomicOrdering::Relaxed),
+            1,
+            "the flush drains what the row HOLDS; it must not re-feed it the \
+             note its frozen playhead is still sitting on"
+        );
+        // The other half of the same split, and the reason the gate is on the
+        // event queue rather than on `render_live_into` as a whole: the node's
+        // own pipeline is part of what the window drains, so it keeps
+        // processing for the live block plus every block of the window, and
+        // STOPS when the row takes the bare skip. The loop deliberately runs
+        // past the end of the window so that "stops" is still asserted — a
+        // count equal to the number of blocks rendered would prove only that
+        // the node never stopped.
+        assert_eq!(
+            processed.load(AtomicOrdering::Relaxed),
+            1 + flush_blocks,
+            "the live node must keep PROCESSING through the flush window — \
+             skipping it would truncate its tail and replay it at the next \
+             press, which is the defect the window exists to fix"
+        );
+    }
+
+    /// The flush window belongs to a PAD whose trigger ended, and to nothing
+    /// else. An ordinary timeline track on a stopped transport also has its
+    /// clock off — but nothing has stopped feeding it: its clip read still
+    /// runs, at a frozen position. A flush gate that only asked "is the tail
+    /// out" would hold whatever sits under the playhead for `tail_frames`
+    /// after every stop.
+    #[test]
+    fn a_stopped_transport_still_silences_a_track_that_owns_a_tail() {
+        use crate::audio::transport::LoopSpec;
+
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut track = RtTrack::clips(0, row);
+        track.pdc = Some(crate::audio::pdc::DelayLine::new(32, 64, 2));
+        let mut g = RtGraph::new(vec![track], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(1, 1);
+        clocks.set_transport_playing(true);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert!(
+            out.iter().any(|s| *s != 0.0),
+            "the rig has to sound while the transport rolls"
+        );
+
+        g.clocks.set_transport_playing(false);
+        for _ in 0..2 {
+            out.fill(0.0);
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            assert_eq!(
+                out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+                0.0,
+                "a stop is a stop: no flush window opens the fader on a track \
+                 that is still being fed"
+            );
+        }
+    }
+
+    /// The other side of the same rule, and the one the idle-pad cost rests
+    /// on: a RAW pad owns no tail at all, so it takes the BARE skip on every
+    /// block. V-6 gives it no inserts and no sends, and `node.rs` forces its
+    /// output to the master, so there is nothing for `recompute_tail_frames`
+    /// to add up.
+    #[test]
+    fn a_raw_pad_owns_no_tail_and_takes_the_bare_skip() {
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        let g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
+        // Task 10 fix round 2 added a fourth term to `computed_tail_frames`,
+        // and this is the row it must NOT reach. A raw pad is an audio clip
+        // (V-6 gives it no instrument), so it carries no live node, gets no
+        // `live_tail_frames` allowance, and keeps the bare skip and the
+        // measured idle cost that the owner's ear-check path rests on.
+        assert!(g.tracks[0].live.is_none(), "V-6: a raw pad has no instrument");
+        assert_eq!(g.tracks[0].tail_frames, 0);
+    }
+
+    /// Task 10 fix round 3, the arithmetic half, REVERSED from round 2.
+    ///
+    /// The allowance ADDS to the strip, it does not float on top of it.
+    /// `tail_frames` is the row's whole path latency, so a fragment entering
+    /// the strip at flush start leaves exactly as the window closes — but
+    /// release material keeps ENTERING for the whole release, so the last of
+    /// it enters at `allowance` and needs `strip` more frames to traverse the
+    /// inserts, the `pdc` and the longer output branch. Round 2's `max`
+    /// closed the window with that material still inside the chain;
+    /// `a_cut_pads_insert_chain_is_drained_before_the_next_press` is what
+    /// hears it.
+    #[test]
+    fn the_live_node_allowance_adds_to_the_strip() {
+        use crate::audio::dsp::AudioProcessor;
+        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use crate::audio::rt::{live_tail_frames, LiveNodeCell, LiveSource};
+
+        let allowance = live_tail_frames(48_000);
+        let long = allowance * 2;
+        let mut dummy = LatencyDummy::new(long);
+        dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut synth = crate::midi::synth::PolySynth::new();
+        synth.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(0, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth)),
+            events: Arc::new(Vec::new()),
+        });
+        pad.inserts = vec![InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency: long,
+            proc: InsertNodeCell::new(Box::new(dummy)),
+        }];
+        let g = RtGraph::new(vec![pad], 1, Arc::new(ParamTable::with_slots_and_sends(1, 0)));
+        assert_eq!(
+            g.tracks[0].tail_frames,
+            long + allowance,
+            "the release runs inside the node and its output still has to get \
+             through the chain: series, so the two add"
+        );
+
+        // ...and the other direction: no strip to traverse, so the window is
+        // the allowance alone.
+        let mut bare = RtTrack::clips(0, Vec::new());
+        let mut synth2 = crate::midi::synth::PolySynth::new();
+        synth2.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        bare.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth2)),
+            events: Arc::new(Vec::new()),
+        });
+        let g2 = RtGraph::new(vec![bare], 1, Arc::new(ParamTable::with_slots_and_sends(1, 0)));
+        assert_eq!(
+            g2.tracks[0].tail_frames, allowance,
+            "and with no strip to traverse, the allowance is the whole window"
+        );
+
+        // Rate-true (fix round 3, item 2): the allowance is a DURATION, so at
+        // 96 kHz it is twice the frames. `RtGraph::new` builds at the
+        // fallback rate, so this goes through `with_buses`.
+        let mut hi = RtTrack::clips(0, Vec::new());
+        let mut synth3 = crate::midi::synth::PolySynth::new();
+        synth3.prepare(96_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        hi.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth3)),
+            events: Arc::new(Vec::new()),
+        });
+        let g3 = RtGraph::with_buses(
+            vec![hi],
+            Vec::new(),
+            1,
+            Arc::new(ParamTable::with_slots_and_sends(1, 0)),
+            96_000,
+        );
+        assert_eq!(g3.tracks[0].tail_frames, allowance * 2, "85 ms at 96 kHz too");
+    }
+
+    /// Fix round 4, items 3 and 4. `tail_frames` follows the STRIP. Inserts
+    /// and `pdc` are in series with everything after them, so they add; the
+    /// send taps leave BEFORE `out_pdc.process`, so `out_pdc` and the send
+    /// delays are parallel branches off the same point and the worst path is
+    /// the longer of the two.
+    ///
+    /// The `pdc` term is otherwise unreachable — V-17 forces `track_pdc` to 0
+    /// for a player, and only player rows flush — so it is set here directly,
+    /// the way `out_pdc_pad` sets `out_pdc`.
+    #[test]
+    fn a_rows_tail_is_its_series_lines_plus_the_longer_parallel_branch() {
+        use crate::audio::pdc::DelayLine;
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 1));
+        let mut tr = RtTrack::clips(0, Vec::new());
+        tr.pdc = Some(DelayLine::new(32, 64, 2));
+        tr.out_pdc = Some(DelayLine::new(64, 64, 2));
+        tr.sends = vec![crate::audio::rt::RtSend {
+            bus: 0,
+            amount: 0,
+            pre_fader: true,
+            delay: Some(DelayLine::new(128, 64, 2)),
+        }];
+        let g = RtGraph::new(vec![tr], 1, params);
+        assert_eq!(
+            g.tracks[0].tail_frames,
+            32 + 128,
+            "the source-alignment line is in series; the dry compensation and \
+             the send edge are not in series with each other"
+        );
+    }
+
+    /// Fix round 2 gave a bus-routed pad an `out_pdc` line (V-17), and fix
+    /// round 3 made the flush window general. This is the DRY half of the
+    /// same conservation argument the send test makes: `out_pdc` sits after
+    /// the fader, on the path into the bus, and a delay moves energy in time
+    /// rather than destroying it — so the compensated pad must deliver the
+    /// same total into the master as an uncompensated one, given blocks
+    /// enough for the line to clear.
+    fn out_pdc_pad(delay: Option<usize>) -> (RtGraph, u64) {
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        let mut pad = RtTrack::clips(1, row);
+        pad.output = Some(0);
+        pad.out_pdc = delay.map(|d| crate::audio::pdc::DelayLine::new(d, 64, 2));
+        let bus = crate::audio::rt::RtBus {
+            slot: 0,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            output: None,
+            out_pdc: None,
+            win: Default::default(),
+        };
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params, 48_000);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        (g, c.length_samples)
+    }
+
+    #[test]
+    fn an_idle_pad_still_flushes_its_out_pdc_tail_into_the_bus() {
+        let total = |delay: Option<usize>| -> f64 {
+            let (mut g, len) = out_pdc_pad(delay);
+            press_and_collect(&mut g, len, 8)
+                .iter()
+                .flat_map(|b| b.iter())
+                .map(|s| *s as f64)
+                .sum()
+        };
+        let compensated = total(Some(32));
+        let straight = total(None);
+        assert!(straight > 0.0, "the rig has to deliver something at all");
+        assert!(
+            (compensated - straight).abs() < 1e-6,
+            "the compensated DRY path must deliver the whole press into the \
+             bus: {compensated} vs {straight}"
+        );
+    }
+
+    #[test]
+    fn a_second_press_does_not_carry_the_first_press_s_out_pdc_tail() {
+        let (mut g, len) = out_pdc_pad(Some(32));
+        let first = press_and_collect(&mut g, len, 4);
+        let second = press_and_collect(&mut g, len, 4);
+        assert!(
+            first[0].iter().any(|s| *s != 0.0),
+            "the first press has to reach the bus at all"
+        );
+        assert_eq!(
+            second[0], first[0],
+            "the second press's first block is contaminated by the tail left \
+             in `out_pdc`"
+        );
+    }
+
+    /// The cost datum for Plan V's idle pads — the number the whole "an idle
+    /// player is about one atomic load per block" claim rests on, and which
+    /// nobody had measured before fix round 1 (finding 1). `scripts/perf-check.sh`
+    /// cannot produce it: its harness builds the OFFLINE graph, and V-15 keeps
+    /// players out of that entirely, so there is no configuration of it in
+    /// which an idle pad appears at all.
+    ///
+    /// 32 pads, each with a decoded clip, none pressed, timed the way the
+    /// plugin-load harness times a block. Ignored by default because it is a
+    /// measurement, not an assertion — a timing threshold here would be a
+    /// flake on a loaded machine. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test --release --lib -- --ignored --nocapture idle_players_block_cost
+    /// ```
+    #[test]
+    #[ignore]
+    fn idle_players_block_cost() {
+        use crate::audio::transport::LoopSpec;
+        use std::time::Instant;
+        const PADS: usize = 32;
+        const FRAMES: usize = 512;
+        const BLOCKS: usize = 2_000;
+
+        let source = Arc::new(RtClipData {
+            channels: 2,
+            data: (0..48_000 * 2).map(|i| (i % 977) as f32 / 977.0).collect(),
+        });
+        let params = Arc::new(ParamTable::with_slots_and_sends(PADS, 0));
+        let mut rows = Vec::with_capacity(PADS);
+        for slot in 0..PADS {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+            rows.push(RtTrack::clips(
+                slot,
+                vec![RtClip {
+                    start: 0,
+                    offset: 0,
+                    len: 48_000,
+                    gain: 1.0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    samples: source.clone(),
+                }],
+            ));
+        }
+        let mut g = RtGraph::new(rows, 1, params);
+        let clocks =
+            crate::audio::clock::ClockTable::with_slots_clocks_and_players(PADS, PADS + 1, PADS);
+        clocks.set_transport_playing(true);
+        for slot in 0..PADS {
+            clocks.bind_slot(slot, 1 + slot as u32);
+        }
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; FRAMES * 2];
+        for _ in 0..200 {
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        }
+        let mut micros: Vec<f64> = Vec::with_capacity(BLOCKS);
+        for _ in 0..BLOCKS {
+            let t0 = Instant::now();
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            micros.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "IDLE-PADS: {PADS} pads, {FRAMES}-frame block — min {:.2} us, median {:.2} us, p95 {:.2} us",
+            micros[0],
+            micros[BLOCKS / 2],
+            micros[BLOCKS * 95 / 100],
+        );
+        assert_eq!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            0.0,
+            "and every one of them is silent, which is what makes the cost \
+             pure waste rather than work"
+        );
+    }
+
+    /// A clock index means "the i-th Region binding in document order", so
+    /// adding a binding ahead of a sounding one RENUMBERS it. Carrying the
+    /// state across by index would hand one scene's playhead to another;
+    /// `rebuild` pairs the two tables by binding id instead, and carries the
+    /// tracks the scene has claimed by track id for the same reason.
+    #[test]
+    fn a_rebuild_carries_a_sounding_scene_by_binding_id_not_by_index() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b-late", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        // Fire it, exactly as `ControlPlane::fire_scene` would.
+        let (slot, clock) = {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b-late"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 1_000, 9_000, false);
+            t.clocks.advance(64);
+            (slot, clock)
+        };
+        assert_eq!(clock, 1, "the only scene, right after the transport");
+
+        // Now a binding is added AHEAD of it and the graph rebuilds.
+        session.lock().midi.launch_maps[0]
+            .bindings
+            .insert(0, region_binding("b-early", 61, &["t-1"]));
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let moved = t.scene_clocks["b-late"];
+        assert_eq!(moved, 2, "renumbered by the insertion");
+        assert!(t.clocks.is_on(moved), "and still sounding, at its new index");
+        assert!(!t.clocks.is_on(t.scene_clocks["b-early"]), "the new binding is idle");
+        assert_eq!(
+            t.clocks.clock_of(slot),
+            moved,
+            "the track it claimed followed it, rather than being handed back to the arrangement"
+        );
+    }
+
+    /// The rebuild must leave the fresh table able to reconcile at adoption:
+    /// it records WHICH published table it snapshotted, so
+    /// `ClockTable::reconcile_adoption` can refuse a graph it was not built
+    /// from (a rebuild retried after a full graph queue — [I1]).
+    #[test]
+    fn rebuild_records_the_generation_it_carried_from() {
+        let (mut ctl, _session) = bare_control();
+        let before = ctl.tables.lock().generation;
+        ctl.rebuild();
+        let t = ctl.tables.lock();
+        assert_eq!(t.generation, before + 1, "a rebuild is a new generation");
+        assert_eq!(
+            t.clocks.carry_source_for_tests(),
+            before,
+            "and the fresh clocks know which table they took their state from"
+        );
+    }
+
+    /// Fix round 1, finding 3. Deleting a binding while its scene sounds is
+    /// an ENDING, and every other ending hands the live nodes one
+    /// `all_notes_off`. The deleted binding has no clock in the fresh table to
+    /// carry that, so `rebuild` mints an orphan clock: stopped, owing one
+    /// discontinuity, with the stranded slots bound to it. Without it the
+    /// slot defaults to the transport with no discontinuity anywhere and the
+    /// node hangs whatever it was holding.
+    #[test]
+    fn deleting_a_binding_while_its_scene_sounds_still_flushes_its_nodes() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+        let slot = {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.begin_block(); // the fire's own jump, delivered
+            slot
+        };
+
+        session.lock().midi.launch_maps[0].bindings.clear();
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        assert!(t.scene_clocks.is_empty(), "the binding is gone");
+        let orphan = t.clocks.clock_of(slot);
+        assert_ne!(
+            orphan,
+            crate::audio::clock::TRANSPORT_CLOCK,
+            "the stranded track is not simply handed back with nothing said"
+        );
+        assert!(!t.clocks.is_on(orphan), "the scene is over");
+        assert!(
+            t.clocks.flush_pending_for(orphan),
+            "and the node is owed the all-notes-off every other ending gives it"
+        );
+        // And the flush reaches the node exactly the way every other one
+        // does: a rendered block latches it, and the slot reads it. (Turning
+        // "a stopped clock" into "read the arrangement" is
+        // `mixer::node_playhead`'s third case, which this level cannot see.)
+        t.clocks.begin_block();
+        let ph = t.clocks.playhead(slot, 7_000, false);
+        assert!(ph.discontinuity, "delivered");
+        assert!(!ph.on, "and the node is not rendering the deleted scene");
+    }
+
+    /// Round 2, finding 3. A scene cut by Escape or by transport-stop is
+    /// `!is_on` with its flush STILL PENDING. If the fresh graph is adopted
+    /// before the retired one renders another block, nobody ever latches it —
+    /// so "was it sounding?" is the wrong question for the orphan guard, and
+    /// the same hung note comes back through a one-block door.
+    #[test]
+    fn a_scene_cut_but_not_yet_flushed_is_orphaned_when_its_binding_goes() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+        let slot = {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.begin_block(); // the fire's own jump, delivered
+            assert!(t.clocks.stop(clock), "Escape, mid-clip");
+            assert!(!t.clocks.is_on(clock));
+            assert!(t.clocks.flush_pending_for(clock), "and nobody has read it");
+            slot
+        };
+
+        session.lock().midi.launch_maps[0].bindings.clear();
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let orphan = t.orphan_clock.expect("the unread flush travels with the slot");
+        assert_eq!(t.clocks.clock_of(slot), orphan);
+        assert!(t.clocks.flush_pending_for(orphan), "still owed, now here");
+    }
+
+    /// Round 2, finding 4. A slot on ANY non-transport clock reads as
+    /// `own_clock`, which overrides another track's solo
+    /// (`mixer::audible_with_launch`). For a normal ending that lasts until
+    /// the next drive poll; for the orphan clock — which no binding names and
+    /// no rebuild is scheduled for, since mute/solo are plain `Set`s — it
+    /// would last until somebody happened to edit something else.
+    #[test]
+    fn a_slot_stranded_on_the_orphan_clock_is_released_once_its_flush_lands() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+        let slot = {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.begin_block();
+            slot
+        };
+        session.lock().midi.launch_maps[0].bindings.clear();
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let orphan = t.orphan_clock.expect("orphaned");
+        assert_eq!(t.clocks.clock_of(slot), orphan);
+        // The drive poll refuses while the all-notes-off is unread...
+        t.release_finished_scenes();
+        assert_eq!(t.clocks.clock_of(slot), orphan, "the flush comes first");
+        // ...and hands the track back once a block has latched it, so the
+        // track stops overriding solo.
+        t.clocks.begin_block();
+        t.release_finished_scenes();
+        assert_eq!(t.clocks.clock_of(slot), crate::audio::clock::TRANSPORT_CLOCK);
+    }
+
+    /// The orphan clock is per-graph like everything else in the table, so a
+    /// rebuild landing before its flush has been read has to carry the DEBT
+    /// forward, not just the binding pairings — the orphan is in no
+    /// `scene_clocks` map, so nothing else would pair it and the slot would
+    /// fall back to the transport with the `all_notes_off` still unpaid.
+    #[test]
+    fn a_rebuild_before_the_orphans_flush_lands_carries_the_debt_forward() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+        let slot = {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.begin_block();
+            slot
+        };
+        session.lock().midi.launch_maps[0].bindings.clear();
+        ctl.rebuild();
+        assert!(ctl.tables.lock().orphan_clock.is_some(), "stranded");
+
+        // Another rebuild (any edit at all) before a block renders.
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let orphan = t.orphan_clock.expect("the debt is still unpaid");
+        assert_eq!(t.clocks.clock_of(slot), orphan);
+        assert!(t.clocks.flush_pending_for(orphan), "and still owed");
+    }
+
+    /// The orphan clock is minted only when something is actually orphaned —
+    /// a clock every graph carries is a clock `begin_block` and `advance`
+    /// walk every block for a case that is not happening.
+    #[test]
+    fn a_rebuild_with_nothing_stranded_mints_no_orphan_clock() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+        assert_eq!(ctl.tables.lock().clocks.clocks(), 2, "transport + one scene");
+
+        // The scene runs to its END and its flush is delivered — but the
+        // slot is still bound to the (now stopped) clock, which is the state
+        // the drive poll's release pass takes ~8 ms to clear. NOW delete the
+        // binding. Nothing is owed here: the node had its `all_notes_off`
+        // when the clock ended and has already rejoined the arrangement, so
+        // minting an orphan would fabricate a second one and cut arrangement
+        // notes mid-song — `ClockTable::stop`'s guard, same rule.
+        {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100, false);
+            t.clocks.advance(128); // past its end: stops itself, owing a jump
+            t.clocks.begin_block(); // and the node reads it
+            assert!(!t.clocks.is_on(clock));
+            assert_eq!(t.clocks.clock_of(slot), clock, "not released yet");
+        }
+        session.lock().midi.launch_maps[0].bindings.clear();
+        ctl.rebuild();
+        let t = ctl.tables.lock();
+        assert_eq!(t.clocks.clocks(), 1, "the transport, and nothing else");
+        assert!(!t.clocks.flush_pending(), "no flush was fabricated");
+        assert_eq!(
+            t.clocks.clock_of(t.slots[&crate::ids::TrackId::from("t-1")]),
+            crate::audio::clock::TRANSPORT_CLOCK,
+            "the track is simply back on the arrangement"
+        );
+    }
+
+    /// Fix round 1, finding 2. `rebuild` holds ONE guard from the read of the
+    /// retired tables to the publish. Dropping it in between let a
+    /// `fire_scene` write its slot bindings into a table this loop had
+    /// already read — the clock state survived (adoption reconciles it) but
+    /// the bindings did not, so the scene played the arrangement instead of
+    /// its own material for the whole life of that graph.
+    ///
+    /// The window is two mutex operations wide and there is no seam a test
+    /// can wedge into it, so this asserts the SOURCE property that closes it,
+    /// the way `rt::tests::the_launch_overlay_is_gone_from_this_file` asserts
+    /// V-4. A second `self.tables.lock()` inside `rebuild` re-opens the gap,
+    /// and it re-opens it silently.
+    #[test]
+    fn rebuild_takes_the_tables_lock_exactly_once() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/engine.rs"),
+        )
+        .expect("read engine.rs");
+        let start = src.find("    fn rebuild(&mut self) {").expect("rebuild");
+        let body = &src[start..];
+        let end = body[1..].find("\n    fn ").map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        assert_eq!(
+            body.matches("self.tables.lock()").count(),
+            1,
+            "rebuild must hold ONE tables guard from the carry read to the publish: \
+             a fire landing in a gap between two acquisitions writes its slot \
+             bindings into a table this rebuild has already read, and they are \
+             lost for the life of the graph (reconciliation recovers the clock \
+             state, not the bindings)"
+        );
+    }
+
+    /// The behavioural half of the above, at the closest seam a test can
+    /// stand: `after_assembly` fires with NO tables lock held, so this pins
+    /// that a fire landing next to a rebuild keeps both its clock AND the
+    /// tracks it claimed. It does not reproduce the old gap — nothing can —
+    /// which is why the source gate above exists beside it.
+    #[test]
+    fn a_fire_landing_during_a_rebuild_keeps_its_slot_bindings() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        // A fire lands mid-rebuild, into the tables as they stand then.
+        let tables = ctl.tables.clone();
+        ctl.after_assembly = Some(Arc::new(move || {
+            let t = tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100_000, false);
+        }));
+        ctl.rebuild();
+        ctl.after_assembly = None;
+
+        let t = ctl.tables.lock();
+        let clock = t.scene_clocks["b1"];
+        let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+        assert!(t.clocks.is_on(clock), "the press survived the rebuild");
+        assert_eq!(
+            t.clocks.clock_of(slot),
+            clock,
+            "and so did the track it claimed — a scene that keeps its clock \
+             but loses its tracks plays the arrangement instead"
+        );
     }
 
     /// Track D: a rebuild compiles the session's plugin-param lanes into the
@@ -5932,6 +8060,66 @@ mod tests {
         );
     }
 
+    /// Task 10 fix round 4, item 1: the rate `rebuild` hands to
+    /// `RtGraph::with_buses` has to be the ENGINE's, not a literal.
+    ///
+    /// Nothing else can catch it being wrong. Since round 3 the live-node
+    /// flush allowance is a duration, so a graph built at a hardcoded 48 kHz
+    /// on a 96 kHz device covers half of the release ramp and strands the
+    /// rest — and it fails SILENTLY, because `render_impl`'s `debug_assert`
+    /// re-derives the tail from `graph.rate`, which would carry the same
+    /// wrong number and agree with the bug. That consistency is deliberate
+    /// (it is what makes the device-rate-change window safe), which is
+    /// exactly why the one argument carrying the real rate needs its own pin.
+    ///
+    /// Driven through a whole `rebuild` rather than by poking `cache_rate`:
+    /// `ensure_loaded` derives it from `shared.sample_rate`, so setting the
+    /// engine rate is what pins the WIRING and not just the last hop.
+    #[test]
+    fn a_rebuilt_graph_carries_the_engine_rate_into_every_live_rows_window() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        ctl.shared.sample_rate.store(96_000, Relaxed);
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            s.store.tracks.push(t);
+            s.republish_full();
+        }
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+
+        ctl.live_in_hub.set_target_track(Some("t-1".into()));
+        tx.send(ControlMsg::Subscribe(Box::new(CountingSink(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ))))
+        .unwrap();
+        drop(tx);
+        ctl.run();
+
+        let graph = graph_rx.pop().expect("the tick published a graph").into_box();
+        let live = graph
+            .tracks
+            .iter()
+            .find(|t| t.live.is_some())
+            .expect("the armed midi track is the live row");
+        assert_ne!(
+            crate::audio::rt::live_tail_frames(96_000),
+            crate::audio::rt::live_tail_frames(48_000),
+            "the two rates must differ, or the assertion below cannot bite"
+        );
+        assert_eq!(
+            live.tail_frames,
+            crate::audio::rt::live_tail_frames(96_000),
+            "85 ms of release at the DEVICE's rate, not at 48 kHz"
+        );
+        assert_eq!(graph.rate, 96_000, "and the graph carries it for the tail debug_assert");
+    }
+
     /// Plan G1 Task 7 — the bug this closes: a plugin on an AUDIO track must
     /// actually process the track's audio. Before Task 7 the insert chain was
     /// never compiled into the graph (`compile_inserts` resolved every slot to
@@ -6007,6 +8195,12 @@ mod tests {
 
         // Hard-left so the left channel carries the full (halved) signal.
         graph.params.set_pan(0, -1.0);
+        // Plan V — V2 (V-13): this renders a REBUILD's graph directly instead
+        // of through the output callback, and `rebuild` seeds clock 0 from
+        // `SharedRt::playing`, which this test never sets. The callback
+        // mirrors the transport onto the table every block, so production
+        // never sees the mismatch; a direct render has to say it itself.
+        graph.clocks.set_transport_playing(true);
         let mut out = vec![0.0f32; 64 * 2];
         let dropped = mixer::render(&mut graph, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
         assert_eq!(dropped, 0);

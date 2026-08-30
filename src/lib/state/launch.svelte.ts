@@ -8,7 +8,7 @@ import { backend } from "../tauri";
 import { midi } from "./midi.svelte";
 import { transport } from "./transport.svelte";
 import { view } from "./view.svelte";
-import type { LaunchFired } from "../types/ipc";
+import type { LaunchFired, PlayerInfo } from "../types/ipc";
 import {
   bindingFocusSamples,
   clipWouldSelfTrigger,
@@ -33,6 +33,20 @@ class LaunchStore {
   /** Drive-clip scene currently sounding on the shadow playhead. */
   overlay = $state<{ id: string; name: string } | null>(null);
   error = $state<string | null>(null);
+  /** Fix round 1, Critical 2: the only way to resolve a `LaunchTarget::Player`
+   * back to the clip it plays — the frontend has no other player registry.
+   * Best-effort; stays empty in demo mode (`backend.playersGet` is optional)
+   * or on a failed fetch, same as every other optional backend call here. */
+  players = $state<PlayerInfo[]>([]);
+
+  /** The clip id a player target names, or null (a knobs-only pad, an
+   * audio-clip player — not reachable from a MIDI launch binding today —
+   * or a player id `players` hasn't loaded yet). */
+  clipIdForPlayer(playerId: string): string | null {
+    const p = this.players.find((p) => p.id === playerId);
+    if (!p || p.source.kind !== "midiClip") return null;
+    return p.source.clipId;
+  }
 
   get activeMap(): LaunchMap {
     return this.maps.find((m) => m.id === this.activeMapId) ?? this.maps[0] ?? defaultLaunchMap();
@@ -87,10 +101,11 @@ class LaunchStore {
       this.accept(snap);
     });
     backend.on?.("launch://fired", (ev: LaunchFired) => {
-      if (ev.origin === "hardware") {
-        this.overlay = null;
-        return;
-      }
+      // Every origin sounds the same way now (Plan V — V2, Task 8): a
+      // hardware press used to seize the arrangement transport instead of
+      // running the shadow playhead, so this handler cleared the indicator
+      // for it. A pad press is a scene on its own clock now, so it shows
+      // like any other fire.
       if (ev.playing === false) {
         if (this.overlay?.id === ev.id) this.overlay = null;
         return;
@@ -217,9 +232,32 @@ class LaunchStore {
   }
 
   async reload() {
-    if (!backend.launchGet) return;
+    // Runs on `project://changed` too (see `init`), which is the very
+    // event `open_project_epoch` fires right after the clip→player
+    // migration. Fix round 2: `players` and `maps` are fetched
+    // CONCURRENTLY but this method does not resolve until both have
+    // landed, so `this.players` is guaranteed current by the time
+    // `reload()`'s caller (or anything awaiting `init()`) proceeds — a
+    // pad press racing this window used to see a stale/empty `players`
+    // and take `mapClip`'s CREATE path for a clip that already had a
+    // migrated binding, minting a duplicate.
+    const playersDone = this.reloadPlayers();
+    if (!backend.launchGet) {
+      await playersDone;
+      return;
+    }
     try {
-      this.accept(await backend.launchGet());
+      const [snap] = await Promise.all([backend.launchGet(), playersDone]);
+      this.accept(snap);
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  private async reloadPlayers() {
+    if (!backend.playersGet) return;
+    try {
+      this.players = await backend.playersGet();
     } catch (err) {
       this.error = String(err);
     }
@@ -257,7 +295,9 @@ class LaunchStore {
     const b = this.bindings.find((x) => x.id === id);
     if (!b) return;
     this.selectedId = id;
-    const samples = bindingFocusSamples(b, midi.clips, (t) => midi.ticksToSamples(t));
+    const samples = bindingFocusSamples(b, midi.clips, (t) => midi.ticksToSamples(t), (id) =>
+      this.clipIdForPlayer(id),
+    );
     if (samples == null) return;
     const pad = view.width * view.spp * 0.15;
     view.scrollToSamples(Math.max(0, samples - pad));
@@ -285,10 +325,41 @@ class LaunchStore {
     return this.create({ kind: "region", startTicks, lengthTicks, trackIds });
   }
 
+  /** The binding already mapping `clipId`, `clip`-target or migrated
+   * `player`-target (via `clipIdForPlayer`), or null. Side-effect-free —
+   * unlike `mapClip`, which also focuses/selects on a hit — so a caller
+   * that only wants to know "is this clip already bound" (fireClip) can
+   * ask without the side effect of jumping the timeline/seeking the
+   * transport on every press of an already-mapped pad. */
+  existingBindingForClip(clipId: string): LaunchBinding | null {
+    return this.bindings.find((b) => this.bindingMatchesClip(b, clipId)) ?? null;
+  }
+
+  /** Does `binding`'s target resolve to `clipId` — a `clip` target
+   * directly, or a migrated `player` target via `clipIdForPlayer`? Fix
+   * round 3: the single matching rule underneath both
+   * `existingBindingForClip` (above) and `surface.isClipPlaying`, which
+   * had drifted into its own copy of the same two-line check — the exact
+   * duplication Critical 2 was, left half-closed after round 2 removed
+   * the other copy (`fireClip`'s). */
+  bindingMatchesClip(binding: LaunchBinding, clipId: string): boolean {
+    return (
+      (binding.target.kind === "clip" && binding.target.clipId === clipId) ||
+      (binding.target.kind === "player" && this.clipIdForPlayer(binding.target.playerId) === clipId)
+    );
+  }
+
   async mapClip(clipId: string, name?: string): Promise<LaunchBinding | null> {
     const clip = midi.clipById(clipId);
     if (!clip) return null;
-    const existing = this.bindings.find((b) => b.target.kind === "clip" && b.target.clipId === clipId);
+    // Fix round 1, Critical 2: `existingBindingForClip` resolves a
+    // migrated `player` target back to its clip via `this.players`, so a
+    // clip that already has a migrated pad is still found here. Without
+    // this a second binding used to get minted on a fresh note every
+    // time — silently, since Rust's by-clip migration dedup would
+    // reunite both onto one player on the next open, hiding the
+    // duplicate note until then.
+    const existing = this.existingBindingForClip(clipId);
     if (existing) {
       this.selectedId = existing.id;
       this.focus(existing.id);
@@ -298,8 +369,18 @@ class LaunchStore {
   }
 
   clipSelfTriggers(binding: LaunchBinding): boolean {
-    if (binding.target.kind !== "clip") return false;
-    const clip = midi.clipById(binding.target.clipId);
+    // Fix round 1, Critical 2: resolve a `player` target back to its
+    // clip via `this.players`, the same as `mapClip` above, so the
+    // self-trigger warning still fires for a migrated binding instead of
+    // going silently quiet.
+    const clipId =
+      binding.target.kind === "clip"
+        ? binding.target.clipId
+        : binding.target.kind === "player"
+          ? this.clipIdForPlayer(binding.target.playerId)
+          : null;
+    if (clipId === null) return false;
+    const clip = midi.clipById(clipId);
     if (!clip) return false;
     return clipWouldSelfTrigger(clip.notes, binding.note, binding.channel);
   }

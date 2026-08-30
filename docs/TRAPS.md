@@ -343,8 +343,60 @@ session burns an hour on something a sentence would have prevented.
   Drive the vite dev server with Playwright and system Chrome instead, the
   same approach [`LANDED.md`](LANDED.md)'s layout scan used ("headless
   overflow scan (Chrome, browser demo mode)").
+- **A perf harness measures only what it actually builds — check the path
+  before writing the test, not after.** Plan V's Task 14 was asked for a
+  `plugin_load_profile.rs` case measuring idle players' cost, and that file's
+  only route to an `RtGraph` is `offline::build_graph`, which never takes or
+  reads `store.players` (ruling V-15 — a pad performance is not arrangement
+  material). Verified both ways: a harness session compiled with 0 and with
+  32 players produced bit-identical output, and `offline.rs`'s own tests
+  assert production must not read them. No production change to any
+  idle-player code path could have moved such a test — it would stay green
+  whether the early-out existed, was broken, or was deleted. That is
+  "measures nothing" wearing a measurement's clothes, and it survives no
+  amount of careful writing because it is structural: the file it lives in
+  cannot see what it is meant to test. `idle_players_block_cost` (in
+  `engine.rs`, hand-building an `RtGraph`) is the only place that
+  measurement can be made, which is why it lives outside the `tests/`
+  harness. Before adding a case to an existing perf fixture, trace what that
+  fixture actually compiles the graph from.
+- **A plan written before the worktree rule can carry instructions that are
+  now dangerous — re-read them at dispatch time, don't relay them.** Plan
+  V's own Task 14 text said `git stash` / `git checkout origin/main` /
+  `git stash pop` to measure a baseline. In a worktree the stash stack is
+  shared with the main checkout and every other session working in it, so
+  that sequence is exactly what [`CLAUDE.md`](../CLAUDE.md) forbids — it
+  was caught only because the dispatcher re-read the steps instead of
+  trusting the plan verbatim. The baseline-on-`origin/main` measurement
+  belongs in a throwaway worktree (`git worktree add` to a temp path),
+  never in a stash dance inside the branch's own worktree.
 
 ## Audio engine
+
+- **`binding_self_triggers` is a pure function, and nothing enforces that the
+  drive loop calls it.** `midi/launch.rs`'s drive poll must skip a binding
+  that fires the pad playing the very clip driving it; that predicate was
+  once inline and non-exhaustive, so a migrated `Player` target slipped past
+  it and the clip re-fired its own player on every note-on — doubled,
+  restarted material, with the frontend's matching warning silent at the
+  same time. It is now extracted and pinned four ways as a function, but
+  **reverting the call site at `launch.rs:751` to the old inline `if let`
+  leaves all 43 `midi::launch` tests green.** The loop body lives inside a
+  `thread::spawn` closure with no test seam, so pinning the call itself needs
+  a rig that does not exist. The doc comment at `:380` claims the loop and
+  the test call the same match; that claim is true today and is enforced by
+  nothing.
+
+- **`ControlPlane`'s test accessors take a non-reentrant lock, so nesting two
+  of them in one expression HANGS the whole test binary.** `parking_lot`'s
+  mutex is not reentrant and does not panic on a second acquire from the
+  same thread — it simply waits, forever. Written as
+  `cp.tables_for_tests().clocks.is_on(cp.player_clock_for(&b).unwrap())` the
+  inner call runs while the outer temporary still holds the guard, and
+  `cargo test` sits there producing nothing: a silent multi-minute stall
+  with no panic and no failing test to point at. Bind each accessor's result
+  to a `let` first. Cost when this was found: task 11's retrigger test, and
+  several minutes spent suspecting the suite rather than the expression.
 
 - **`ParamTable::default()` has 64 mixer slots and ZERO send lanes.** An
   unknown send index reads back as UNITY (`send_amount_linear`'s
@@ -396,19 +448,19 @@ session burns an hour on something a sentence would have prevented.
   Pass the host's own `PluginInstanceInfo` through, do not reconstruct
   it.
 
-- **Run the local suite under `xvfb-run`, and single-threaded.**
+- **Run the local suite under `xvfb-run`.**
 
   ```sh
-  xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+  xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml
   ```
 
-  Two separate problems, one command. Zyn's LV2 UI is DPF ExternalWindow:
+  Zyn's LV2 UI is DPF ExternalWindow:
   it draws nothing itself and instead spawns `zynaddsubfx-ext-gui` as its
   own process, so the GUI tests put real windows on your desktop.
-  `xvfb-run` gives them a throwaway display that dies with the run.
-  `--test-threads=1` avoids the parallel crash below — which is what
-  leaves windows behind, because a process killed by a signal never runs
-  `Drop`, and `Drop` is the only thing that kills the GUI child.
+  `xvfb-run` gives them a throwaway display that dies with the run. This
+  used to also require `--test-threads=1`, because a process killed by a
+  signal never runs `Drop`, and `Drop` is the only thing that kills the
+  GUI child — but the signal is gone; see below.
 
   **Do not "fix" this by unsetting `DISPLAY`.** The three GUI tests gate
   on it and return early, so they go green having asserted nothing —
@@ -417,11 +469,45 @@ session burns an hour on something a sentence would have prevented.
   under `xvfb-run` all five zyn tests run and pass; with no display they
   pass while printing "skipping: no display".
 
-- **A parallel `cargo test --lib` can SIGSEGV**, not merely flake. Single
-  threaded it passes 1407/1407. If a full run dies with `signal: 11`, you
-  have not broken anything — see
-  [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 5, which has
-  the evidence and the two pieces of work it implies.
+- **A pad's flush window does NOT survive a graph rebuild.** A player
+  row that has stopped being triggered keeps running its whole strip for
+  `RtTrack::tail_frames` so its tail leaves the row (V-17 (b)) — but
+  `flush_left` is a field on `RtTrack`, `RtTrack::clips` sets it to 0 and
+  `RtGraph::with_buses` does not seed it, while the insert NODES
+  themselves are reused across rebuilds by `LiveNodeRegistry` precisely
+  so plugin state survives. So a rebuild landing INSIDE a pad's flush
+  window strands whatever is still in that plugin pipeline, and the next
+  press replays it at its onset. The window is a few milliseconds wide
+  and this is no worse than the behaviour before the window existed, so
+  it is not a regression and was deliberately left alone — but it is the
+  one remaining hole in "nothing on this row is skipped until its whole
+  tail has left it". If you hear a pad's previous hit at the start of the
+  next one, check whether a rebuild happened in between before you go
+  looking at the mixer.
+
+- **`--test-threads=1` is still needed, but not for the reason every doc in
+  this repo gives.** The SIGSEGV is gone: a libtest binary has no
+  `AURA_SCAN_WORKER` guard, so `WorkerCommand::current_exe()`'s child ran the
+  ENTIRE suite again and opened every audio device its engine tests asked
+  for, pinning pipewire at its 1024 file-descriptor limit. Fixed in #123 —
+  [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 5 has the
+  diagnosis and the two wrong turns it cost.
+
+  **A second, independent problem outlived it**, and it is a flake rather
+  than a crash: `midi::launch::tests` shares a process-wide `LaunchRuntime`
+  singleton, and the `plane()` fixture's `runtime().clear_sounding()` is only
+  safe while nothing else is mid-test. Measured 2026-08-30 —
+  `cargo test --lib midi::launch::tests` at default parallelism failed **5 of
+  6** consecutive runs, a different test each time; the same module under
+  `--test-threads=1` passed every run. See `backlog/ci-hardening.md` item 8.
+
+  **Do not read a green parallel run as proof.** Three consecutive full-suite
+  parallel runs passed 1568/1568 in 11.5–12.4 s against 112.9 s
+  single-threaded, and that is what this entry originally claimed as the end
+  of the rule. It was luck: a full run spreads the launch tests across many
+  threads and the collision window narrows, while running the module alone
+  concentrates them. The 9x is real and worth having — but it costs a flake
+  the whole suite cannot reliably show you, so it is not free yet.
 
 ## Runtime noise that is not your bug
 

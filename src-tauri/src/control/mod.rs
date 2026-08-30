@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::audio::engine::{ControlMsg, EngineHandle, MeterSink};
-use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO};
-use crate::ids::TrackId;
+use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_MUTE, FLAG_SOLO};
+use crate::ids::{PlayerId, TrackId};
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
@@ -361,6 +361,7 @@ impl Committer {
             ),
             tracks: s.tracks.clone(),
             clips: s.clips.clone(),
+            players: s.players.clone(),
             transport: Some(transport),
         }
     }
@@ -498,6 +499,14 @@ impl Committer {
                     // `param_writes` either (they travel through
                     // `host_forward::ParamWrite` instead, resolved by
                     // instance id, not by a `GraphTables` slot).
+                    // Plan V (ruling V-1): same reasoning for `Raw`,
+                    // `TriggerMode` and `PlayerSource` — the first two are
+                    // structural or document-only, the third is structural.
+                    // A player's Gain/Pan/Muted do NOT land here: they reuse
+                    // the four arms above, because a player's compiled
+                    // `MixNode::id` is its `PlayerId` borrowed into `TrackId`
+                    // and its slot lives in the same `slots` map a track's
+                    // does (Task 9, `derive_slots_with_players`).
                     // Rename: document-only, no ParamTable counterpart and
                     // no rebuild — `apply_raw` never pushes it here either.
                     op::PropPath::Name
@@ -519,7 +528,10 @@ impl Committer {
                     | op::PropPath::LoopEndSamples
                     | op::PropPath::StopAtEnd
                     | op::PropPath::SampleRate
-                    | op::PropPath::Param { .. } => {}
+                    | op::PropPath::Param { .. }
+                    | op::PropPath::Raw
+                    | op::PropPath::TriggerMode
+                    | op::PropPath::PlayerSource => {}
                 }
             }
             // Plan G2: send amounts, resolved through the CURRENT
@@ -1787,50 +1799,371 @@ impl ControlPlane {
         );
     }
 
-    pub fn apply_launch_audible(&self, track_ids: &[String]) {
+    /// The clock a scene binding fires, or `None` when the graph has not been
+    /// rebuilt since the binding was added. A missing clock drops the fire
+    /// with a warn rather than firing the wrong one — the same "unknown index
+    /// means drop the write" rule `ParamTable`'s setters use.
+    pub fn scene_clock_for(&self, binding_id: &str) -> Option<u32> {
+        self.tables.lock().scene_clocks.get(binding_id).copied()
+    }
+
+    /// Start one scene: point the tracks its region names at ITS clock, then
+    /// fire that clock. Returns whether the scene actually has one.
+    ///
+    /// This is the whole fire path now, for every `FireOrigin`. It never
+    /// touches the transport (design §2.2's defect) and never touches another
+    /// scene's clock, which is what lets two scenes sound at once — the
+    /// single overlay this replaces could express neither.
+    ///
+    /// The release-then-bind pass is per-clock and deliberate: re-firing a
+    /// binding whose region has since lost a track must not leave that track
+    /// stranded on this scene's playhead. It releases only what THIS clock
+    /// still owns (V-14), so a track another scene has claimed in the
+    /// meantime stays with that scene.
+    pub fn fire_scene(&self, binding_id: &str, track_ids: &[String], start: u64, end: u64) -> bool {
         let tables = self.tables.lock();
+        let Some(&clock) = tables.scene_clocks.get(binding_id) else {
+            log::warn!("launch: no clock for binding {binding_id} — dropping the fire");
+            return false;
+        };
         for slot in 0..tables.params.len() {
-            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+            tables.clocks.release_slot_if(slot, clock);
         }
         for id in track_ids {
             if let Some(&slot) = tables.slots.get(&TrackId::from(id.as_str())) {
-                tables.params.set_flag(slot, FLAG_LAUNCH, true);
+                tables.clocks.bind_slot(slot, clock);
             }
         }
+        tables.clocks.fire(clock, start, end, false);
+        true
     }
 
-    pub fn clear_launch_audible(&self) {
-        crate::midi::launch::runtime().clear_audible_tracks();
-        self.shared.clear_launch();
+    /// Cut one scene: stop its clock, and leave every slot it owns bound.
+    ///
+    /// This is the brief's `stop_scene`, RENAMED when the release moved out
+    /// of it, because a method called "stop" invites putting the release
+    /// back — and the release is exactly what must not happen here.
+    /// `ClockTable::stop` latches one discontinuity for the live nodes bound
+    /// to this clock (the `all_notes_off` a cut note needs, or the voice
+    /// hangs with nothing left to release it), and a slot released in the
+    /// same breath never reads it. `release_finished_scenes` does the
+    /// release, once a rendered block has actually delivered the flush.
+    ///
+    /// Every ending goes through here — a clip running out, a Gate note-off
+    /// lifting mid-clip, stop-all, and the transport stopping. The Gate path
+    /// is why the old "the drive thread only releases a poll after the clock
+    /// already stopped" reasoning was not enough: it cuts a RUNNING clock.
+    ///
+    /// Returns whether this call is the one that stopped a running clock.
+    /// `ClockTable::stop`'s own return value is the answer, not an `is_on`
+    /// read beside it: `advance` can turn the clock off between the two, and
+    /// the pair would then report "something was sounding" for a scene that
+    /// had already ended.
+    pub fn cut_scene(&self, binding_id: &str) -> bool {
         let tables = self.tables.lock();
-        for slot in 0..tables.params.len() {
-            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+        let Some(&clock) = tables.scene_clocks.get(binding_id) else { return false };
+        tables.clocks.stop(clock)
+    }
+
+    /// Cut every scene, and forget the endings we owed the frontend — the
+    /// transport-stop path (`TransportAction::Stop`) and nothing else:
+    /// stopping the song ends the scenes with it, and the UI learns that from
+    /// `transport://state`, not from a `LaunchFired` per scene.
+    ///
+    /// Cut, NOT released: same reason as `cut_scene`. Before Task 8's fix
+    /// round this stopped and released in one breath, so a note sounding when
+    /// the user pressed Stop was left hanging in the live node.
+    pub fn clear_launch_audible(&self) {
+        crate::midi::launch::runtime().clear_sounding();
+        let tables = self.tables.lock();
+        // SCENES ONLY, and that is a ruling, not an oversight. A scene is a
+        // region of the arrangement that a pad borrowed, so stopping the song
+        // ends it. A PLAYER is not in the song at all (V-2), and cutting a
+        // performance because someone stopped the transport is the deck
+        // going quiet mid-set. `stop_launch_overlay` (Escape / stop-all) is
+        // the call that cuts pads; see `docs/backlog/plan-v-players.md`.
+        for &clock in tables.scene_clocks.values() {
+            tables.clocks.stop(clock);
         }
     }
 
-    pub fn arm_drive_launch(&self, track_ids: &[String], start: u64, end: u64) {
-        self.apply_launch_audible(track_ids);
-        self.shared.arm_launch(start, end);
-    }
-
-    pub fn drive_overlay_is(&self, id: &str) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.shared.launch_on.load(Relaxed)
-            && crate::midi::launch::runtime().overlay_id().as_deref() == Some(id)
-    }
-
-    pub fn clear_drive_overlay(&self) {
-        crate::midi::launch::runtime().set_overlay_id(None);
-        self.shared.clear_launch();
-    }
-
-    /// Cut whatever is on the launch overlay (Escape / stop-all). Ends it
-    /// exactly the way reaching the clip's end does, so the release path the
-    /// drive thread already owns clears FLAG_LAUNCH and emits
-    /// `LaunchFired { playing: false }` — one code path, one behaviour.
-    /// Returns true when something was actually sounding.
+    /// Cut everything sounding — every scene AND every player (Escape /
+    /// stop-all). Ends them exactly the way reaching a clip's end does, so
+    /// the drive thread's own release edge announces each ending and
+    /// `release_finished_scenes` hands the scenes' tracks back — one code
+    /// path, one behaviour. Returns true when something was actually
+    /// sounding.
+    ///
+    /// PLAYERS were missing here until fix round 1, and their absence made
+    /// this the only escape from a hung deck. `TriggerMode::Loop` fires a
+    /// looping clock; a looping clock never ends itself
+    /// (`ClockTable::advance` wraps it instead), and `any_running()` keeps
+    /// the output callback rendering with the transport stopped — so a
+    /// looping pad sounded indefinitely with nothing in reach able to cut
+    /// it. `player_stop(id)` could, but no caller exists yet, and this
+    /// method's own doc already claimed to stop everything.
+    ///
+    /// This is NOT the transport-stop path. Stopping the song deliberately
+    /// leaves pads sounding (V-2: a pad is not arrangement material, and
+    /// stopping the arrangement should not cut a performance) — see
+    /// `clear_launch_audible`, and `docs/backlog/plan-v-players.md` for the
+    /// ruling.
+    ///
+    /// It deliberately does NOT release the slots itself, for the reason
+    /// spelled out on `cut_scene`: the discontinuity `ClockTable::stop`
+    /// latches has to reach the live nodes still bound here first. A
+    /// player's slot is never released at all — it owns it for the life of
+    /// the graph.
+    ///
+    /// `ClockTable::stop`'s own return value is the answer, not an `is_on`
+    /// read beside it: `advance` can turn a clock off between the two, and
+    /// the pair would then report "something was sounding" for a scene that
+    /// had already ended.
     pub fn stop_launch_overlay(&self) -> bool {
-        self.shared.end_launch()
+        let tables = self.tables.lock();
+        // Fold with `|`, not `any`: every scene and every pad must be cut,
+        // and `any` short-circuits on the first one that was running.
+        tables
+            .scene_clocks
+            .values()
+            .chain(tables.player_clocks.values())
+            .fold(false, |acc, &clock| tables.clocks.stop(clock) | acc)
+    }
+
+    // ---- Plan V — V2: players (ruling V-1, Task 9) --------------------
+
+    /// Every player in the document. PURE session-lock read.
+    pub fn players(&self) -> Vec<crate::audio::player::Player> {
+        self.session.lock().store.players.clone()
+    }
+
+    /// The clock this player fires, or `None` when the graph has not been
+    /// rebuilt since the player was added. Same contract — and the same
+    /// reasoning — as [`ControlPlane::scene_clock_for`]: a missing clock
+    /// drops the fire rather than firing whichever clock sits at that index.
+    pub fn player_clock_for(&self, id: &str) -> Option<u32> {
+        self.tables.lock().player_clocks.get(&PlayerId::from(id)).copied()
+    }
+
+    /// How many samples a fired player sounds for.
+    ///
+    /// The PLACEMENT's length, not the source file's: `PlayerSource` names a
+    /// `ClipId` precisely because the placement is what carries the trim
+    /// (`offset_samples`/`length_samples`), and V-16 defines raw playback in
+    /// exactly those terms. `PlayerSource::None` is a knobs-only pad (R5) and
+    /// has nothing to sound, so it is 0 rather than an error — a control pad
+    /// that reports a failure every time it is pressed is worse than one that
+    /// silently does what it is.
+    /// The MIDI arm reads `session.midi`, which is why this takes the whole
+    /// session rather than the store: a MIDI player's placement is a
+    /// `MidiClip`, and its length is TICKS. `rate` is the engine's, and a
+    /// rate of 0 (no device yet) yields 0 — the same "nothing to sound"
+    /// answer a knobs-only pad gives, rather than a length computed at a
+    /// fabricated rate.
+    fn player_source_length(
+        session: &Session,
+        p: &crate::audio::player::Player,
+        rate: u32,
+    ) -> Result<u64, String> {
+        match &p.source {
+            crate::audio::player::PlayerSource::AudioClip { clip_id } => session
+                .store
+                .clips
+                .iter()
+                .find(|c| &c.id == clip_id)
+                .map(|c| c.length_samples)
+                .ok_or_else(|| format!("player {}: unknown clip {clip_id}", p.id)),
+            // The PLACEMENT's span, tick-converted through the tempo map the
+            // arrangement uses — the difference of the two ends rather than
+            // `length_ticks` converted from zero, so a placement under a
+            // tempo change is as long as it actually sounds there.
+            crate::audio::player::PlayerSource::MidiClip { clip_id, .. } => {
+                let clip = session
+                    .midi
+                    .clips
+                    .iter()
+                    .find(|c| &c.id == clip_id)
+                    .ok_or_else(|| format!("player {}: unknown midi clip {clip_id}", p.id))?;
+                if rate == 0 {
+                    return Ok(0);
+                }
+                let map = crate::midi::TempoMap::new(
+                    session.midi.ppq,
+                    session.midi.tempo_events.clone(),
+                    rate,
+                )
+                .map_err(|e| format!("player {}: {e}", p.id))?;
+                let start = map.tick_to_samples(clip.timeline_start_ticks);
+                let end =
+                    map.tick_to_samples(clip.timeline_start_ticks + clip.length_ticks);
+                Ok(end.saturating_sub(start))
+            }
+            crate::audio::player::PlayerSource::None => Ok(0),
+        }
+    }
+
+    /// Fire a player: start ITS clock, at 0, for its source's length.
+    ///
+    /// TRANSIENT by construction — a press is not a document change, so it
+    /// commits no op and takes no undo entry, the same reasoning that keeps
+    /// transport actions out of the history. It is also two atomic stores and
+    /// nothing else: the slot binding was made at graph build, so a pad press
+    /// never rebuilds the graph (the RT contract).
+    ///
+    /// It never touches the transport, and never touches another player's or
+    /// scene's clock — which is what lets a pad fire under a rolling
+    /// arrangement, and two pads sound at once (V-4).
+    pub fn player_fire(&self, id: &str) -> Result<(), String> {
+        // Read before the lock: an atomic load has no business under it.
+        let rate = self.shared.sample_rate.load(Relaxed);
+        let (len, looping) = {
+            let session = self.session.lock();
+            let p = session
+                .store
+                .players
+                .iter()
+                .find(|p| p.id.as_str() == id)
+                .ok_or_else(|| format!("unknown player: {id}"))?;
+            (
+                Self::player_source_length(&session, p, rate)?,
+                // `Gate` and `OneShot` are byte-identical here, by design:
+                // the design's `gate` ("sounds while held; release cuts it")
+                // is entirely a matter of WHO calls `player_stop` and WHEN —
+                // a pointerup, not anything the engine can see — so this is
+                // the one and only place trigger mode does anything at all.
+                p.trigger.mode == crate::audio::player::TriggerMode::Loop,
+            )
+        };
+        // BEFORE the clock lookup, and that order is the whole point (fix
+        // round 1). A zero-length source (a knobs-only pad, or a MIDI one
+        // before Task 10) would fire a clock that ends on the block it
+        // started — `ClockTable::fire` widens `end` to `start + 1` rather
+        // than divide by zero — so there is nothing to fire. Below the
+        // lookup, a knobs-only pad the graph had not been rebuilt for
+        // returned `Err("player has no clock yet")` instead of the
+        // documented no-op: an R5 control pad reporting a failure for
+        // being exactly what it is.
+        if len == 0 {
+            return Ok(());
+        }
+        let tables = self.tables.lock();
+        let clock = tables
+            .player_clocks
+            .get(&PlayerId::from(id))
+            .copied()
+            .ok_or_else(|| format!("player has no clock yet: {id}"))?;
+        tables.clocks.fire(clock, 0, len, looping);
+        Ok(())
+    }
+
+    /// Cut a player: stop its clock, leaving one discontinuity behind for the
+    /// nodes bound to it. The slot stays bound — a player OWNS its slot for
+    /// the life of the graph, so there is nothing to release (unlike
+    /// `cut_scene`, which borrows a timeline track's).
+    ///
+    /// Returns `Ok(())` for a pad that was not sounding: stop-all presses
+    /// every pad unconditionally, and `ClockTable::stop`'s guard already
+    /// makes an idle stop fabricate no flush.
+    ///
+    /// The session is consulted only on the FAILURE path, and deliberately so.
+    /// The clock map alone cannot tell "no such pad" from "a pad the graph has
+    /// not been rebuilt for yet", and reporting the first for the second sends
+    /// the reader hunting a document bug that is not there — the press side
+    /// already distinguishes them (`player_fire`). Doing it here costs the
+    /// happy path nothing: a release takes one uncontended table lock and no
+    /// session lock at all, and the two locks are never held together.
+    pub fn player_stop(&self, id: &str) -> Result<(), String> {
+        {
+            let tables = self.tables.lock();
+            if let Some(&clock) = tables.player_clocks.get(&PlayerId::from(id)) {
+                tables.clocks.stop(clock);
+                return Ok(());
+            }
+        }
+        Err(
+            if self.session.lock().store.players.iter().any(|p| p.id.as_str() == id) {
+                format!("player has no clock yet: {id}")
+            } else {
+                format!("unknown player: {id}")
+            },
+        )
+    }
+
+    /// Set a player's trigger mode through the transaction channel
+    /// (`Op::Set { path: PropPath::TriggerMode, .. }`) — the seam a user
+    /// needs to reach anything but the `OneShot` default (fix round 1: the
+    /// plan otherwise shipped Loop and Gate unreachable by any caller).
+    /// Document-only (Task 3's ruling: `player_fire` reads `p.trigger.mode`
+    /// off the live session on every press, not off the compiled graph), so
+    /// this never rebuilds and never touches `GraphTables`.
+    pub fn set_trigger_mode(
+        &self,
+        id: &str,
+        mode: crate::audio::player::TriggerMode,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::Set {
+                object: op::ObjectRef::Player(PlayerId::from(id)),
+                path: op::PropPath::TriggerMode,
+                from: serde_json::Value::Null,
+                to: serde_json::to_value(mode).unwrap(),
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Add a player through the transaction channel (`Op::PlayerAdd`), so it
+    /// is undoable, journaled and persisted exactly as `add_track` is. A
+    /// player is a document object (V-1); it is NOT a track (V-2), which is
+    /// why this is its own op rather than a `TrackAdd` with a flag.
+    pub fn add_player(
+        &self,
+        name: Option<String>,
+        source: crate::audio::player::PlayerSource,
+        raw: bool,
+        meta: op::TxMeta,
+    ) -> Result<crate::audio::player::Player, String> {
+        let index = self.session.lock().store.players.len();
+        let name = name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("PAD {}", index + 1));
+        let mut player = crate::audio::player::Player::new(PlayerId::mint(), name);
+        player.source = source;
+        player.raw = raw;
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::PlayerAdd { player: player.clone(), index })
+        })?;
+        Ok(player)
+    }
+
+    /// Remove a player through the transaction channel (`Op::PlayerRemove`).
+    /// The op takes its payload from store truth, so undo restores the pad
+    /// byte-identically.
+    ///
+    /// `index` is passed as `usize::MAX` rather than `0` on purpose. The
+    /// `apply_raw` arm ignores the caller's value entirely and finds the real
+    /// position by id — a literal `0` in a declared field reads like an
+    /// assertion that the pad is first, and would be believed by the next
+    /// person to touch this. `usize::MAX` cannot be mistaken for a claim.
+    /// The inverse op the arm returns carries the TRUE index, which is what
+    /// undo re-inserts at.
+    pub fn remove_player(&self, id: &str, meta: op::TxMeta) -> Result<(), String> {
+        let player = {
+            let session = self.session.lock();
+            session
+                .store
+                .players
+                .iter()
+                .find(|p| p.id.as_str() == id)
+                .cloned()
+                .ok_or_else(|| format!("unknown player: {id}"))?
+        };
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::PlayerRemove { player: player.clone(), index: usize::MAX })
+        })?;
+        Ok(())
     }
 
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no
@@ -4389,6 +4722,18 @@ impl ControlPlane {
         &self.session
     }
 
+    /// Test-only view of the published `GraphTables` — the clock table, the
+    /// slot map and the scene-clock map a rebuild would have published. Tests
+    /// that assert on what a fire DID (which clock is on, which slot reads
+    /// it) need to see the same table the fire wrote into.
+    ///
+    /// Returns the guard, so a caller holding it must not call back into the
+    /// control plane: every helper here takes this same lock.
+    #[cfg(test)]
+    pub(crate) fn tables_for_tests(&self) -> parking_lot::MutexGuard<'_, crate::audio::rt::GraphTables> {
+        self.tables.lock()
+    }
+
     /// Test-only accessor to the `Committer` (review round 1, Important-2):
     /// `ControlPlane` no longer has its own `execute_persist` — the only
     /// production caller is `Committer::commit_with_rebuild` itself, calling
@@ -4472,6 +4817,7 @@ impl ControlPlane {
             // trivially satisfies.
             s.tracks.clear();
             s.clips.clear();
+            s.players.clear(); // blank-slate reset (V-1) — same reason as tracks/clips above
             s.project_dir = Some(dir.clone());
             s.project_name = Some(name.to_string());
             s.created_at = project.created_at.clone();
@@ -4599,6 +4945,10 @@ impl ControlPlane {
             let mut session = self.session.lock();
             session.store.tracks = project.tracks.clone();
             session.store.clips = project.clips.clone();
+            // Plan V players (V-1): a separate list from tracks/clips (V-2),
+            // swapped in the same place for the same reason — an open must
+            // replace the in-memory document wholesale, not merge into it.
+            session.store.players = project.players.clone();
             session.store.project_dir = Some(dir.clone());
             session.store.project_name = Some(project.name.clone());
             session.store.created_at = project.created_at.clone();
@@ -4627,10 +4977,44 @@ impl ControlPlane {
             // Eager midi adopt (Task 6: no more lazy resync on the first
             // midi command after an open) — same lock as the store swap
             // above, no separate re-acquisition.
+            //
+            // `force: true` — an explicit open must always re-read midi
+            // state, the same as the store fields just above
+            // (tracks/clips/PLAYERS), which are refreshed unconditionally.
+            // `adopt_midi_from_dir`'s same-dir skip exists for the lazy
+            // READ paths it used to serve (Task 6's own doc), not for an
+            // explicit open of a document just freshly re-read and
+            // validated above. Fix round 1, Critical 1: an EARLIER version
+            // of this forced the reload by clearing `session.midi.loaded_dir`
+            // itself, which ALSO defeated the `Ok(None)` branch's own,
+            // unrelated `loaded_dir.is_some()` check inside
+            // `adopt_midi_from_dir` — the guard that clears a PREVIOUS
+            // project's clips/harmony/launch_maps when the newly-opened one
+            // has never had a midi save (every project that has never been
+            // midi-saved takes that branch). `force` bypasses only the
+            // same-dir cache hit, leaving that check, and the `dirty`
+            // guard, exactly as `adopt_midi_from_dir` already has them.
             let t = std::time::Instant::now();
             let bpm = session.store.transport.tempo_bpm;
-            crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
+            crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm, true);
             log::info!("open: midi adopted in {} ms", t.elapsed().as_millis());
+            // Plan V — V2 Task 12: retires the launch overlay's `Clip`
+            // targets in favor of players, now that both the just-adopted
+            // launch maps and the just-swapped players/tracks are in place.
+            // In-memory only, like the schema migrations `adopt_midi_from_dir`
+            // itself performs (persist.rs's own doc) — the next save writes
+            // it back; nothing here forces disk I/O under the session lock.
+            let sess = &mut *session;
+            let migrated = crate::midi::launch::migrate_clip_targets_to_players(
+                &mut sess.midi.launch_maps,
+                &sess.midi.clips,
+                &sess.store.tracks,
+                &mut sess.store.players,
+            );
+            if migrated > 0 {
+                log::info!("launch: migrated {migrated} clip binding(s) to players on open");
+                crate::midi::launch::runtime().set_maps(session.midi.launch_maps.clone());
+            }
             // snapshot republish: document swap (open) — a non-op writer,
             // so nothing captured this. Full re-derive before the guard
             // drops, so the published image is never behind the live doc.
@@ -5608,6 +5992,71 @@ pub fn open_clip_in_external_editor(
     app.shell().open(path.to_string_lossy(), None).map_err(|e| e.to_string())
 }
 
+// ---- Plan V — V2: players (Task 9). Additive commands; every frozen
+// command name is untouched. ----
+
+/// Every player in the document (Plan V — V1). Read-only.
+#[tauri::command]
+pub fn players_get(
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<Vec<crate::audio::player::Player>, String> {
+    Ok(control.players())
+}
+
+/// Add a player — thin delegate over [`ControlPlane::add_player`], so it
+/// goes through `commit` exactly as `add_track` does (undoable, journaled,
+/// persisted). `source` omitted is a knobs-only pad (R5).
+#[tauri::command]
+pub fn player_add(
+    name: Option<String>,
+    source: Option<crate::audio::player::PlayerSource>,
+    raw: Option<bool>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<crate::audio::player::Player, String> {
+    control.add_player(
+        name,
+        source.unwrap_or_default(),
+        raw.unwrap_or(false),
+        op::TxMeta::user("add player"),
+    )
+}
+
+/// Remove a player — thin delegate over [`ControlPlane::remove_player`].
+#[tauri::command]
+pub fn player_remove(
+    player_id: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.remove_player(&player_id, op::TxMeta::user("remove player"))
+}
+
+/// Fire a player (a pad press) — thin delegate over
+/// [`ControlPlane::player_fire`]. Deliberately NOT a commit: a press is a
+/// performance, not a document edit, so it takes no undo entry and never
+/// rebuilds the graph.
+#[tauri::command]
+pub fn player_fire(player_id: String, control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    control.player_fire(&player_id)
+}
+
+/// Cut a player — thin delegate over [`ControlPlane::player_stop`].
+#[tauri::command]
+pub fn player_stop(player_id: String, control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    control.player_stop(&player_id)
+}
+
+/// Set a player's trigger mode — thin delegate over
+/// [`ControlPlane::set_trigger_mode`]. Fix round 1 (Task 11): the command
+/// surface that makes Gate and Loop reachable by anyone but a unit test.
+#[tauri::command]
+pub fn player_set_trigger_mode(
+    player_id: String,
+    mode: crate::audio::player::TriggerMode,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.set_trigger_mode(&player_id, mode, op::TxMeta::user("set trigger mode"))
+}
+
 /// Open a gesture boundary (Plan E Task 14 — round-2 inventory row 31, ADR
 /// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. Returns the
 /// new gesture's id so a later `gesture_end` can refuse to close a
@@ -5895,6 +6344,7 @@ mod tests {
 
     use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 
+    use crate::audio::player::TriggerMode;
     use crate::audio::types::testutil::{test_clip, test_track};
     use crate::control::op::testutil::set_gain;
 
@@ -5938,6 +6388,10 @@ mod tests {
             send_slots: Default::default(),
             generation: 1,
             params: Arc::new(ParamTable::default()),
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
+            player_clocks: Default::default(),
+            orphan_clock: None,
             slots: derive_slots(&session.lock().store.tracks),
         }));
         let (engine, engine_rx) = EngineHandle::for_tests();
@@ -5954,6 +6408,565 @@ mod tests {
             Arc::new(crate::control::GestureState::new()),
         );
         (cp, engine_rx, events)
+    }
+
+    // ---- Plan V — V2: players (Task 9) ----------------------------------
+
+    /// Publish the `GraphTables` `engine::rebuild` would publish for this
+    /// plane's CURRENT document — the slot map, the clock table and the
+    /// reserved player range `1 ..= players.len()`.
+    ///
+    /// [M2]'s argument, extended to players: there is no engine thread
+    /// behind `EngineHandle::for_tests`, so nothing ever rebuilds, and
+    /// without this every `player_fire` would report "no clock yet" and
+    /// every assertion below would pass vacuously.
+    fn republish_tables(cp: &ControlPlane) {
+        use crate::audio::types::{derive_slots_with_players, mixer_slot_count_with_players};
+        let session = cp.session.lock();
+        let store = &session.store;
+        let slots = derive_slots_with_players(&store.tracks, &store.players);
+        let n_slots = mixer_slot_count_with_players(&store.tracks, &store.players);
+        let params = Arc::new(ParamTable::with_slots_and_sends(n_slots, 0));
+        let clocks = Arc::new(crate::audio::clock::ClockTable::with_slots_clocks_and_players(
+            n_slots,
+            1 + store.players.len(),
+            store.players.len(),
+        ));
+        let player_clocks: std::collections::HashMap<PlayerId, u32> = store
+            .players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), 1 + i as u32))
+            .collect();
+        for (id, &clock) in player_clocks.iter() {
+            if let Some(&slot) = slots.get(&TrackId::from(id.as_str())) {
+                clocks.bind_slot(slot, clock);
+            }
+        }
+        let mut tables = cp.tables.lock();
+        let generation = tables.generation + 1;
+        *tables = GraphTables {
+            generation,
+            params,
+            clocks,
+            scene_clocks: Default::default(),
+            player_clocks,
+            orphan_clock: None,
+            slots,
+            send_slots: Default::default(),
+        };
+    }
+
+    /// One audio track carrying one clip, and no player yet. The clip is the
+    /// source every player test below fires.
+    fn test_control_plane_with_an_audio_clip() -> ControlPlane {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        cp.session.lock().store.clips.push(test_clip("c1", "t-1"));
+        republish_tables(&cp);
+        cp
+    }
+
+    /// Add a player sourced from clip `c1` and republish, i.e. exactly what
+    /// the real engine does after `Op::PlayerAdd` sets `effect.rebuild`.
+    fn add_audio_player(cp: &ControlPlane, clip_id: &str, raw: bool) -> String {
+        let p = cp
+            .add_player(
+                Some("PAD".into()),
+                crate::audio::player::PlayerSource::AudioClip { clip_id: clip_id.into() },
+                raw,
+                op::TxMeta::user("add player"),
+            )
+            .unwrap();
+        republish_tables(cp);
+        p.id.to_string()
+    }
+
+    /// Two audio tracks, each carrying one clip. Two players do NOT need
+    /// distinct clips to be independent — `two_players_sound_at_once_on_their_own_clocks`
+    /// already fires two off the SAME clip — this exists only because the
+    /// retrigger test wants two clearly-distinct players to reason about.
+    fn test_control_plane_with_two_audio_clips() -> ControlPlane {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1", "t-2"]);
+        cp.session.lock().store.clips.push(test_clip("c1", "t-1"));
+        cp.session.lock().store.clips.push(test_clip("c2", "t-2"));
+        republish_tables(&cp);
+        cp
+    }
+
+    /// The V2 gate's first line: a pad fires a WAV while the arrangement
+    /// plays, and the arrangement's transport does not move.
+    #[test]
+    fn firing_an_audio_player_sounds_without_touching_the_transport() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let player_id = add_audio_player(&cp, "c1", true);
+        cp.transport(TransportAction::Seek { position_samples: 96_000 }).unwrap();
+        cp.transport(TransportAction::Play).unwrap();
+
+        cp.player_fire(&player_id).unwrap();
+
+        let clock = cp.player_clock_for(&player_id).expect("the player has a clock");
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(clock), "the pad is sounding");
+        assert_eq!(
+            tables.clocks.playhead(tables.slots[&TrackId::from(player_id.as_str())], 96_000, false).pos,
+            0,
+            "on ITS OWN playhead, at 0 — not at the transport's 96000"
+        );
+        drop(tables);
+        assert_eq!(
+            cp.transport_state().position_samples, 96_000,
+            "the arrangement kept rolling from where it was"
+        );
+    }
+
+    /// V-4, the whole reason the overlay was replaced: two pads at once.
+    #[test]
+    fn two_players_sound_at_once_on_their_own_clocks() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let a = add_audio_player(&cp, "c1", true);
+        let b = add_audio_player(&cp, "c1", false);
+
+        cp.player_fire(&a).unwrap();
+        cp.player_fire(&b).unwrap();
+
+        let ca = cp.player_clock_for(&a).unwrap();
+        let cb = cp.player_clock_for(&b).unwrap();
+        assert_ne!(ca, cb, "each player owns a clock");
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(ca) && tables.clocks.is_on(cb));
+
+        // ...and cutting one leaves the other sounding.
+        drop(tables);
+        cp.player_stop(&a).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_on(ca));
+        assert!(tables.clocks.is_on(cb), "a retrigger/cut touches ONE clock");
+    }
+
+    /// The reserved range, from the control side: clock 0 is the transport
+    /// and is never a player's, however many pads the document has.
+    #[test]
+    fn players_own_the_reserved_clock_range_starting_after_the_transport() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let a = add_audio_player(&cp, "c1", false);
+        let b = add_audio_player(&cp, "c1", false);
+        assert_eq!(cp.player_clock_for(&a), Some(1));
+        assert_eq!(cp.player_clock_for(&b), Some(2));
+    }
+
+    #[test]
+    fn firing_an_unknown_player_is_an_error() {
+        let cp = test_control_plane_with_an_audio_clip();
+        assert!(cp.player_fire("ghost").unwrap_err().contains("unknown player"));
+        assert!(cp.player_stop("ghost").unwrap_err().contains("unknown player"));
+    }
+
+    /// A pad whose source clip was deleted must SAY so rather than fire a
+    /// clock over a length nobody can compute.
+    #[test]
+    fn firing_a_player_whose_clip_is_gone_is_an_error() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        cp.session.lock().store.clips.clear();
+        assert!(cp.player_fire(&id).unwrap_err().contains("unknown clip"));
+    }
+
+    /// R5: a knobs-only pad has nothing to sound. Pressing it is a no-op,
+    /// not an error — a control pad that reports a failure on every press is
+    /// worse than one that quietly does what it is.
+    #[test]
+    fn firing_a_sourceless_player_sounds_nothing_and_is_not_an_error() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let p = cp
+            .add_player(None, Default::default(), false, op::TxMeta::user("add"))
+            .unwrap();
+        republish_tables(&cp);
+        cp.player_fire(p.id.as_str()).unwrap();
+        let clock = cp.player_clock_for(p.id.as_str()).unwrap();
+        assert!(!cp.tables_for_tests().clocks.is_on(clock), "nothing to play");
+    }
+
+    /// Task 10: a MIDI pad's press has a LENGTH, which before it was 0 — so
+    /// `player_fire`'s zero-length short-circuit swallowed the press and the
+    /// pad never sounded at all. The length is the PLACEMENT's, tick-converted
+    /// through the tempo map, exactly as the audio arm uses `length_samples`.
+    #[test]
+    fn firing_a_midi_player_sounds_for_the_clips_tick_converted_length() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        cp.shared.sample_rate.store(48_000, Relaxed);
+        // Bar 5, one bar long. 960 ticks at 120 bpm / 48 kHz is 24000 samples,
+        // and the bar-5 origin must not leak into the length.
+        cp.session.lock().midi.clips.push(crate::midi::types::MidiClip {
+            id: "mc1".into(),
+            track_id: "t-1".into(),
+            name: "pad".into(),
+            timeline_start_ticks: 15_360,
+            length_ticks: 960,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t-1"),
+            content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
+        });
+        let p = cp
+            .add_player(
+                Some("PAD".into()),
+                crate::audio::player::PlayerSource::MidiClip {
+                    clip_id: "mc1".into(),
+                    instrument_id: Some("plugin:i1".into()),
+                },
+                false,
+                op::TxMeta::user("add"),
+            )
+            .unwrap();
+        republish_tables(&cp);
+
+        cp.player_fire(p.id.as_str()).unwrap();
+        let clock = cp.player_clock_for(p.id.as_str()).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(clock), "the pad is sounding");
+        tables.clocks.advance(23_999);
+        assert!(tables.clocks.is_on(clock), "still inside the bar");
+        tables.clocks.advance(1);
+        assert!(
+            !tables.clocks.is_on(clock),
+            "one bar at 120 bpm / 48 kHz is 24000 samples, and the bar-5 \
+             origin is not part of it"
+        );
+    }
+
+    /// The same tolerance the audio arm has, for the same reason: a source
+    /// the document no longer has is an error the press reports rather than a
+    /// clock spun over a length nobody can compute.
+    #[test]
+    fn firing_a_midi_player_whose_clip_is_gone_is_an_error() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        cp.shared.sample_rate.store(48_000, Relaxed);
+        let p = cp
+            .add_player(
+                Some("PAD".into()),
+                crate::audio::player::PlayerSource::MidiClip {
+                    clip_id: "ghost".into(),
+                    instrument_id: Some("plugin:i1".into()),
+                },
+                false,
+                op::TxMeta::user("add"),
+            )
+            .unwrap();
+        republish_tables(&cp);
+        assert!(cp.player_fire(p.id.as_str()).unwrap_err().contains("unknown midi clip"));
+    }
+
+    /// A pad added since the last rebuild has no lane yet. Say so, rather
+    /// than fire whichever clock happens to sit at that index — the same
+    /// rule `fire_scene` and `ParamTable`'s setters follow.
+    #[test]
+    fn firing_a_player_the_graph_has_not_seen_yet_reports_it() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let p = cp
+            .add_player(
+                None,
+                crate::audio::player::PlayerSource::AudioClip { clip_id: "c1".into() },
+                true,
+                op::TxMeta::user("add"),
+            )
+            .unwrap(); // deliberately NOT republished
+        let err = cp.player_fire(p.id.as_str()).unwrap_err();
+        assert!(err.contains("no clock yet"), "got: {err}");
+    }
+
+    /// Fix round 1, finding 3. Nothing could stop a looping pad.
+    ///
+    /// `TriggerMode::Loop` fires a looping clock; `ClockTable::advance` wraps
+    /// such a clock instead of ending it, and `any_running()` keeps the output
+    /// callback rendering with the transport stopped. So a looping pad sounded
+    /// indefinitely, and the only thing in reach that could cut it was
+    /// `player_stop(id)` — which no TypeScript calls yet. `stop_launch_overlay`
+    /// is Escape / stop-all, and its own doc already claimed to end everything
+    /// that was sounding.
+    #[test]
+    fn stop_all_cuts_a_looping_pad_and_not_only_scenes() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        cp.commit(op::TxMeta::user("loop"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Player(PlayerId::from(id.as_str())),
+                path: PropPath::TriggerMode,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("loop"),
+            })
+        })
+        .unwrap();
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+
+        // It really is unstoppable by time alone: run it far past the clip.
+        cp.tables_for_tests().clocks.advance(48_000 * 10);
+        assert!(cp.tables_for_tests().clocks.is_on(clock), "a loop never ends itself");
+
+        assert!(cp.stop_launch_overlay(), "stop-all reports it cut something");
+        assert!(!cp.tables_for_tests().clocks.is_on(clock), "and the pad is silent");
+    }
+
+    /// The other side of the same ruling, and it is a ruling: stopping the
+    /// TRANSPORT leaves pads sounding. A scene is a region of the arrangement
+    /// that a pad borrowed, so the song ending ends it; a player is not in the
+    /// song at all (V-2), and cutting a performance because someone stopped
+    /// the transport is the deck going quiet mid-set.
+    /// See `docs/backlog/plan-v-players.md`.
+    #[test]
+    fn stopping_the_transport_leaves_a_sounding_pad_alone() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        cp.transport(TransportAction::Play).unwrap();
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+
+        cp.transport(TransportAction::Stop).unwrap();
+        assert!(
+            cp.tables_for_tests().clocks.is_on(clock),
+            "the song stopped; the performance did not"
+        );
+    }
+
+    /// `player_stop` and `player_fire` must agree about WHY a pad cannot be
+    /// reached. Before this, `player_stop` had only the clock map to consult,
+    /// so a pad the graph had not seen yet — added and not rebuilt, the state
+    /// `firing_a_player_the_graph_has_not_seen_yet_reports_it` pins for the
+    /// press — reported "unknown player" and sent the reader looking for a
+    /// document bug that was not there.
+    #[test]
+    fn stopping_a_player_the_graph_has_not_seen_yet_says_so_not_unknown() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let p = cp
+            .add_player(
+                None,
+                crate::audio::player::PlayerSource::AudioClip { clip_id: "c1".into() },
+                true,
+                op::TxMeta::user("add"),
+            )
+            .unwrap(); // deliberately NOT republished
+        let err = cp.player_stop(p.id.as_str()).unwrap_err();
+        assert!(err.contains("no clock yet"), "got: {err}");
+        assert!(
+            cp.player_stop("ghost").unwrap_err().contains("unknown player"),
+            "and a pad that is not in the document at all still says that"
+        );
+    }
+
+    /// `TriggerMode::Loop` is what `ClockTable::fire`'s `looping` flag is
+    /// for: the pad repeats instead of ending, and the wrap carries its own
+    /// discontinuity.
+    #[test]
+    fn a_loop_mode_player_fires_a_looping_clock() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        cp.commit(op::TxMeta::user("loop"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Player(PlayerId::from(id.as_str())),
+                path: PropPath::TriggerMode,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("loop"),
+            })
+        })
+        .unwrap();
+        cp.player_fire(&id).unwrap();
+
+        let clock = cp.player_clock_for(&id).unwrap();
+        let tables = cp.tables_for_tests();
+        // The clip is 48000 long; run past it and it must still be on.
+        tables.clocks.advance(48_000 + 512);
+        assert!(tables.clocks.is_on(clock), "a loop does not end at the clip's end");
+    }
+
+    /// `TriggerMode::OneShot` is the default, and needs no looping flag: a
+    /// non-looping clock already ends itself at its own `end` (`advance`,
+    /// pinned by `clock::tests::advance_moves_running_clocks_and_stops_one_at_its_end`).
+    /// This pins the BEHAVIOUR through `player_fire` at the exact boundary —
+    /// on through the last frame, off past it — not merely "off eventually",
+    /// which a clock fired for a fraction of the real length would also
+    /// satisfy. Sets Loop first so the OneShot write actually changes
+    /// something, through the real command (fix round 1, item 4).
+    #[test]
+    fn one_shot_plays_to_its_end_and_stops_itself() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", false);
+        cp.set_trigger_mode(&id, TriggerMode::Loop, op::TxMeta::user("loop")).unwrap();
+        cp.set_trigger_mode(&id, TriggerMode::OneShot, op::TxMeta::user("one-shot")).unwrap();
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(clock));
+        tables.clocks.advance(47_999); // the clip is 48000 long (test_clip)
+        assert!(tables.clocks.is_on(clock), "still inside the clip");
+        tables.clocks.advance(1);
+        assert!(!tables.clocks.is_on(clock), "one-shot ends AT the clip's end, not before or after");
+    }
+
+    /// `Gate` and `OneShot` are byte-identical in the engine (`player_fire`'s
+    /// own comment on its `== Loop` check) — the design's "release cuts it"
+    /// is a pointerup calling `player_stop`, which the engine cannot see.
+    /// So this pins the ONE thing `set_trigger_mode` (fix round 1's new
+    /// command) can be asked to prove: the value it writes reaches the
+    /// document and reads back, round-tripped through real `TriggerMode`
+    /// serde — not that anything about playback changes, because nothing
+    /// does. `player_stop` cutting a sounding pad is already pinned by
+    /// `two_players_sound_at_once_on_their_own_clocks`.
+    #[test]
+    fn set_trigger_mode_reaches_the_document() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", false);
+        cp.set_trigger_mode(&id, TriggerMode::Gate, op::TxMeta::user("gate")).unwrap();
+        assert_eq!(
+            cp.players().iter().find(|p| p.id.as_str() == id).unwrap().trigger.mode,
+            TriggerMode::Gate,
+            "the write reached the document"
+        );
+    }
+
+    /// A retrigger rewinds THIS player and nothing else — the property the
+    /// single overlay this branch replaced could not have (V-4). Both halves
+    /// need a PLAYHEAD, not an on/off flag: a no-op retrigger leaves `a`
+    /// running from wherever it was, and a press that rewinds EVERY player —
+    /// the overlay behaviour itself — leaves `b` on while silently
+    /// restarting it.
+    #[test]
+    fn retriggering_one_player_leaves_another_sounding() {
+        let cp = test_control_plane_with_two_audio_clips();
+        let a = add_audio_player(&cp, "c1", false);
+        let b = add_audio_player(&cp, "c2", false);
+        cp.player_fire(&a).unwrap();
+        cp.player_fire(&b).unwrap();
+        cp.tables_for_tests().clocks.advance(128);
+        cp.player_fire(&a).unwrap();
+
+        let cb = cp.player_clock_for(&b).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(cb), "b untouched by a's retrigger");
+        let slot_a = tables.slots[&TrackId::from(a.as_str())];
+        assert_eq!(
+            tables.clocks.playhead(slot_a, 0, false).pos,
+            0,
+            "a's second press rewound ITS OWN playhead back to 0"
+        );
+        let slot_b = tables.slots[&TrackId::from(b.as_str())];
+        assert_eq!(
+            tables.clocks.playhead(slot_b, 0, false).pos,
+            128,
+            "b kept playing from where it was — a's press did not rewind it"
+        );
+    }
+
+    /// §10, and the reason this moved off `effect.rebuild`: a fader drag on
+    /// a pad is an atomic write into the live table, not a graph rebuild.
+    /// The Track arm has always worked this way; a player owns a mixer slot
+    /// now, so it can too.
+    #[test]
+    fn a_players_gain_and_pan_are_param_writes_not_rebuilds() {
+        use crate::audio::mixer::db_to_linear;
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", false); // NOT raw: the strip applies
+
+        let committed = cp
+            .commit(op::TxMeta::user("fader"), |tx| {
+                tx.apply(Op::Set {
+                    object: ObjectRef::Player(PlayerId::from(id.as_str())),
+                    path: PropPath::Gain,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(-6.0),
+                })
+            })
+            .unwrap();
+        assert!(!committed.effect.rebuild, "a fader drag must not rebuild the graph");
+
+        let tables = cp.tables_for_tests();
+        let slot = tables.slots[&TrackId::from(id.as_str())];
+        let got = f32::from_bits(tables.params.gain[slot].load(Relaxed));
+        assert!(
+            (got - db_to_linear(-6.0)).abs() < 1e-4,
+            "the write reached the live table (got {got})"
+        );
+    }
+
+    /// V-6, at the commit layer. A raw player's strip fields are inert: the
+    /// compiled node is unity/centre/unmuted whatever the document holds, so
+    /// writing them into the table would make the fader take effect on a
+    /// strip the compiler says is at unity — V-16's bit-exact pad, broken
+    /// until some unrelated edit rebuilt the graph.
+    #[test]
+    fn a_raw_players_fader_is_document_only_and_never_reaches_the_table() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true); // raw
+
+        let committed = cp
+            .commit(op::TxMeta::user("fader"), |tx| {
+                tx.apply(Op::Set {
+                    object: ObjectRef::Player(PlayerId::from(id.as_str())),
+                    path: PropPath::Gain,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(-6.0),
+                })
+            })
+            .unwrap();
+        assert!(committed.effect.param_writes.is_empty(), "raw: nothing to write");
+        assert!(!committed.effect.rebuild);
+        assert_eq!(
+            cp.session.lock().store.players[0].node.gain_db, -6.0,
+            "but the document keeps it, so unticking `raw` restores what the user had"
+        );
+
+        let tables = cp.tables_for_tests();
+        let slot = tables.slots[&TrackId::from(id.as_str())];
+        let got = f32::from_bits(tables.params.gain[slot].load(Relaxed));
+        assert!((got - 1.0).abs() < 1e-6, "still unity (got {got})");
+    }
+
+    /// `Raw` and `PlayerSource` change what the graph COMPILES — the clips,
+    /// the inserts, the sends — so they are the two that still rebuild.
+    #[test]
+    fn raw_and_source_still_rebuild_because_they_change_what_compiles() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", false);
+        for (path, to) in [
+            (PropPath::Raw, serde_json::json!(true)),
+            (
+                PropPath::PlayerSource,
+                serde_json::json!({ "kind": "none" }),
+            ),
+        ] {
+            let committed = cp
+                .commit(op::TxMeta::user("structural"), |tx| {
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Player(PlayerId::from(id.as_str())),
+                        path,
+                        from: serde_json::Value::Null,
+                        to: to.clone(),
+                    })
+                })
+                .unwrap();
+            assert!(committed.effect.rebuild, "{path:?} changes what the graph compiles");
+        }
+    }
+
+    /// A pad is a document object (V-1): adding one is undoable and durable,
+    /// exactly like adding a track.
+    #[test]
+    fn add_player_is_undoable_and_persists_the_project() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let committed = cp
+            .commit(op::TxMeta::user("add player"), |tx| {
+                tx.apply(Op::PlayerAdd {
+                    player: crate::audio::player::Player::new(PlayerId::from("p1"), "PAD"),
+                    index: 0,
+                })
+            })
+            .unwrap();
+        assert!(committed.effect.persist.project, "a pad lives in project.json");
+        assert_eq!(cp.players().len(), 1);
+        cp.undo().unwrap();
+        assert!(cp.players().is_empty(), "one Ctrl+Z removes the pad");
     }
 
     // ---- lanes UX: arrange_lanes ----------------------------------------
@@ -6106,6 +7119,10 @@ mod tests {
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
             send_slots: Default::default(),
             generation: 1,
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
+            player_clocks: Default::default(),
+            orphan_clock: None,
             params: gen1_params.clone(),
             slots: gen1_slots,
         }));
@@ -6146,6 +7163,10 @@ mod tests {
             GraphTables {
                 generation: 2,
                 params: gen2_params.clone(),
+                clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+                scene_clocks: Default::default(),
+                player_clocks: Default::default(),
+                orphan_clock: None,
                 slots: gen2_slots,
                 send_slots: Default::default(),
             };

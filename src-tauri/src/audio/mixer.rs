@@ -19,10 +19,8 @@ use std::sync::atomic::Ordering::Relaxed;
 use super::dsp::ProcessBlock;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::midi_in::{LiveMidiEvent, EV_ALL_OFF, EV_NOTE_ON};
-use super::rt::{
-    LaunchPlayhead, RtClip, RtGraph, RtSend, RtTrack, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO,
-    MAX_LIVE_BLOCK,
-};
+use super::clock::{ClockTable, TRANSPORT_CLOCK};
+use super::rt::{RtClip, RtGraph, RtSend, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
 use crate::midi::synth::BlockNoteEvent;
 use crate::plugins::automation::{value_at, AbsParamEvent, RampCursor};
@@ -71,18 +69,22 @@ pub fn balance_gains(pan: f32) -> (f32, f32) {
 
 /// Solo/mute resolution: when any track is soloed only soloed tracks sound;
 /// mute always silences its own track (mute wins over its own solo, and
-/// over a live launch target — an explicitly muted track stays silent even
-/// while it drives a launched scene). `launch` only bypasses another
-/// track's solo, so a launched scene stays audible while auditioning
-/// across a solo elsewhere.
+/// over a node on its own clock — an explicitly muted track stays silent
+/// even while it drives a launched scene). `own_clock` only bypasses
+/// another track's solo, so a launched scene stays audible while
+/// auditioning across a solo elsewhere.
 #[inline]
 pub fn audible(muted: bool, soloed: bool, any_solo: bool) -> bool {
     audible_with_launch(muted, soloed, any_solo, false)
 }
 
+/// `own_clock` = "this node reads a clock of its own, not the transport"
+/// (Plan V — V2). Same predicate the deleted `FLAG_LAUNCH` bit carried,
+/// stated in the vocabulary that now owns it: a pad that goes silent
+/// because someone soloed a vocal is the deck cutting out mid-performance.
 #[inline]
-pub fn audible_with_launch(muted: bool, soloed: bool, any_solo: bool, launch: bool) -> bool {
-    !muted && (launch || !any_solo || soloed)
+pub fn audible_with_launch(muted: bool, soloed: bool, any_solo: bool, own_clock: bool) -> bool {
+    !muted && (own_clock || !any_solo || soloed)
 }
 
 /// Sample a clip at absolute timeline position `pos` (engine samples).
@@ -367,30 +369,69 @@ fn prime_live(tr: &RtTrack, discontinuity: bool, live_in_events: &[LiveMidiEvent
     }
 }
 
+/// What one run of the strip is, for the live node that renders into it. A
+/// callback block is split into runs by the loop wrap and by
+/// `MAX_LIVE_BLOCK`, so `pos`, `run` and `discontinuity` all vary WITHIN a
+/// block; `flushing` is a property of the row and does not.
+#[derive(Clone, Copy)]
+struct LiveRun {
+    /// Absolute engine position of the run's first frame.
+    pos: u64,
+    /// Frames in the run.
+    run: usize,
+    /// The playhead jumped into `pos` (seek, loop wrap, launch).
+    discontinuity: bool,
+    /// The row is draining its tail after its clock stopped, so it has
+    /// stopped being FED — see below.
+    flushing: bool,
+}
+
 /// ADD one run of the track's live instrument into `buf` (already holding
 /// the clip sum). No gain/pan — the shared fader runs after inserts.
+///
+/// `flushing` splits the two halves of this function, and they answer to
+/// different rules. A flushing row has stopped being FED but has not stopped
+/// SOUNDING (V-17 (b)), so:
+///
+/// * The event queue is FEEDING, exactly as the clip read is, and is skipped.
+///   A flushing row's `pos` is frozen, so an event inside `[pos, pos + run)`
+///   would be re-queued once per flush block — a MIDI pad whose clock stops
+///   with a note-on at the frozen position would re-trigger that note
+///   `ceil(tail_frames / block)` times. That is the same shape as fix round
+///   1's re-read clip fragment, through the other source.
+/// * `node.process` is NOT skipped: the node's own pipeline is part of what
+///   the flush window exists to drain. Skipping it wholesale would truncate a
+///   synth's release and replay it at the next press's onset — the very
+///   defect the window was added to fix.
+///
+/// `set_block_context` still runs, and it gets the FROZEN `pos`, because that
+/// is where the row's playhead honestly is: it is the automation seam's
+/// "absolute base position of this run", and an off clock does not advance.
+/// Feeding it a fabricated advancing position would walk the node's ramp
+/// cursors across material nobody is playing.
 fn render_live_into(
     tr: &RtTrack,
     buf: &mut [f32],
-    pos: u64,
-    run: usize,
+    r: LiveRun,
     sample_rate: u32,
-    discontinuity: bool,
     steady_base: Option<u64>,
 ) {
     let Some(live) = &tr.live else { return };
     // SAFETY: RCU discipline — exactly one graph snapshot is rendered at a
     // time, on this (the only RT) thread; see `LiveNodeCell`.
     let node = unsafe { live.node.rt_mut() };
-    let end = pos + run as u64;
-    let evs = &live.events[..];
-    let lo = evs.partition_point(|e| e.sample < pos);
-    for e in evs[lo..].iter().take_while(|e| e.sample < end) {
-        node.queue_event(BlockNoteEvent {
-            offset: (e.sample - pos) as u32,
-            key: e.key,
-            velocity: e.velocity,
-        });
+    let LiveRun { pos, run, discontinuity, flushing } = r;
+    if !flushing {
+        let end = pos + run as u64;
+        let evs = &live.events[..];
+        let lo = evs.partition_point(|e| e.sample < pos);
+        for e in evs[lo..].iter().take_while(|e| e.sample < end) {
+            node.queue_event(BlockNoteEvent {
+                offset: (e.sample - pos) as u32,
+                key: e.key,
+                velocity: e.velocity,
+            });
+        }
     }
     // Automation seam (ARCHITECTURE §15.1): the run's absolute base
     // position + discontinuity reach the node BEFORE it processes, so
@@ -429,31 +470,111 @@ fn process_inserts(
     }
 }
 
-/// Where this track's playhead is for THIS block, and whether that position
-/// is a discontinuity. Factored out (Plan G2) because the windowed render
-/// needs the answer twice: once in the prologue, to decide whether the live
-/// node owes an `all_notes_off` before the block's first run, and again per
-/// window, to place the runs. A launched track renders at the drive-clip
-/// shadow playhead with no loop; a launch that just ended is itself a
-/// discontinuity back to the arrangement playhead.
+/// Where this node's playhead is for THIS block, whether that position is a
+/// discontinuity, and whether the node renders at all.
+///
+/// Returns `(pos, loop_spec, discontinuity, audible, own_clock,
+/// exclusive_idle)`. `exclusive_idle` is "nothing is FEEDING this node this
+/// block" — true only in the exclusive-and-off case below, which is a player
+/// whose pad is not being pressed. It is not yet "produces nothing": a row
+/// stops being fed the moment its clock does, while whatever is still inside
+/// its chain and its delay lines has to come out. So the strip stops the
+/// CLIP READ on it immediately and skips the row outright only once its tail
+/// is out; see the early-out in `render_impl`, and fix round 1 finding 1 for
+/// the three things that cost. `own_clock` is "this node reads a clock of its
+/// own" — the predicate that
+/// bypasses another track's solo, and exactly `clock_of(slot) !=
+/// TRANSPORT_CLOCK` (a slot can never hold an out-of-range clock index:
+/// `bind_slot` refuses one). Returned rather than re-derived so the strip
+/// does not pay a second indexed load for something this call already knows.
+///
+/// Factored out (Plan
+/// G2) because the windowed render needs the answer twice: once in the
+/// prologue, to decide whether the live node owes an `all_notes_off` before
+/// the block's first run, and again per window, to place the runs. Calling
+/// it twice is safe because `ClockTable::begin_block` latched this block's
+/// discontinuity once, up front — `playhead` only ever reads that latch.
+///
+/// Costs one indexed atomic load more than the `FLAG_LAUNCH` test it
+/// replaces: the flag test became a clock lookup.
+///
+/// THREE cases, and the third is the one that keeps this swap
+/// behaviour-neutral:
+///
+/// * The **transport clock** — the arrangement's `LoopSpec` applies, and the
+///   clock's `on` flag IS the transport's play state (V-13). "Only launched
+///   nodes render while stopped" (`LaunchPlayhead::exclusive`) is now a
+///   consequence of that flag, not a special case.
+/// * A **running clock of its own** — its loop is the start/end pair the
+///   fire recorded and `ClockTable::advance` wraps it, so the arrangement's
+///   `LoopSpec` does not apply at all. That is exactly the `&LoopSpec::OFF`
+///   the overlay handed a launched track.
+/// * A **stopped clock of its own** — the node REJOINS THE ARRANGEMENT until
+///   the control plane releases its slot. This is the old `ended` frame
+///   (`track_playhead` returned `(base_pos, lp, true)`), and it is load
+///   bearing at both ends of a launch: `ControlPlane::fire_scene` binds the
+///   slots and then fires, and the release
+///   (`GraphTables::release_finished_scenes`, on the drive thread's poll)
+///   runs after the clip ends AND after the flush block, so without this
+///   case a launched track would drop out for a block at the press and go
+///   silent for at least a poll at the end instead of returning to the
+///   song. The discontinuity that comes with it is `ClockTable::stop`'s /
+///   `advance`'s parting flush — the `all_notes_off` `launch_ended` bought —
+///   OR'd with the TRANSPORT's, because this node is reading the transport's
+///   position now: a seek or a Play edge in the same block is a jump for it
+///   just as it is for every other arrangement node, and dropping it would
+///   hang a held note until something else happened to jump.
 #[inline]
-fn track_playhead(
-    flags: u32,
-    launch: Option<LaunchPlayhead>,
+fn node_playhead(
+    clocks: &ClockTable,
+    slot: usize,
     base_pos: u64,
     lp: &LoopSpec,
     discontinuity: bool,
-) -> (u64, &LoopSpec, bool) {
-    let flagged = flags & FLAG_LAUNCH != 0;
-    if flagged {
-        if let Some(ov) = launch {
-            if !ov.ended {
-                return (ov.pos, &LoopSpec::OFF, ov.discontinuity);
-            }
-            return (base_pos, lp, true);
-        }
+) -> (u64, LoopSpec, bool, bool, bool, bool) {
+    let ph = clocks.playhead(slot, base_pos, discontinuity);
+    if ph.is_transport {
+        return (ph.pos, *lp, ph.discontinuity, ph.on, false, false);
     }
-    (base_pos, lp, discontinuity)
+    if ph.on {
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true, true, false);
+    }
+    if ph.exclusive {
+        // Plan V — V-2: a PLAYER's slot has no arrangement to rejoin. Its row
+        // carries one clip at position 0 (the ephemeral placement), so the
+        // fallback below would sound the pad's sample at bar 1 of the song
+        // for as long as the transport rolled past it. `on = false` renders
+        // it silent instead — but the discontinuity is still delivered, so a
+        // player's live node (V3's MIDI sources) gets the `all_notes_off` its
+        // clip's end owes it.
+        //
+        // The last element says the strip may skip this row ENTIRELY, and
+        // `on = false` alone was not enough (fix round 1, finding 1): `on` is
+        // consumed inside `apply_fader_into`, which zeroes only AFTER the
+        // clip read, the inserts and the pre-fader taps have already run. An
+        // off clock never advances, so an unpressed pad sat at `pos = 0` and
+        // re-read the first `frames` of its own clip every block, forever —
+        // feeding its inserts and leaking into its pre-fader buses.
+        //
+        // The transport's `discontinuity` is OR'd in, which strictly speaking
+        // is a flush an idle pad does not owe: it reads its own position, so
+        // a seek is not a jump for it. Harmless while player rows carry no
+        // live node, and deliberately left that way — TASK 10 makes it live
+        // work, and the choice then is between one spurious `all_notes_off`
+        // on a silent pad (this) and inventing a second discontinuity
+        // channel. A sounding pad is unaffected either way: it takes the
+        // `ph.on` branch above, which does NOT OR the transport's in, so a
+        // seek can never cut a pad mid-press.
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity || discontinuity, false, true, true);
+    }
+    (
+        base_pos,
+        *lp,
+        ph.discontinuity || discontinuity,
+        clocks.transport_on(),
+        true,
+        false,
+    )
 }
 
 fn live_all_notes_off(tr: &RtTrack) {
@@ -513,7 +634,6 @@ pub fn render(
         discontinuity,
         None,
         None,
-        None,
         meter_tx,
     )
 }
@@ -548,7 +668,6 @@ pub fn render_rt(
         discontinuity,
         Some(steady_base),
         None,
-        None,
         meter_tx,
     )
 }
@@ -568,23 +687,6 @@ pub fn render_rt_with_input(
     live_in: Option<LiveInBlock<'_>>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
-    render_rt_launch(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, steady_base, live_in, None, meter_tx)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn render_rt_launch(
-    graph: &mut RtGraph,
-    base_pos: u64,
-    lp: &LoopSpec,
-    out: &mut [f32],
-    out_ch: usize,
-    sample_rate: u32,
-    discontinuity: bool,
-    steady_base: u64,
-    live_in: Option<LiveInBlock<'_>>,
-    launch: Option<LaunchPlayhead>,
-    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
-) -> u32 {
     render_impl(
         graph,
         base_pos,
@@ -595,7 +697,6 @@ pub fn render_rt_launch(
         discontinuity,
         Some(steady_base),
         live_in,
-        launch,
         meter_tx,
     )
 }
@@ -611,7 +712,6 @@ fn render_impl(
     discontinuity: bool,
     steady_base: Option<u64>,
     live_in: Option<LiveInBlock<'_>>,
-    launch: Option<LaunchPlayhead>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
     let out_ch = out_ch.max(1);
@@ -624,6 +724,20 @@ fn render_impl(
     // the function. This is also how the O-13 alias window stays dead: a
     // retired graph always renders against the table it was built with.
     let params = graph.params.clone();
+    // Plan V — V2: this graph's playheads, taken the same way and for the
+    // same borrow-check reason as `params`.
+    let clocks = graph.clocks.clone();
+    // The rate the graph was BUILT at — not this call's `sample_rate`. The
+    // `debug_assert` below re-derives every row's tail, and the allowance in
+    // it is rate-dependent; checking a row built at one rate against another
+    // would fire on the RT thread for a graph that is perfectly correct. One
+    // source of truth, and it travels with the graph.
+    let graph_rate = graph.rate;
+    // ONCE per block, before any `playhead()` call: latch every clock's
+    // pending discontinuity. A scene clock is bound to MANY slots, and a
+    // per-reader consume would hand the jump to whichever track read first
+    // and hang a note on all the others — see `ClockTable::begin_block`.
+    clocks.begin_block();
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
@@ -658,13 +772,21 @@ fn render_impl(
     // queues THIS BLOCK's hardware MIDI-in events into the node and may fire
     // `all_notes_off`. Left inside the window loop it would deliver every
     // live-in event once per window.
+    //
+    // It is also the ONE deliberate exception to "an idle pad is fed
+    // nothing", and the reason the row loop's early-out sits inside that loop
+    // rather than up here: both things `prime_live` delivers must reach a row
+    // the strip loop skips — hardware MIDI-in, which is how a pad's
+    // instrument is PLAYED from a keyboard with no clock running at all, and
+    // the `all_notes_off` a cut pad's discontinuity owes its node, which is
+    // precisely what a row that has just stopped no longer runs to collect.
     for tr in tracks.iter_mut() {
         tr.win = super::rt::TrackWindow::default();
         if tr.slot >= n_slots {
             continue;
         }
-        let flags = params.flags[tr.slot].load(Relaxed);
-        let (_, _, track_disc) = track_playhead(flags, launch, base_pos, lp, discontinuity);
+        let (_, _, track_disc, _, _, _) =
+            node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
         tr.win.disc = track_disc;
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
         prime_live(tr, track_disc, live_in_events);
@@ -702,23 +824,112 @@ fn render_impl(
             if tr.slot >= n_slots {
                 continue;
             }
+            // `RtGraph::with_buses`'s funnel holds only if nothing adds a
+            // line to a row AFTER the graph is built. Production never
+            // does; test rigs do (assigning `pdc` or pushing an insert onto
+            // an already-built graph), and such a row would silently keep
+            // `tail_frames = 0` — a flush window of nothing, which is the
+            // very defect fix round 3 closed. Debug-only, and an internal
+            // invariant rather than data arriving from outside.
+            debug_assert_eq!(
+                tr.tail_frames,
+                tr.computed_tail_frames(graph_rate),
+                "row {} carries lines its tail_frames does not know about — \
+                 call RtTrack::recompute_tail_frames after changing them",
+                tr.slot
+            );
+            let (track_base, track_lp, _, clock_on, own_clock, exclusive_idle) =
+                node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
+            // Plan V — V-2, the cost half (fix round 1, finding 1). An
+            // exclusive-and-off slot is a pad nobody is pressing, and it can
+            // produce nothing BY CONSTRUCTION — not "produces something the
+            // fader will zero". Everything below it is therefore waste, and
+            // three kinds of waste at that: the per-sample clip read (an off
+            // clock never advances, so the row re-read the first `frames` of
+            // its own sample every block, forever), the insert chain (fed
+            // that repeating fragment continuously, so a pad with a reverb
+            // fired from polluted state), and the PRE-fader taps, which are
+            // deliberately NOT gated by `on` — that gate is for a muted
+            // track, whose reverb send should keep ringing, and it made an
+            // idle pad leak its own first 10 ms into its bus on every block.
+            // That last one is "every pad sounds at bar 1" reached through
+            // the send path instead of the master path.
+            //
+            // Skipping is safe HERE and only here. `prime_live` above already
+            // ran, so a cut pad's `all_notes_off` is delivered whatever this
+            // branch does (that is why the early-out is not hoisted into the
+            // prologue), and `acc` would stay zero, so `tr.win.pk_*.max(0)`
+            // and `+= 0` leave the meters exactly where rendering-then-zeroing
+            // left them.
+            //
+            // The rule, and it is ONE rule rather than a list of hazards:
+            // NOTHING on this row is skipped until the row's whole tail has
+            // left it. A pad that has stopped being TRIGGERED is still
+            // SOUNDING for `tail_frames` — its insert chain's pipeline, its
+            // source-alignment line, its `out_pdc`, its send edges' delays.
+            // None of those has a reset and none of them advances by itself,
+            // so a row skipped while it still holds material both TRUNCATES
+            // that material and replays it at the onset of the next press.
+            // Enumerating the lines by name is how that defect got in twice:
+            // the guard named `out_pdc` and the send edges, and missed a
+            // plugin's own latency, which is the case that swallows a whole
+            // press (a 2048-sample linear-phase EQ over an 800-sample
+            // one-shot: the clock is off from block 2 with every real sample
+            // still inside the plugin).
+            //
+            // So while `flush_left` is non-zero the ORDINARY strip runs, with
+            // two differences below, and the first of them is one rule rather
+            // than one line: the row stops being FED. An off clock does not
+            // advance, so every SOURCE reading the frozen position would
+            // repeat itself once per flush block — the clip read re-reading
+            // the same fragment (fix round 1's defect), and
+            // `render_live_into` re-queueing every scheduled event inside the
+            // frozen window (see there). What the row already HOLDS is not a
+            // source and keeps running: the insert chain, the delay lines,
+            // and the live node's own `process`. The second difference is
+            // that the fader's gate is the tail rather than the clock. Mute
+            // and solo still apply; a muted pad's tail stays muted.
+            //
+            // Only when the tail is out does the row take the BARE skip —
+            // which is what every raw pad takes on every block (V-6 leaves it
+            // no inserts, no sends and no `out_pdc`, so `tail_frames` is 0),
+            // and what the measured 1.98 µs idle case is.
+            //
+            // Consequence, stated rather than fixed: an insert with an
+            // UNBOUNDED tail — a reverb on a pad — is hard-cut when
+            // `flush_left` reaches 0. That is exactly what a transport stop
+            // already does to a track's inserts, and "when does a pad stop
+            // ringing" is a separate question this does not answer.
+            if clock_on {
+                tr.flush_left = tr.tail_frames;
+            }
+            if exclusive_idle && tr.flush_left == 0 {
+                continue;
+            }
+            let flushing = exclusive_idle;
             let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
             let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
             let flags = params.flags[tr.slot].load(Relaxed);
-            let flagged = flags & FLAG_LAUNCH != 0;
-            let exclusive = launch.as_ref().is_some_and(|ov| ov.exclusive && !ov.ended);
-            let on = if exclusive && !flagged {
-                false
-            } else {
-                audible_with_launch(
+            // Two gates, and they used to be three. `clock_on` false is a
+            // stopped transport (the old `exclusive`) or a clock that is not
+            // running; `own_clock` is what bypasses another track's solo
+            // (the old `FLAG_LAUNCH`). Both are now read off the same
+            // binding, so they cannot disagree.
+            //
+            // The second disjunct is the flush window, and it is qualified by
+            // `flushing` for a reason: an ordinary track on a STOPPED
+            // transport also has `clock_on` false, but nothing stops feeding
+            // it — its clip read still runs, at a frozen `base_pos`. Opening
+            // its fader for `tail_frames` after a stop would hold whatever
+            // sits under the playhead. A stop is a stop; only a pad whose
+            // trigger has ended is flushing.
+            let on = (clock_on || (flushing && tr.flush_left > 0))
+                && audible_with_launch(
                     flags & FLAG_MUTE != 0,
                     flags & FLAG_SOLO != 0,
                     any_solo,
-                    flagged,
-                )
-            };
-            let (track_base, track_lp, _) =
-                track_playhead(flags, launch, base_pos, lp, discontinuity);
+                    own_clock,
+                );
             let (gl_atomic, gr_atomic) = pan_gains(pan);
             let mut acc = TrackAccum::default();
 
@@ -740,8 +951,8 @@ fn render_impl(
                 ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
                 pan,
                 (gl_atomic, gr_atomic),
-                frame_pos(track_base, 0, track_lp).saturating_sub(pdc_delay),
-                frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp)
+                frame_pos(track_base, 0, &track_lp).saturating_sub(pdc_delay),
+                frame_pos(track_base, frames.saturating_sub(1) as u64, &track_lp)
                     .saturating_sub(pdc_delay),
                 pan_gains,
             );
@@ -752,7 +963,7 @@ fn render_impl(
             // LoopSpec); so is the window edge.
             let mut f = w0;
             while f < w_end {
-                let pos = frame_pos(track_base, f as u64, track_lp);
+                let pos = frame_pos(track_base, f as u64, &track_lp);
                 let mut run = (w_end - f).min(MAX_LIVE_BLOCK);
                 let mut wraps = false;
                 if track_lp.active() && pos < track_lp.end {
@@ -768,9 +979,9 @@ fn render_impl(
                 let run_disc = tr.win.disc;
                 let buf = &mut track_buf[..run * 2];
                 buf.fill(0.0);
-                if !tr.clips.is_empty() {
+                if !tr.clips.is_empty() && !flushing {
                     for i in 0..run {
-                        let p = frame_pos(track_base, (f + i) as u64, track_lp);
+                        let p = frame_pos(track_base, (f + i) as u64, &track_lp);
                         let mut l = 0.0f32;
                         let mut r = 0.0f32;
                         for clip in &tr.clips {
@@ -782,7 +993,8 @@ fn render_impl(
                         buf[i * 2 + 1] = r;
                     }
                 }
-                render_live_into(tr, buf, pos, run, sample_rate, run_disc, steady_base);
+                let live_run = LiveRun { pos, run, discontinuity: run_disc, flushing };
+                render_live_into(tr, buf, live_run, sample_rate, steady_base);
                 process_inserts(tr, buf, sample_rate, steady_base);
                 // PRE-fader taps leave here: post-insert, source-aligned by
                 // `RtTrack::pdc`, before the fader and before `out_pdc`.
@@ -813,6 +1025,9 @@ fn render_impl(
                 }
                 tr.win.disc = wraps;
                 f += run;
+            }
+            if flushing {
+                tr.flush_left = tr.flush_left.saturating_sub(w_len);
             }
 
             tr.win.pk_l = tr.win.pk_l.max(acc.pk_l);
@@ -998,6 +1213,7 @@ pub fn render_live_input_only(
     let frames = out.len() / out_ch;
     out.fill(0.0);
     let params = graph.params.clone();
+    let clocks = graph.clocks.clone();
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
@@ -1023,7 +1239,7 @@ pub fn render_live_input_only(
             flags & FLAG_MUTE != 0,
             flags & FLAG_SOLO != 0,
             any_solo,
-            flags & FLAG_LAUNCH != 0,
+            clocks.clock_of(tr.slot) != TRANSPORT_CLOCK,
         );
         let (gl_atomic, gr_atomic) = pan_gains(pan);
         let mut acc = TrackAccum::default();
@@ -1197,74 +1413,106 @@ mod tests {
         );
     }
 
+    /// The clock table this graph would get for a launch: `n` slots, the
+    /// transport plus one scene clock, transport play state as given.
+    fn scene_clocks(g: &RtGraph, playing: bool) -> ClockTable {
+        let c = ClockTable::with_slots_and_clocks(g.params.len(), 2);
+        c.set_transport_playing(playing);
+        c
+    }
+
+    /// The claim the overlay test made, now made of clocks: a node bound to
+    /// a running non-transport clock renders at THAT clock's position, not
+    /// the arrangement's.
     #[test]
-    fn launch_overlay_plays_the_scene_not_the_arrangement_playhead() {
+    fn a_node_on_a_scene_clock_plays_the_scene_not_the_arrangement_playhead() {
         let mut g = one_track_graph(0, clip(100, 0, 4, vec![1.0; 4], 1));
-        g.params.set_flag(0, FLAG_LAUNCH, true);
         g.params.set_pan(0, -1.0);
         let mut silent = vec![0.0f32; 8];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut silent, 2);
         assert!(
             silent.iter().all(|s| *s == 0.0),
-            "without overlay the clip is off the arrangement playhead"
+            "on the transport clock the clip is off the arrangement playhead"
         );
+
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 100, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
         let mut out = vec![0.0f32; 8];
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false, ended: false }),
-            None,
-        );
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!(
             (out[0] - 1.0).abs() < 1e-5,
-            "overlay hears the scene at its own position"
+            "the scene sounds at its own clock's position, got {}",
+            out[0]
         );
     }
 
+    /// V-13: with the transport stopped, a transport-clock node renders
+    /// nothing while a fired clock still sounds. This is what
+    /// `LaunchPlayhead::exclusive` used to say, and it is now a consequence
+    /// of clock 0's `on` flag rather than a separate concept.
     #[test]
-    fn exclusive_overlay_silences_tracks_without_the_launch_flag() {
+    fn a_stopped_transport_silences_arrangement_nodes_but_not_a_fired_one() {
         let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
         g.params.set_pan(0, -1.0);
+
+        g.clocks = Arc::new(scene_clocks(&g, false));
         let mut out = vec![0.0f32; 8];
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true, ended: false }),
-            None,
-        );
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!(
             out.iter().all(|s| *s == 0.0),
-            "parked arrangement must stay silent during stopped preview"
+            "parked arrangement must stay silent while the transport is stopped"
         );
-        g.params.set_flag(0, FLAG_LAUNCH, true);
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true, ended: false }),
-            None,
+
+        let clocks = scene_clocks(&g, false);
+        clocks.fire(1, 0, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!(
+            (out[0] - 1.0).abs() < 1e-5,
+            "only the fired node contributes, got {}",
+            out[0]
         );
-        assert!((out[0] - 1.0).abs() < 1e-5, "launched track still plays");
+    }
+
+    /// The other half of `LaunchPlayhead::ended`: a scene that stops does
+    /// not silence its tracks — they rejoin the ARRANGEMENT until the
+    /// control plane releases their slots a poll later, and they get one
+    /// discontinuity on the way so a held note is released.
+    #[test]
+    fn a_stopped_scene_clock_returns_its_nodes_to_the_arrangement() {
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        g.params.set_pan(0, -1.0);
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 500, 10_000, false); // far from the clip
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!(out.iter().all(|s| *s == 0.0), "the scene is past the clip");
+
+        g.clocks.stop(1); // Escape, or the clip reaching its end
+
+        // The flush frame `launch_ended` used to carry: `begin_block`
+        // latches the stop's discontinuity and every node still bound to the
+        // clock reads it, which is what makes the live node all-notes-off in
+        // `render_impl`'s prologue instead of hanging the cut voice.
+        g.clocks.begin_block();
+        let (pos, _, disc, on, own, _) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
+        assert!(own, "still bound to the scene clock, so still past a solo");
+        assert_eq!(pos, 0, "back on the arrangement playhead");
+        assert!(on, "and audible: the transport is still running");
+        assert!(disc, "the return is a discontinuity");
+
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!(
+            (out[0] - 1.0).abs() < 1e-5,
+            "and it is the arrangement that sounds, got {}",
+            out[0]
+        );
     }
 
     // ---- clip sampling ----
@@ -1345,6 +1593,11 @@ mod tests {
             latency,
             proc: InsertNodeCell::new(node),
         });
+        // This helper adds a line to a row that is already built, which
+        // production never does — `RtGraph::with_buses` is the funnel. The
+        // row's flush window has to follow, or `render_impl`'s
+        // `debug_assert` catches the rig rather than the code.
+        tr.recompute_tail_frames(48_000);
     }
 
     #[test]
@@ -1420,6 +1673,9 @@ mod tests {
         insert_on(&mut g, 0, Box::new(dummy), false);
         g.tracks[0].pdc = None; // wet path: plugin supplies the 256
         g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        for tr in g.tracks.iter_mut() {
+            tr.recompute_tail_frames(48_000);
+        }
         let mut out = vec![0.0f32; 512 * 2];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();
@@ -1455,6 +1711,9 @@ mod tests {
         // (A's plugin does not delay; A's DelayLine does).
         g.tracks[0].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
         g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        for tr in g.tracks.iter_mut() {
+            tr.recompute_tail_frames(48_000);
+        }
         let mut out = vec![0.0f32; 512 * 2];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();
@@ -1474,7 +1733,7 @@ mod tests {
     /// reads back as unity — which would make every amount assertion below
     /// pass for the wrong reason.
     fn graph_with_bus(tracks: Vec<RtTrack>, buses: Vec<RtBus>) -> RtGraph {
-        RtGraph::with_buses(tracks, buses, 1, Arc::new(ParamTable::with_slots_and_sends(64, 1)))
+        RtGraph::with_buses(tracks, buses, 1, Arc::new(ParamTable::with_slots_and_sends(64, 1)), 48_000)
     }
 
     fn empty_bus(slot: usize) -> RtBus {
@@ -1895,29 +2154,321 @@ mod tests {
         );
     }
 
+    /// Finding 3: a node that has rejoined the arrangement is reading the
+    /// TRANSPORT's position, so the transport's own jumps are its jumps. A
+    /// seek in the same block as the scene's death used to be swallowed —
+    /// `node_playhead` returned the clock's discontinuity alone — and the
+    /// note held across the seek hung until something else happened to jump.
     #[test]
-    fn launch_overlay_still_plays_the_scene_through_inserts() {
+    fn a_rejoined_node_still_hears_the_transports_own_discontinuity() {
+        let g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 500, 10_000, false);
+        clocks.bind_slot(0, 1);
+        clocks.stop(1);
+        clocks.begin_block(); // consumes the stop's own flush
+        assert!(node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false).2, "the flush");
+
+        clocks.begin_block(); // a later block: nothing pending on the clock
+        let (_, _, disc, _, _, _) = node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false);
+        assert!(!disc, "nothing jumped");
+        let (_, _, disc, _, _, _) = node_playhead(&clocks, 0, 7_000, &LoopSpec::OFF, true);
+        assert!(disc, "but the transport's seek is this node's seek too");
+    }
+
+    /// Task 10, fix round 2. A cut pad's stranded voices must not land on
+    /// the NEXT press.
+    ///
+    /// TWO PRESSES, because one cannot see it: whatever is stranded in the
+    /// node stays stranded for the rest of that press and only surfaces at
+    /// the next onset — the same lesson fix round 4 paid for.
+    ///
+    /// What was measured before the allowance existed: `all_notes_off` only
+    /// MARKS a voice released (`midi/synth.rs`, and the same for the sampler
+    /// and both plugin hosts — the trait contract at `dsp.rs` says "release,
+    /// not hard kill"); the ramp to zero runs inside `process`. A bare pad's
+    /// `tail_frames` was 0, so the row took the bare skip and its node was
+    /// never processed again — leaving a voice stranded at FULL SUSTAIN
+    /// amplitude, which then resumed on top of the next press's onset. Press
+    /// 2 began at 0.1096 instead of 0.0 (a step discontinuity at sample 0 —
+    /// a click) and peaked at 0.208 against press 1's 0.106.
+    #[test]
+    fn a_cut_pads_frozen_release_does_not_land_on_the_next_press() {
+        use super::super::dsp::AudioProcessor;
+        use super::super::rt::{LiveNodeCell, LiveSource, MAX_LIVE_BLOCK};
+        use crate::midi::schedule::AbsNoteEvent;
+        use crate::midi::synth::PolySynth;
+
+        const FRAMES: usize = 128;
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut synth = PolySynth::new();
+        synth.prepare(48_000, MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(0, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth)),
+            // Held past the pad's end, so the cut lands mid-note.
+            events: Arc::new(vec![AbsNoteEvent { sample: 0, key: 69, velocity: 100, channel: 0 }]),
+        });
+        let mut g = RtGraph::new(vec![pad], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let peak = |b: &[f32]| b.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let mut out = vec![0.0f32; FRAMES * 2];
+
+        // PRESS 1 — one block long, so the clock ends under a held note.
+        g.clocks.fire(1, 0, FRAMES as u64, false);
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        let first_press = out.clone();
+        assert!(peak(&first_press) > 0.0, "the press has to sound at all");
+        assert_eq!(first_press[0], 0.0, "a clean onset attacks from silence");
+        g.clocks.advance(FRAMES as u64);
+
+        // The pad is cut. `prime_live` all-notes-offs the node; the flush
+        // window is what lets the node RENDER that release instead of
+        // freezing mid-note. 40 blocks is 5120 frames — past both the
+        // allowance and PolySynth's own 80 ms ramp.
+        for _ in 0..40 {
+            out.fill(0.0);
+            render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            g.clocks.advance(FRAMES as u64);
+        }
+
+        // PRESS 2 — identical clock, identical events, from zero.
+        g.clocks.fire(1, 0, FRAMES as u64, false);
+        out.fill(0.0);
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert_eq!(out[0], 0.0, "press 2 attacks from silence too, with no click");
+        let worst = first_press
+            .iter()
+            .zip(out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-6,
+            "the second press is not the same sound as the first: worst frame differs by {worst}"
+        );
+    }
+
+    /// Task 10, fix round 3 — the case round 2's `max` got wrong.
+    ///
+    /// The release happens INSIDE the node; its output then has to traverse
+    /// the insert chain, the `pdc` and the output branch. Those are in
+    /// SERIES, which is exactly why they add rather than dominate. With a
+    /// 2048-frame chain the last of a 3840-frame release enters the strip at
+    /// 3840 and does not leave until 5888 — still in the pipeline when a
+    /// `max(2048, 4096)` window closes at 4096. Stranded in the insert chain,
+    /// truncated tail, contaminated next onset: the same pair, a fourth time,
+    /// through the one path round 2 left open.
+    ///
+    /// Two presses again, and the whole press is compared rather than one
+    /// block, because a delaying chain makes the first block of a press
+    /// silent — a one-block assertion would pass for the wrong reason.
+    #[test]
+    fn a_cut_pads_insert_chain_is_drained_before_the_next_press() {
+        use super::super::dsp::AudioProcessor;
+        use super::super::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use super::super::rt::{LiveNodeCell, LiveSource, MAX_LIVE_BLOCK};
+        use crate::midi::schedule::AbsNoteEvent;
+        use crate::midi::synth::PolySynth;
+
+        const FRAMES: usize = 128;
+        const CHAIN: usize = 2048;
+        const BLOCKS: usize = 80; // 10240 frames: past the release AND the chain
+
+        let build = || {
+            let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+            params.set_gain_pair_linear(0, 1.0);
+            params.set_pan(0, 0.0);
+            let mut synth = PolySynth::new();
+            synth.prepare(48_000, MAX_LIVE_BLOCK);
+            let mut dummy = LatencyDummy::new(CHAIN);
+            dummy.prepare(48_000, MAX_LIVE_BLOCK);
+            let mut pad = RtTrack::clips(0, Vec::new());
+            pad.live = Some(LiveSource {
+                node: LiveNodeCell::new(Box::new(synth)),
+                events: Arc::new(vec![AbsNoteEvent {
+                    sample: 0,
+                    key: 69,
+                    velocity: 100,
+                    channel: 0,
+                }]),
+            });
+            pad.inserts = vec![InsertNode {
+                slot_id: "s".into(),
+                instance_id: "i".into(),
+                bypassed: false,
+                latency: CHAIN,
+                proc: InsertNodeCell::new(Box::new(dummy)),
+            }];
+            let mut g = RtGraph::new(vec![pad], 1, params);
+            let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+            clocks.set_transport_playing(true);
+            clocks.bind_slot(0, 1);
+            g.clocks = Arc::new(clocks);
+            g
+        };
+
+        // One press, rendered to exhaustion: fire for a single block, then
+        // keep rendering while the row drains.
+        let press = |g: &mut RtGraph| -> Vec<f32> {
+            let mut all = Vec::with_capacity(BLOCKS * FRAMES * 2);
+            let mut out = vec![0.0f32; FRAMES * 2];
+            g.clocks.fire(1, 0, FRAMES as u64, false);
+            for _ in 0..BLOCKS {
+                out.fill(0.0);
+                render(g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+                all.extend_from_slice(&out);
+                g.clocks.advance(FRAMES as u64);
+            }
+            all
+        };
+
+        let mut g = build();
+        let first = press(&mut g);
+        assert!(
+            first.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
+            "the press has to sound at all"
+        );
+
+        // A pristine graph pressed once is the reference: whatever the second
+        // press on the USED graph produces must be the same sound.
+        let mut fresh = build();
+        let reference = press(&mut fresh);
+        let second = press(&mut g);
+        let worst = reference
+            .iter()
+            .zip(second.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-6,
+            "the second press differs from a first press by {worst}: material was \
+             stranded in the row and replayed at the next onset"
+        );
+    }
+
+    /// Fix round 3, item 2's trap. The tail `debug_assert` re-derives a row's
+    /// window, and the allowance in it is now RATE-DEPENDENT — so the rate it
+    /// re-derives with has to be the one the row was BUILT at, never this
+    /// call's `sample_rate`.
+    ///
+    /// The two disagree for real: a device rate change moves what
+    /// `render_impl` is handed immediately, and the graph is only rebuilt
+    /// afterwards. In that window a perfectly correct graph would fail its
+    /// own invariant check and panic on the RT thread. One source of truth,
+    /// and it travels with the graph.
+    #[test]
+    fn a_graphs_tail_check_uses_the_rate_it_was_built_at_not_the_callers() {
+        use super::super::dsp::AudioProcessor;
+        use super::super::rt::{live_tail_frames, LiveNodeCell, LiveSource, MAX_LIVE_BLOCK};
+        use crate::midi::synth::PolySynth;
+
+        let mut synth = PolySynth::new();
+        synth.prepare(96_000, MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(0, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth)),
+            events: Arc::new(Vec::new()),
+        });
+        let mut g = RtGraph::with_buses(
+            vec![pad],
+            Vec::new(),
+            1,
+            Arc::new(ParamTable::with_slots_and_sends(1, 0)),
+            96_000,
+        );
+        assert_eq!(g.tracks[0].tail_frames, live_tail_frames(96_000));
+
+        // The device dropped to 48 kHz; the rebuild has not landed yet.
+        let mut out = vec![0.0f32; 64 * 2];
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+    }
+
+    /// The integrated half of the flush: `render_impl`'s prologue must turn
+    /// a stopped scene clock's discontinuity into a real `all_notes_off` on
+    /// the live node still bound to it. Nothing asserted this before —
+    /// `prime_live` is where the hanging note is actually prevented.
+    #[test]
+    fn a_stopped_scene_clock_all_notes_offs_the_live_node_bound_to_it() {
+        use super::super::dsp::{AudioProcessor, LiveInstrument};
+        use super::super::rt::{LiveNodeCell, LiveSource};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        /// Counts `all_notes_off` calls and nothing else.
+        struct OffCounter(Arc<AtomicUsize>);
+        impl AudioProcessor for OffCounter {
+            fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
+            fn process(&mut self, _io: &mut ProcessBlock<'_>) {}
+            fn reset(&mut self) {}
+        }
+        impl LiveInstrument for OffCounter {
+            fn queue_event(&mut self, _ev: BlockNoteEvent) -> bool {
+                true
+            }
+            fn all_notes_off(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let offs = Arc::new(AtomicUsize::new(0));
+        let tr = RtTrack {
+            sends: Vec::new(),
+            out_pdc: None,
+            output: None,
+            tail_frames: 0,
+            flush_left: 0,
+            win: Default::default(),
+            slot: 0,
+            clips: Vec::new(),
+            live: Some(LiveSource {
+                node: LiveNodeCell::new(Box::new(OffCounter(offs.clone()))),
+                events: Arc::new(Vec::new()),
+            }),
+            inserts: Vec::new(),
+            pdc: None,
+        };
+        let mut g = RtGraph::new(vec![tr], 1, Arc::new(ParamTable::default()));
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 0, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let after_fire = offs.load(AtomicOrdering::Relaxed);
+        assert_eq!(after_fire, 1, "the fire itself is a jump");
+
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert_eq!(offs.load(AtomicOrdering::Relaxed), 1, "steady block");
+
+        g.clocks.stop(1);
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert_eq!(
+            offs.load(AtomicOrdering::Relaxed),
+            2,
+            "the cut releases the held voice instead of freezing it"
+        );
+    }
+
+    #[test]
+    fn a_node_on_a_scene_clock_still_plays_the_scene_through_inserts() {
         let mut g = one_track_graph(0, clip(100, 0, 4, vec![1.0; 4], 1));
-        g.params.set_flag(0, FLAG_LAUNCH, true);
         g.params.set_pan(0, -1.0);
         insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), false);
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 100, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
         let mut out = vec![0.0f32; 8];
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false, ended: false }),
-            None,
-        );
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!(
             (out[0] - 0.5).abs() < 1e-5,
-            "overlay must hear the scene through the insert, got {}",
+            "the scene must be heard through the insert, got {}",
             out[0]
         );
     }
@@ -2017,6 +2568,8 @@ mod tests {
             sends: Vec::new(),
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: Default::default(),
             slot,
             clips: Vec::new(),
@@ -2031,6 +2584,63 @@ mod tests {
 
     fn peak(buf: &[f32]) -> f32 {
         buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// Task 10 fix round 4, item 2: the raised tail is inert PER ROW KIND.
+    ///
+    /// Since round 3 a live row's `tail_frames` is `strip + allowance`, and
+    /// `with_buses` recomputes it for every row — a live MIDI TRACK included,
+    /// which now writes a much larger `flush_left` than it ever did before.
+    /// Nothing may read it: `flushing` is `exclusive_idle`, and only a
+    /// player's row is that. An ordinary track on a stopped transport still
+    /// has something feeding it, so a window that opened its fader would hold
+    /// whatever sits under the frozen playhead — here, a note the synth is
+    /// still sustaining.
+    ///
+    /// `a_raw_pad_owns_no_tail_and_takes_the_bare_skip` pins the row kind that
+    /// gets no window; this pins the row kind that gets one and must not use
+    /// it. The branch has already shipped a gate that opened every track's
+    /// fader for `tail_frames` after a stop, with the whole suite green — a
+    /// per-kind assertion is the only thing that saw it.
+    #[test]
+    fn a_live_midi_track_row_never_flushes_after_a_stop_however_long_its_tail() {
+        const RATE: u32 = 48_000;
+        let held = vec![AbsNoteEvent { sample: 0, key: 69, velocity: 100, channel: 0 }];
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut g =
+            RtGraph::with_buses(vec![live_track(0, held, RATE)], Vec::new(), 1, params, RATE);
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(1, 1);
+        clocks.set_transport_playing(true);
+        g.clocks = Arc::new(clocks);
+        assert!(
+            g.tracks[0].tail_frames >= crate::audio::rt::live_tail_frames(RATE),
+            "premise: a live row does carry a window now — without one this \
+             test would pass for want of a tail rather than for the gate"
+        );
+
+        let mut out = vec![0.0f32; 128 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
+        }
+        assert!(peak(&out) > 0.0, "the sustained note has to sound while the transport rolls");
+
+        // Every one of these blocks is INSIDE the window — 8 x 128 frames
+        // against a window of at least 4096 — which is where a wrongly
+        // opened fader would sound.
+        g.clocks.set_transport_playing(false);
+        for i in 0..8 {
+            out.fill(0.0);
+            render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
+            assert_eq!(
+                peak(&out),
+                0.0,
+                "block {i} after the stop: a track is not a pad, and its \
+                 flush window must stay unread"
+            );
+        }
     }
 
     /// The headless seam proof: a live PolySynth node inside the RCU graph
@@ -2189,6 +2799,8 @@ mod tests {
             sends: Vec::new(),
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),

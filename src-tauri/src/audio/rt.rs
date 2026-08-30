@@ -22,9 +22,12 @@ use crate::plugins::automation::AbsParamEvent;
 
 pub const FLAG_MUTE: u32 = 1 << 0;
 pub const FLAG_SOLO: u32 = 1 << 1;
-/// Track is a live launch target — mixer must hear it even if another
-/// track is soloed or this one is muted.
-pub const FLAG_LAUNCH: u32 = 1 << 2;
+// Bit 2 is FREE. It carried "this track is a live launch target" until
+// Plan V — V2 replaced the overlay with `audio::clock`: which playhead a
+// node reads is now the clock its mixer slot is bound to, so "heard past
+// another track's solo" is DERIVED from that binding (`clock_of(slot) !=
+// TRANSPORT_CLOCK`) instead of stored a second time here. Do not reuse the
+// bit for a playhead concept — see ruling V-4.
 /// A live Write/Touch/Latch controller owns track gain. While set, the
 /// mixer bypasses the compiled gain lane so the fader value is heard
 /// exactly once (the lane remains a relative multiplier when read back).
@@ -51,19 +54,6 @@ pub fn advance_automation_pass(pass: &AtomicU64) -> u64 {
 /// or non-finite bases use the safe silence fallback.
 pub fn relative_gain_multiplier(live: f32, base: f32) -> f32 {
     if base.is_finite() && base > 0.0 { live / base } else { 0.0 }
-}
-
-/// One-shot shadow playhead for a drive-clip launch. Launched tracks
-/// render at `pos` instead of the arrangement playhead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LaunchPlayhead {
-    pub pos: u64,
-    pub discontinuity: bool,
-    /// When true (stopped preview), only FLAG_LAUNCH tracks render.
-    pub exclusive: bool,
-    /// Overlay just reached its marked end — FLAG_LAUNCH tracks must
-    /// all-notes-off; they render at the arrangement playhead.
-    pub ended: bool,
 }
 
 /// `SharedRt::park` sentinel: no parking position pending. (Sample 0 is a
@@ -149,16 +139,6 @@ pub struct SharedRt {
     pub countin_beat: AtomicU64,
     /// Beats in the bar the count-in started in (for downbeat accents).
     pub countin_beats_per_bar: AtomicU32,
-    /// Shadow playhead for a drive-clip launch. The main transport (loop,
-    /// seek, FOLLOW) is left alone; launched tracks render at `launch_pos`.
-    pub launch_on: AtomicBool,
-    pub launch_pos: AtomicU64,
-    pub launch_start: AtomicU64,
-    pub launch_end: AtomicU64,
-    pub launch_discont: AtomicBool,
-    /// Set when the overlay playhead crosses `launch_end`. Consumed by the
-    /// next mixer block so FLAG_LAUNCH tracks all-notes-off.
-    pub launch_ended: AtomicBool,
 }
 
 impl Default for SharedRt {
@@ -184,12 +164,6 @@ impl Default for SharedRt {
             countin_elapsed: AtomicU64::new(0),
             countin_beat: AtomicU64::new(0),
             countin_beats_per_bar: AtomicU32::new(4),
-            launch_on: AtomicBool::new(false),
-            launch_pos: AtomicU64::new(0),
-            launch_start: AtomicU64::new(0),
-            launch_end: AtomicU64::new(0),
-            launch_discont: AtomicBool::new(false),
-            launch_ended: AtomicBool::new(false),
         }
     }
 }
@@ -201,64 +175,6 @@ impl SharedRt {
             enabled: self.loop_enabled.load(Ordering::Relaxed),
             start: self.loop_start.load(Ordering::Relaxed),
             end: self.loop_end.load(Ordering::Relaxed),
-        }
-    }
-
-    pub fn arm_launch(&self, start: u64, end: u64) {
-        let end = end.max(start.saturating_add(1));
-        self.launch_start.store(start, Ordering::Relaxed);
-        self.launch_end.store(end, Ordering::Relaxed);
-        self.launch_pos.store(start, Ordering::Relaxed);
-        self.launch_discont.store(true, Ordering::Relaxed);
-        self.launch_ended.store(false, Ordering::Relaxed);
-        self.launch_on.store(true, Ordering::Relaxed);
-    }
-
-    pub fn clear_launch(&self) {
-        self.launch_on.store(false, Ordering::Relaxed);
-    }
-
-    /// Cut a sounding overlay the way reaching its marked end cuts it: the
-    /// engine gets one `ended` frame, so FLAG_LAUNCH tracks all-notes-off at
-    /// the arrangement playhead instead of having the overlay pulled out from
-    /// under a held note. Returns false when nothing was on it.
-    pub fn end_launch(&self) -> bool {
-        if !self.launch_on.swap(false, Ordering::Relaxed) {
-            return false;
-        }
-        self.launch_ended.store(true, Ordering::Relaxed);
-        true
-    }
-
-    pub fn take_launch_ended(&self) -> bool {
-        self.launch_ended.swap(false, Ordering::Relaxed)
-    }
-
-    pub fn launch_overlay(&self) -> Option<LaunchPlayhead> {
-        if !self.launch_on.load(Ordering::Relaxed) {
-            return None;
-        }
-        Some(LaunchPlayhead {
-            pos: self.launch_pos.load(Ordering::Relaxed),
-            discontinuity: self.launch_discont.swap(false, Ordering::Relaxed),
-            exclusive: false,
-            ended: false,
-        })
-    }
-
-    pub fn advance_launch(&self, frames: u64) {
-        if !self.launch_on.load(Ordering::Relaxed) {
-            return;
-        }
-        let pos = self.launch_pos.load(Ordering::Relaxed);
-        let end = self.launch_end.load(Ordering::Relaxed);
-        let next = pos.saturating_add(frames);
-        if next >= end {
-            self.launch_on.store(false, Ordering::Relaxed);
-            self.launch_ended.store(true, Ordering::Relaxed);
-            self.launch_pos.store(end, Ordering::Relaxed);
-        } else {
-            self.launch_pos.store(next, Ordering::Relaxed);
         }
     }
 }
@@ -602,12 +518,78 @@ pub struct RtTrack {
     /// Where this track's fader output goes: an index into
     /// `RtGraph::buses`, or `None` for the master.
     pub output: Option<usize>,
+    /// How long this row keeps SOUNDING after it stops being fed: the
+    /// applied insert-chain latency plus every delay line the row owns
+    /// (`pdc`, `out_pdc`, the widest send edge). Derived from the row by
+    /// [`RtTrack::recompute_tail_frames`], which every `RtGraph`
+    /// constructor calls — a number kept in step with the lines by
+    /// recomputing it from them, not by remembering to update it.
+    ///
+    /// A raw player is 0 by construction (V-6 gives it no inserts and no
+    /// sends, and `node.rs` forces `output: None`, so no `out_pdc`), which
+    /// is what keeps the idle-pad skip in `mixer` free.
+    pub tail_frames: usize,
+    /// Frames of [`Self::tail_frames`] not yet flushed out of the row. Held
+    /// at `tail_frames` while the row's clock is on; counted down by the
+    /// window length once it goes off. RT-owned; see the exclusive-idle
+    /// early-out in `mixer`.
+    pub flush_left: usize,
     /// Carry state across the `MAX_LIVE_BLOCK` windows of ONE callback block
     /// (Plan G2). It lives on the ROW, not in a parallel vector on the
     /// graph: a parallel vector has to be sized at construction, and every
     /// caller that pushes a row afterwards (several tests do) would silently
     /// lose that row's meters. Reset at the top of every render.
     pub win: TrackWindow,
+}
+
+/// The flush allowance a row carrying a LIVE NODE gets on top of its strip,
+/// expressed at 48 kHz (Plan V — V2, Task 10; rate-true since fix round 3).
+/// Use [`live_tail_frames`], never this constant directly.
+///
+/// Every other term in [`RtTrack::computed_tail_frames`] is a line the row
+/// can be asked how long it is. An instrument's own release is not: it lives
+/// inside the node, and `all_notes_off` does not perform it — it only MARKS
+/// the voices released (`midi::synth::PolySynth`, `SamplerNode`, and both
+/// plugin hosts, which merely QUEUE a CC 123 for the next `process`). The
+/// ramp to zero runs inside `process`. So a row that stops being processed
+/// the block after its clock ends does not truncate a decaying tail; it
+/// strands a voice at whatever amplitude it had — full sustain, if the pad
+/// was cut mid-note — and dumps it into the onset of the next press.
+///
+/// Why a fixed allowance rather than asking the node
+/// (`LiveInstrument::tail_samples()`): it could not be honest for the nodes
+/// that matter most. LV2 has no tail concept at all and CLAP's is advisory,
+/// so such an accessor would return a confident number for `PolySynth` and a
+/// guess for a plugin — a second source of truth that lies exactly where the
+/// cost is highest. And why not a hard kill at the freeze point: not
+/// implementable generically for the same reason. `PolySynth` and
+/// `SamplerNode` could reset their voices; LV2 and CLAP have no generic
+/// reset short of deactivate/reactivate, which is not an RT-path operation.
+/// A bounded allowance is what V-17 (b) already commits to — an unbounded
+/// tail is hard-cut at the end of the window, exactly as a transport stop
+/// cuts a track's inserts.
+///
+/// 4096 frames at 48 kHz is 85 ms, comfortably past
+/// `PolySynth::RELEASE_SECS` (80 ms, 3840 frames).
+const LIVE_TAIL_FRAMES_AT_48K: usize = 4096;
+
+/// The sample rate a graph falls back to when it is built without one — a
+/// test rig, or `Control::rebuild` before a device has opened and set
+/// `cache_rate`. See [`RtGraph::with_buses`], the ONE place that clamps.
+pub const FALLBACK_RATE: u32 = 48_000;
+
+/// [`LIVE_TAIL_FRAMES_AT_48K`] scaled to `rate`, in frames.
+///
+/// The allowance is a DURATION — an instrument's release ramp is 80 ms at
+/// every sample rate — so it has to be counted in that rate's frames. Fixing
+/// it at 4096 frames covered the ramp at 48 kHz and only half of it at
+/// 96 kHz, which turned a full-amplitude stranded voice into a
+/// half-amplitude one rather than into none.
+///
+/// Integer math, exact at the reference rate (48 kHz → 4096, 96 kHz → 8192).
+pub fn live_tail_frames(rate: u32) -> usize {
+    debug_assert!(rate > 0, "a graph's rate is clamped by RtGraph::with_buses");
+    (LIVE_TAIL_FRAMES_AT_48K as u64 * rate as u64 / FALLBACK_RATE as u64) as usize
 }
 
 impl RtTrack {
@@ -622,8 +604,73 @@ impl RtTrack {
             pdc: None,
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: TrackWindow::default(),
         }
+    }
+
+    /// Re-derive [`Self::tail_frames`] from the row as it now stands.
+    /// CONTROL THREAD, before publication.
+    ///
+    /// The arithmetic follows the STRIP, which is inserts → `pdc` →
+    /// pre-fader taps → fader → post-fader taps → `out_pdc` → `route_out`
+    /// (`mixer::render_impl`). Inserts and `pdc` are in series with
+    /// everything after them, so they add. The send taps are taken from the
+    /// strip BEFORE `out_pdc.process`, so `out_pdc` and the send delays are
+    /// PARALLEL branches out of the same point: the worst path through the
+    /// row is the longer of the two, not their sum.
+    ///
+    /// Over-counting never truncates, but it is not free either. V-17 makes
+    /// a bus-routed pad's `out_pdc` and its send edge into that same bus
+    /// EQUAL, so summing them would double the window — and the window is
+    /// blocks of FULL-STRIP processing, inserts included, after every
+    /// release. With one linear-phase EQ in that bus that is ~4096 extra
+    /// frames, 85 ms, of it.
+    pub fn recompute_tail_frames(&mut self, rate: u32) {
+        self.tail_frames = self.computed_tail_frames(rate);
+    }
+
+    /// What [`Self::tail_frames`] would be for the row as it now stands.
+    /// Split out so `mixer::render_impl` can `debug_assert` the stored value
+    /// against it — see the funnel note on [`RtGraph::with_buses`].
+    pub fn computed_tail_frames(&self, rate: u32) -> usize {
+        let inserts: usize = self
+            .inserts
+            .iter()
+            .filter(|i| !i.bypassed)
+            .map(|i| i.latency)
+            .sum();
+        let line = |d: &Option<DelayLine>| d.as_ref().map_or(0, |d| d.delay());
+        let sends = self
+            .sends
+            .iter()
+            .map(|s| line(&s.delay))
+            .max()
+            .unwrap_or(0);
+        let strip = inserts + line(&self.pdc) + line(&self.out_pdc).max(sends);
+        // ...and the one term that is not a line on the strip: the
+        // instrument's own release, which runs INSIDE the node.
+        //
+        // It ADDS, and running first is exactly why. `tail_frames` is the
+        // row's whole path latency, so a fragment ENTERING the strip when the
+        // flush starts leaves precisely as the window closes. Release
+        // material is not one fragment: it keeps entering for the whole
+        // release, so the LAST of it enters at `allowance` and still needs
+        // `strip` more frames to traverse the inserts, the `pdc` and the
+        // longer output branch. A `max` closes the window while that material
+        // is still inside the chain — with a 2048-frame chain the tail of a
+        // 3840-frame release is stranded at 4096 and replayed at the next
+        // onset. Over-counting costs flush blocks; under-counting swallows
+        // audio, and this row has swallowed it three times already.
+        //
+        // ONE rule, applied to any row with a live node, not just a player's.
+        // It is inert for a track — `tail_frames` is only ever consumed under
+        // `flushing`, and `flushing` is `exclusive_idle`, which no track row
+        // is — so scoping it to players would buy nothing and would put a
+        // second condition on a funnel whose whole value is having one.
+        let live = if self.live.is_some() { live_tail_frames(rate) } else { 0 };
+        strip + live
     }
 }
 
@@ -756,13 +803,40 @@ pub struct RtGraph {
     /// driven). Empty when there is nothing to click. The RT mixer only
     /// reads it when `SharedRt::metro_on` is set.
     pub clicks: Arc<Vec<crate::audio::metronome::Click>>,
+    /// THIS graph's playheads (Plan V — V2). Versioned with the snapshot for
+    /// the same reason `params` is: a retired graph keeps reading the table
+    /// it was built with, so a rebuild that renumbers clocks cannot bleed
+    /// into a render already in flight.
+    ///
+    /// A running clock's state is CARRIED ACROSS a rebuild by
+    /// `ClockTable::carry_over` (`engine::rebuild`), because the overlay
+    /// this replaces lived on `SharedRt` and a clip edit made while a pad
+    /// sounded did not rewind it.
+    pub clocks: Arc<crate::audio::clock::ClockTable>,
+    /// The engine rate this graph was BUILT at, and the single source of
+    /// truth for anything derived from a rate at build time — today
+    /// [`live_tail_frames`], through `RtTrack::computed_tail_frames`.
+    ///
+    /// `mixer::render_impl` re-derives every row's tail in a `debug_assert`
+    /// and MUST read this, never its own `sample_rate` argument: the two
+    /// disagree across a device rate change until the next rebuild, and a
+    /// row built at one rate and checked against another would fire the
+    /// assert on the RT thread for a graph that is perfectly correct.
+    pub rate: u32,
 }
 
 impl RtGraph {
-    /// Build a snapshot, always allocating the strip `track_buf`
-    /// (unified clip/live/insert path).
+    /// Build a snapshot at the [`FALLBACK_RATE`], always allocating the
+    /// strip `track_buf` (unified clip/live/insert path).
+    ///
+    /// For TEST RIGS. Every production path has its real rate in hand —
+    /// `offline::build_graph` takes one, `Control::rebuild` has
+    /// `self.cache_rate`, `loopjam::render_region_stereo` has `engine_rate` —
+    /// and passes it through [`Self::with_buses`]. A production caller that
+    /// reaches for this instead silently sizes its live rows' flush windows
+    /// at 48 kHz whatever the device is doing.
     pub fn new(tracks: Vec<RtTrack>, generation: u64, params: Arc<ParamTable>) -> Self {
-        Self::with_buses(tracks, Vec::new(), generation, params)
+        Self::with_buses(tracks, Vec::new(), generation, params, FALLBACK_RATE)
     }
 
     /// [`Self::new`] plus compiled bus strips (Plan G2). Sizes the per-bus
@@ -773,7 +847,31 @@ impl RtGraph {
         buses: Vec<RtBus>,
         generation: u64,
         params: Arc<ParamTable>,
+        rate: u32,
     ) -> Self {
+        // THE one clamp. `Control::rebuild` runs with `cache_rate == 0` until
+        // a device opens, and a rate of 0 would size every live row's flush
+        // window at 0 — the bare skip, i.e. exactly the defect the window
+        // exists to prevent. Clamped here, where the value is STORED, so
+        // `graph.rate` is the single sane number every later reader sees and
+        // `live_tail_frames` never has to guess.
+        let rate = if rate == 0 { FALLBACK_RATE } else { rate };
+        // The one place every graph — engine rebuild, offline bounce, every
+        // test rig — passes through, so a row's flush window is derived from
+        // the lines it actually carries.
+        //
+        // The funnel only covers what the row carries WHEN IT IS BUILT.
+        // Production never adds a line afterwards; test rigs do, and such a
+        // row would keep `tail_frames = 0` — a flush window of nothing,
+        // which is exactly the defect fix round 3 closed, arriving silently
+        // through a rig instead of through the code. `mixer::render_impl`
+        // therefore `debug_assert`s the stored value against
+        // `RtTrack::computed_tail_frames` on every row it renders, so the
+        // convention is checked rather than merely documented.
+        let mut tracks = tracks;
+        for tr in tracks.iter_mut() {
+            tr.recompute_tail_frames(rate);
+        }
         let track_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let post_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let bus_buf = vec![0.0; buses.len() * MAX_LIVE_BLOCK * 2];
@@ -787,6 +885,15 @@ impl RtGraph {
                 b
             })
             .collect();
+        // Plan V — V2: a graph nobody has given a clock table to IS the
+        // transport, playing. That is what every caller of `mixer::render`
+        // meant before clocks existed (the offline bounce — V-15 — the
+        // headless previews, and every mixer test), so expressing it as the
+        // default keeps this swap behaviour-neutral for all of them.
+        // `engine::rebuild` overwrites the field with the real, scene-bearing
+        // table before the graph is published.
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(params.len(), 1);
+        clocks.set_transport_playing(true);
         Self {
             tracks,
             buses,
@@ -799,6 +906,8 @@ impl RtGraph {
             meter_scratch,
             track_ramps: Vec::new(),
             clicks: Arc::new(Vec::new()),
+            clocks: Arc::new(clocks),
+            rate,
         }
     }
 
@@ -871,6 +980,46 @@ unsafe impl Send for GraphPtr {}
 pub struct GraphTables {
     pub generation: u64,
     pub params: Arc<ParamTable>,
+    /// The CURRENT graph's playheads (Plan V — V2), published here for the
+    /// same reason `params` is: firing a pad must reach the table the
+    /// rendering graph actually reads, and a pad press must never rebuild
+    /// the graph.
+    pub clocks: Arc<crate::audio::clock::ClockTable>,
+    /// Launch binding id -> its clock in `clocks` (Plan V — V2, Task 8).
+    /// The scene half of `slots`: it is what turns a pad press into an
+    /// atomic write into a lane that already exists, instead of a graph
+    /// rebuild. Sized and numbered by `engine::rebuild` from the document,
+    /// so a binding added since the last rebuild is simply absent — and a
+    /// fire naming it is dropped with a warn rather than firing whichever
+    /// clock happens to sit at that index.
+    pub scene_clocks: HashMap<String, u32>,
+    /// `PlayerId` -> its clock in `clocks` (Plan V — V2, Task 9). The player
+    /// half of `scene_clocks`, and the same argument: firing a pad has to be
+    /// an atomic write into a lane that already exists, because a pad press
+    /// must never rebuild the graph (the RT contract).
+    ///
+    /// The clocks it names are the RESERVED range `1 ..= players.len()`,
+    /// allocated by `engine::rebuild` in document order and bound to each
+    /// player's mixer slot for the life of the graph — a player, unlike a
+    /// scene, never borrows another node's slot, so nothing ever releases it
+    /// (`ClockTable::with_slots_clocks_and_players` is what makes the idle
+    /// state silence rather than "rejoin the arrangement", V-2).
+    ///
+    /// A player added since the last rebuild is simply absent, and
+    /// `ControlPlane::player_fire` reports that rather than firing whichever
+    /// clock happens to sit at that index.
+    pub player_clocks: HashMap<crate::ids::PlayerId, u32>,
+    /// The clock `engine::rebuild` minted for tracks stranded by a binding
+    /// DELETED while its scene sounded (or cut with its flush still unread):
+    /// stopped, owing one discontinuity, and in no `scene_clocks` map because
+    /// it has no binding left. Present only when something was actually
+    /// stranded — a clock every graph carried would be one `begin_block` and
+    /// `advance` walk every block for a case that is not happening.
+    ///
+    /// Published so `release_finished_scenes` can hand those tracks back once
+    /// the flush has been delivered; see there for why leaving them bound
+    /// indefinitely is not an option.
+    pub orphan_clock: Option<u32>,
     pub slots: HashMap<TrackId, usize>,
     /// `SendSlot::id` -> index into `ParamTable::send_amount` (Plan G2),
     /// derived by `types::derive_send_slots` in the same rebuild that built
@@ -910,6 +1059,59 @@ pub struct GraphTables {
 pub type SharedGraphTables = Arc<parking_lot::Mutex<GraphTables>>;
 
 impl GraphTables {
+    /// Hand back every track whose scene has ended AND has been told so.
+    /// One pass over the slots, run by the launch drive thread's poll — the
+    /// ONLY place a scene's slots are released. `ControlPlane::cut_scene`,
+    /// `stop_launch_overlay` and `clear_launch_audible` all deliberately stop
+    /// a clock without releasing what is bound to it.
+    ///
+    /// Two conditions, and both are load-bearing:
+    ///
+    /// * the clock is not running — the scene is over, so the node rejoins
+    ///   the arrangement (`mixer::node_playhead`'s third case);
+    /// * and the block that latches its parting discontinuity has BEGUN
+    ///   (`ClockTable::flush_pending_for`). Releasing before that drops the
+    ///   `all_notes_off` the cut left behind and the note hangs, and "the
+    ///   drive poll came after the cut" does NOT imply "a block ran in
+    ///   between": the poll is 8 ms and a block at 48 kHz / 512 frames is
+    ///   10.7 ms.
+    ///
+    ///   BEGUN, not "read by this node". `begin_block` clears the pending flag
+    ///   at the top of a block, so a poll landing between that and this
+    ///   slot's own `node_playhead` call inside the SAME callback can still
+    ///   release early. Sub-millisecond, strictly narrower than what it
+    ///   replaced, and closing it needs a blocks-rendered counter the release
+    ///   waits on — booked as a follow-up, not built here.
+    ///
+    /// V-14 falls out of the shape: the clock released from is the one the
+    /// slot currently reads, so a track a second scene has since claimed is
+    /// skipped while that scene still runs, and `release_slot_if` covers the
+    /// write that lands between the read and the release.
+    ///
+    /// The ORPHAN clock (`engine::rebuild`, a binding deleted while its scene
+    /// sounded) is released here too, by the same two rules. It has to be:
+    /// `mixer::node_playhead` reports a slot on any non-transport clock as
+    /// `own_clock`, which `audible_with_launch` lets override another track's
+    /// SOLO — and unlike a normal ending, nothing else would ever release
+    /// this one (mute/solo are plain `Set`s that schedule no rebuild), so
+    /// soloing a track would silently fail to silence the stranded one until
+    /// some unrelated edit happened to rebuild the graph.
+    pub fn release_finished_scenes(&self) {
+        if self.scene_clocks.is_empty() && self.orphan_clock.is_none() {
+            return;
+        }
+        let scenes: std::collections::HashSet<u32> =
+            self.scene_clocks.values().copied().collect();
+        for slot in 0..self.params.len() {
+            let clock = self.clocks.clock_of(slot);
+            let ours = scenes.contains(&clock) || self.orphan_clock == Some(clock);
+            if !ours || self.clocks.is_on(clock) || self.clocks.flush_pending_for(clock) {
+                continue;
+            }
+            self.clocks.release_slot_if(slot, clock);
+        }
+    }
+
     /// A fresh gen-0 table with no params and no slots — the shape every
     /// `AudioState::default()` and every control-module test fixture wants
     /// before the first real rebuild publishes something. Single source of
@@ -918,6 +1120,19 @@ impl GraphTables {
         Arc::new(parking_lot::Mutex::new(GraphTables {
             generation: 0,
             params: Arc::new(ParamTable::default()),
+            // Sized to MATCH `params`. Only the transport clock: with
+            // per-binding scene clocks (Task 8) there is no such thing as
+            // "the" scene clock to pre-create, and `scene_clocks` below is
+            // correspondingly empty — a fire before the first real rebuild
+            // is dropped with a warn, which is the same "unknown index means
+            // drop the write" rule `ParamTable`'s setters follow.
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(
+                ParamTable::default().len(),
+                1,
+            )),
+            scene_clocks: HashMap::new(),
+            player_clocks: HashMap::new(),
+            orphan_clock: None,
             slots: HashMap::new(),
             send_slots: HashMap::new(),
         }))
@@ -940,6 +1155,39 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V-4's gate. The overlay's single atomic set is DELETED, not
+    /// deprecated: `audio::clock` is the only playhead mechanism now, and a
+    /// reintroduced `launch_*` atomic here would silently give the engine a
+    /// second, contradictory notion of where a node is — the exact defect
+    /// the clock table exists to make impossible.
+    #[test]
+    fn the_launch_overlay_is_gone_from_this_file() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/rt.rs"),
+        )
+        .expect("rt.rs is readable");
+        // Skip this test's own body, which necessarily names them.
+        let body = src
+            .split("fn the_launch_overlay_is_gone_from_this_file")
+            .next()
+            .expect("split always yields a first part");
+        for banned in [
+            "launch_on",
+            "launch_pos",
+            "launch_start",
+            "launch_end",
+            "launch_discont",
+            "launch_ended",
+            "LaunchPlayhead",
+            "FLAG_LAUNCH",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "{banned} is back in rt.rs \u{2014} see audio::clock and ruling V-4"
+            );
+        }
+    }
 
     #[test]
     fn param_table_sizes_beyond_sixty_four() {
@@ -976,30 +1224,6 @@ mod tests {
         // at 1, it never goes to 0.
         let g = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(0)));
         assert_eq!(g.meter_scratch.len(), 1);
-    }
-
-    #[test]
-    fn ending_a_sounding_overlay_hands_the_engine_one_flush_frame() {
-        // What `launch_stop` relies on: cutting a launched clip mid-note must
-        // leave `launch_ended` set, because that frame is the only thing that
-        // makes FLAG_LAUNCH tracks all-notes-off (`mixer::track_playhead`).
-        // `clear_launch` alone would drop the overlay under a held note.
-        let s = SharedRt::default();
-        s.arm_launch(1_000, 5_000);
-        s.advance_launch(256);
-        assert!(s.launch_overlay().is_some());
-        assert!(s.end_launch());
-        assert!(s.launch_overlay().is_none());
-        assert!(s.take_launch_ended());
-    }
-
-    #[test]
-    fn ending_an_idle_overlay_is_a_no_op() {
-        // Escape with nothing launched must not fake an end: the flush frame
-        // would send all-notes-off to tracks that never went exclusive.
-        let s = SharedRt::default();
-        assert!(!s.end_launch());
-        assert!(!s.take_launch_ended());
     }
 
     #[test]

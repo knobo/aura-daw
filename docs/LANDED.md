@@ -384,7 +384,7 @@ column must never be quoted from one.
 
 ## Plan V — players (a pad that is an instrument)
 
-One cut landed, seven staged behind it: [`backlog/plan-v-players.md`](backlog/plan-v-players.md).
+One cut landed, seven staged behind it: [`backlog/plan-v-players.md`](backlog/plan-v-players.md). V2 is complete and open as PR #121 — it belongs here the day it merges, not before.
 
 | What | Where |
 |---|---|

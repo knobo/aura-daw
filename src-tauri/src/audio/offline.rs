@@ -287,7 +287,7 @@ pub fn build_graph(
     }
 
     let end_samples = song_end(&tracks);
-    let mut graph = RtGraph::with_buses(tracks, buses, 0, params);
+    let mut graph = RtGraph::with_buses(tracks, buses, 0, params, rate);
     // RCU: attach the table BEFORE the graph is handed to the renderer,
     // matching `engine::rebuild` (Track D ruling 1).
     graph.set_track_ramps(compile_track_ramps(
@@ -489,6 +489,130 @@ mod tests {
         // The tail after the last release is silent (no hung voices).
         let tail_start = (383_400 + 10_000) * 2;
         assert_eq!(peak(&a[tail_start..]), 0.0, "release tail decays to silence");
+    }
+
+    /// V-15, and ruling V-2's own argument made executable: the bounce has
+    /// no concept of a pad press, so a player in the document must contribute
+    /// NOTHING to it. Rendering one would put a pad's clip at bar 1 of the
+    /// export — a performance leaking into arrangement material.
+    ///
+    /// Both halves are asserted, because the audible one alone could pass for
+    /// the wrong reason — a player that took a slot but happened to render
+    /// silence. Since Task 10 a MIDI player DOES have a live node in the live
+    /// graph, so the audible half is no longer even circumstantially safe on
+    /// its own: the samples must be identical AND the player must take no
+    /// mixer slot.
+    #[test]
+    fn a_player_contributes_nothing_to_the_bounce() {
+        const RATE: u32 = 48_000;
+        let (store, midi) = demo_project();
+        let render_all = |store: &Store| {
+            let mut og = build_graph(
+                store,
+                &midi,
+                &crate::control::session::PluginDoc::default(),
+                &Default::default(),
+                &Default::default(),
+                None,
+                RATE,
+            );
+            let out = render(&mut og.graph, 0, og.end_samples, RATE, 1.0, &mut |_, _| {});
+            (out, og.graph.params.len(), og.graph.tracks.len(), og.end_samples)
+        };
+        let (without, slots_without, rows_without, end_without) = render_all(&store);
+
+        let (mut padded, _) = demo_project();
+        // BOTH source kinds, because V-15 is about the bounce reading
+        // `store.players` at all, not about one variant of what it holds.
+        let mut midi_pad =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("p1"), "PAD");
+        midi_pad.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: midi.clips[0].id.clone(),
+            instrument_id: None,
+        };
+        midi_pad.node.gain_db = 6.0; // loud enough that a leak could not be missed
+        let mut audio_pad =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("p2"), "WAV PAD");
+        audio_pad.source = crate::audio::player::PlayerSource::AudioClip { clip_id: "c1".into() };
+        audio_pad.raw = true;
+        padded.players.push(midi_pad);
+        padded.players.push(audio_pad);
+        let (with, slots_with, rows_with, end_with) = render_all(&padded);
+
+        assert_eq!(with, without, "a player must not reach the bounce");
+        assert_eq!(slots_with, slots_without, "and it must take no mixer slot");
+        assert_eq!(rows_with, rows_without, "and produce no row");
+        assert_eq!(end_with, end_without, "and not move the song's end");
+    }
+
+    /// V-15's gate, at the line that decides it. `build_graph` compiles
+    /// `mix_nodes(&store.tracks)` — tracks only — while `engine::rebuild`
+    /// compiles `mix_nodes_with_players`. The difference IS the ruling, and
+    /// it is one identifier wide, so it is pinned on the source rather than
+    /// left to be re-derived from a render.
+    #[test]
+    fn the_bounce_compiles_tracks_only_never_players() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/offline.rs"),
+        )
+        .expect("offline.rs is readable");
+        // The PRODUCTION half only: the tests below necessarily name both
+        // functions, in prose and in assertions.
+        let prod = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+        assert!(
+            !prod.contains("mix_nodes_with_players"),
+            "V-15: the offline bounce must never compile a player into the graph"
+        );
+        assert!(
+            prod.contains("mix_nodes(&store.tracks)"),
+            "the tracks-only compiler input is what V-15 rests on"
+        );
+        // The broader pin, and the one that actually survives a refactor:
+        // `mix_nodes_with_players` is only ONE of the ways a player could
+        // reach the bounce. The bounce must not read the players list at
+        // all — not for slots, not for sends, not for `song_end`.
+        assert!(
+            !prod.contains(".players"),
+            "V-15: the offline bounce must not read `store.players` for any purpose"
+        );
+    }
+
+    /// Task 10 fix round 4, item 1, the bounce's half: `build_graph` takes a
+    /// `rate` and must hand THAT to `RtGraph::with_buses`.
+    ///
+    /// A 96 kHz bounce built with a 48 kHz window covers half of every
+    /// instrument's release and hard-cuts the rest, and nothing else in the
+    /// suite would see it — `render_impl`'s tail `debug_assert` re-derives
+    /// from `graph.rate`, so it would carry the same wrong number and agree.
+    #[test]
+    fn a_bounce_sizes_its_live_windows_at_the_bounce_rate() {
+        use crate::audio::rt::live_tail_frames;
+        const RATE: u32 = 96_000;
+        let (store, midi) = demo_project();
+        let og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            RATE,
+        );
+        assert_ne!(
+            live_tail_frames(RATE),
+            live_tail_frames(48_000),
+            "the two rates must differ, or the assertion below cannot bite"
+        );
+        // The demo tracks carry no inserts, no `pdc` and no sends, so the
+        // strip contributes nothing and the window IS the allowance.
+        let live: Vec<usize> =
+            og.graph.tracks.iter().filter(|t| t.live.is_some()).map(|t| t.tail_frames).collect();
+        assert_eq!(live.len(), 2, "both midi tracks render live");
+        assert!(
+            live.iter().all(|&f| f == live_tail_frames(RATE)),
+            "every live row's flush window is 85 ms at the BOUNCE rate, got {live:?}"
+        );
+        assert_eq!(og.graph.rate, RATE, "and the graph carries it for the tail debug_assert");
     }
 
     /// Plan G2: the BOUNCE walks the same routing the live engine does. A

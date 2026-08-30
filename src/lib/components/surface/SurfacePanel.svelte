@@ -16,6 +16,8 @@
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
   import { ui } from "../../state/ui.svelte";
+  import { firePlayer, playerById, setTriggerMode, stopPlayer } from "../../state/players.svelte";
+  import type { PlayerTriggerMode } from "../../types/ipc";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import Knob from "../controls/Knob.svelte";
   import Fader from "../controls/Fader.svelte";
@@ -71,15 +73,42 @@
       const tr = project.trackById(t.trackId);
       if (tr) void surface.writeMute(t.trackId, !tr.muted);
     }
+    if (t.kind === "player") {
+      // Gate fires on the pointer pair (see padPointerDown/Up below), never
+      // on click — a real <button> also delivers click for the pointerup
+      // half of the SAME press, which would double-fire the pad.
+      if (triggerMode(t.playerId) === "gate") return;
+      void firePlayer(t.playerId);
+    }
+  }
+
+  function triggerMode(playerId: string): PlayerTriggerMode {
+    return playerById(playerId)?.trigger?.mode ?? "oneShot";
+  }
+
+  function padPointerDown(widget: SurfaceWidget) {
+    const t = widget.target;
+    if (t?.kind === "player" && triggerMode(t.playerId) === "gate") void firePlayer(t.playerId);
+  }
+
+  function padPointerUp(widget: SurfaceWidget) {
+    const t = widget.target;
+    if (t?.kind === "player" && triggerMode(t.playerId) === "gate") void stopPlayer(t.playerId);
+  }
+
+  const TRIGGER_MODES: readonly PlayerTriggerMode[] = ["oneShot", "gate", "loop"];
+
+  /** V-12's pad inspector, kept to what the pad itself can show: cycling
+   * mode is the only control this task adds, on the pad that owns it. */
+  function cycleTriggerMode(playerId: string) {
+    const cur = triggerMode(playerId);
+    const next = TRIGGER_MODES[(TRIGGER_MODES.indexOf(cur) + 1) % TRIGGER_MODES.length];
+    void setTriggerMode(playerId, next);
   }
 
   /** Lit = actually sounding (or actually muted). Never a local guess. */
   function padLit(widget: SurfaceWidget): boolean {
-    const t = widget.target;
-    if (t?.kind === "clipLaunch") return surface.isClipPlaying(t.clipId);
-    if (t?.kind === "launchBinding") return surface.isBindingPlaying(t.bindingId);
-    if (t?.kind === "trackMute") return !!project.trackById(t.trackId)?.muted;
-    return false;
+    return surface.isLit(widget.target);
   }
 </script>
 
@@ -161,14 +190,43 @@
                   <span class="silk ghost">{w.label}</span>
                 {/if}
               {:else if w.kind === "pad"}
+                {@const pt = w.target?.kind === "player" ? playerById(w.target.playerId) : null}
+                {@const padLabel = w.target?.kind === "player" ? (pt?.name ?? w.label) : w.label}
+                <!-- A pad naming a player nothing has any more must LOOK
+                     unbound: left enabled it is indistinguishable from a
+                     working pad and does nothing when pressed, which is the
+                     silent failure this branch exists to stop. -->
+                {@const dead = w.target?.kind === "player" && !pt}
                 <Pad
-                  label={w.label}
+                  label={padLabel}
                   meterTrackId={meterTrackId(w, midi.clips)}
                   lit={padLit(w)}
-                  disabled={!w.target}
-                  ariaLabel={w.label}
+                  disabled={!w.target || dead}
+                  ariaLabel={padLabel}
                   onpress={() => pressPad(w)}
+                  onpointerdown={() => padPointerDown(w)}
+                  onpointerup={() => padPointerUp(w)}
                 />
+                {#if w.target?.kind === "player"}
+                  {@const playerId = w.target.playerId}
+                  <div class="player-tags">
+                    <span class="silk source" data-testid="pad-{playerId}-source">{padLabel}</span>
+                    {#if pt?.raw}
+                      <span class="silk raw" data-testid="pad-{playerId}-raw">RAW</span>
+                    {/if}
+                    {#if surface.editMode}
+                      <button
+                        class="silk mode"
+                        type="button"
+                        title="Trigger mode — click to cycle"
+                        aria-label="{padLabel} trigger mode: {triggerMode(playerId)}"
+                        onclick={() => cycleTriggerMode(playerId)}
+                      >
+                        {triggerMode(playerId)}
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
               {:else if w.kind === "lamp"}
                 {@const tr = trackOf(w)}
                 <Lamp
@@ -310,34 +368,73 @@
   .cell {
     position: relative;
   }
-  .kill {
-    position: absolute;
-    top: -6px;
-    right: -6px;
-    z-index: 1;
+  .player-tags {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    margin-top: 2px;
+  }
+  .source {
+    color: var(--text-dim);
+    max-width: 56px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .raw {
+    color: var(--amber);
+    letter-spacing: 0.1em;
+  }
+  .mode {
     border: none;
     background: transparent;
+    padding: 0;
     color: var(--text-faint);
     cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
+  .mode:hover {
+    color: var(--cyan);
+  }
+  /* Both edit handles were a faint 12px glyph on a transparent ground, and
+     the owner could not see the bind one at all — which made binding a pad
+     unreachable in practice, not merely hard. They are chips now: a filled
+     ground and a border, so the eye reads a control rather than stray
+     punctuation. Only shown in edit mode, so the weight costs the playing
+     surface nothing. */
+  .kill,
   .tool {
     position: absolute;
     top: -6px;
-    left: -6px;
     z-index: 1;
-    border: none;
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
     padding: 0;
-    background: transparent;
-    color: var(--text-faint);
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 50%;
+    background: rgb(var(--bg-sunken-rgb) / 0.92);
+    color: var(--text-mid);
     font-size: 12px;
     line-height: 1;
     cursor: pointer;
   }
+  .kill {
+    right: -6px;
+  }
+  .tool {
+    left: -6px;
+  }
   .tool:hover {
     color: var(--cyan);
+    border-color: var(--cyan);
   }
   .kill:hover {
     color: var(--red);
+    border-color: var(--red);
   }
   .ghost {
     color: var(--text-faint);

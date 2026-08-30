@@ -246,3 +246,19 @@ Historical plans called this `next-prompt.md` §2.
   behaviour goes in `*.dom.test.ts`.
 - **Theme tokens only** in every `<style>` block — see
   [`TRAPS.md`](TRAPS.md).
+- **A UI review must check reachability, not just presence.** Plan V's V2
+  surface work (Task 13) hit six defects on one day, and every one was
+  reachability, not mechanism: a play action hidden on a rename button, a
+  pad grid that silently could not take a player, an edit handle
+  invisible against its background, a dead pad that looked alive, a lit
+  grid cell that did nothing, a remove handle nobody could see. Every one
+  had green tests — `svelte-check` and a DOM test both see that a control
+  is in the tree; neither sees that it is invisible, unreachable, or
+  indistinguishable from one that works. The same branch's engine code
+  went four fix rounds deep with opus review and a mutation per claim and
+  came out clean; the UI's first review found two Criticals in six
+  commits. A review of a frontend change is not done when it confirms the
+  markup exists — confirm a human can see the control, reach it (tab
+  order, hit target, not hidden behind another element's z-index), and
+  tell it apart from a control that does nothing, ideally by driving the
+  real app (see the `run` skill), not only by reading the component.

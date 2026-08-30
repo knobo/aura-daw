@@ -351,6 +351,11 @@ pub struct Project {
     pub time_signature: Option<(u8, u8)>,
     pub tracks: Vec<TrackState>,
     pub clips: Vec<Clip>,
+    /// Plan V players (V-1). Additive and OPTIONAL, exactly like the
+    /// Composer's `harmony` block: a project that has never had a player
+    /// resaves byte-diff-free and `schemaVersion` does not move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub players: Vec<crate::audio::player::Player>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportState>,
 }
@@ -365,6 +370,9 @@ pub struct Store {
     pub transport: TransportState,
     pub tracks: Vec<TrackState>,
     pub clips: Vec<Clip>,
+    /// Plan V players (V-1). NOT tracks (V-2) — a separate list precisely
+    /// so no timeline code has to learn to skip them.
+    pub players: Vec<crate::audio::player::Player>,
     /// Absolute path of the open `.aura` directory (None = no project).
     pub project_dir: Option<PathBuf>,
     pub project_name: Option<String>,
@@ -448,6 +456,67 @@ pub fn derive_send_slots(tracks: &[TrackState]) -> HashMap<String, usize> {
 /// [`mixer_slot_count`] documents).
 pub fn send_slot_count(tracks: &[TrackState]) -> usize {
     tracks.iter().map(|t| t.sends.len()).sum()
+}
+
+/// [`derive_slots`] plus the document's players, which take the slots AFTER
+/// every track's (Plan V). Same purity contract: nothing is stored, every
+/// rebuild derives fresh, so there is no allocation state to alias.
+///
+/// Appending rather than interleaving is what makes adding a player a
+/// non-event for every existing slot: a fader gesture that resolved a slot
+/// before the player was added still resolves the same strip after.
+pub fn derive_slots_with_players(
+    tracks: &[TrackState],
+    players: &[crate::audio::player::Player],
+) -> HashMap<TrackId, usize> {
+    let mut out = derive_slots(tracks);
+    let base = mixer_slot_count(tracks);
+    for (i, p) in players.iter().enumerate() {
+        out.insert(TrackId::from(p.id.as_str()), base + i);
+    }
+    out
+}
+
+/// [`mixer_slot_count`] plus one slot per player. Sized by COUNT, not by
+/// the slot map's length, for the same reason `mixer_slot_count` is: a
+/// duplicate id would drop a slot and shift every later row.
+pub fn mixer_slot_count_with_players(
+    tracks: &[TrackState],
+    players: &[crate::audio::player::Player],
+) -> usize {
+    mixer_slot_count(tracks) + players.len()
+}
+
+/// The send-amount lanes over tracks AND players. A raw player contributes
+/// none: `MixNode::from(&Player)` emits no sends for it (V-6), so a lane
+/// here would be one nothing reads.
+pub fn derive_send_slots_with_players(
+    tracks: &[TrackState],
+    players: &[crate::audio::player::Player],
+) -> HashMap<String, usize> {
+    let mut out = derive_send_slots(tracks);
+    let mut n = send_slot_count(tracks);
+    for p in players.iter().filter(|p| p.chain_applies()) {
+        for s in &p.node.sends {
+            out.insert(s.id.clone(), n);
+            n += 1;
+        }
+    }
+    out
+}
+
+/// Number of send-amount lanes for `tracks` + `players`, counting every
+/// row (duplicate ids included) exactly as [`send_slot_count`] does.
+pub fn send_slot_count_with_players(
+    tracks: &[TrackState],
+    players: &[crate::audio::player::Player],
+) -> usize {
+    send_slot_count(tracks)
+        + players
+            .iter()
+            .filter(|p| p.chain_applies())
+            .map(|p| p.node.sends.len())
+            .sum::<usize>()
 }
 
 impl Store {
@@ -605,6 +674,55 @@ mod tests {
         });
         let t: TrackState = serde_json::from_value(json).unwrap();
         assert_eq!(t.automation_mode, AutomationMode::Read);
+    }
+
+    #[test]
+    fn players_take_slots_after_every_track_and_never_move_one() {
+        use crate::audio::player::Player;
+        use crate::ids::PlayerId;
+
+        let tracks = vec![test_track("a"), {
+            let mut t = test_track("auto");
+            t.kind = "automation".into();
+            t
+        }, test_track("b")];
+        let players = vec![
+            Player::new(PlayerId::from("p1"), "PAD 1"),
+            Player::new(PlayerId::from("p2"), "PAD 2"),
+        ];
+
+        let plain = derive_slots(&tracks);
+        let with = derive_slots_with_players(&tracks, &players);
+
+        assert_eq!(with[&TrackId::from("a")], plain[&TrackId::from("a")]);
+        assert_eq!(with[&TrackId::from("b")], plain[&TrackId::from("b")]);
+        assert_eq!(with[&TrackId::from("p1")], 2);
+        assert_eq!(with[&TrackId::from("p2")], 3);
+        assert!(!with.contains_key(&TrackId::from("auto")), "automation owns no slot");
+        assert_eq!(mixer_slot_count_with_players(&tracks, &players), 4);
+    }
+
+    /// A raw player has no sends by construction (V-6), so it must not
+    /// consume a send lane either — the lane map and the compiled node have
+    /// to agree or a knob write lands in a lane no graph reads.
+    #[test]
+    fn a_raw_player_consumes_no_send_lane() {
+        use crate::audio::player::Player;
+        use crate::ids::PlayerId;
+
+        let tracks = vec![test_track("a")];
+        let mut p = Player::new(PlayerId::from("p1"), "RAW");
+        p.raw = true;
+        p.node.sends.push(SendSlot {
+            id: "s-ghost".into(),
+            dest: "bus1".into(),
+            amount_db: 0.0,
+            pre_fader: false,
+        });
+
+        let players = vec![p];
+        assert_eq!(send_slot_count_with_players(&tracks, &players), 0);
+        assert!(!derive_send_slots_with_players(&tracks, &players).contains_key("s-ghost"));
     }
 
     #[test]

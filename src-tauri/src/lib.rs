@@ -107,6 +107,10 @@ pub fn run() {
             // about to consume below.
             let midi_out_session = session.clone();
             let midi_out_shared = shared.clone();
+            // Plan V — V2: the launch drive thread watches the CURRENT
+            // graph's scene clock, so it needs the tables `ControlPlane::new`
+            // is about to consume too.
+            let drive_tables = tables.clone();
             let control_plane = Arc::new(control::ControlPlane::new(
                 session,
                 shared,
@@ -133,13 +137,20 @@ pub fn run() {
             // attach it to the control plane so the MIDI-out routing/port/
             // clock methods can reach it.
             let midi_out = app.state::<Arc<midi_out::MidiOut>>().inner().clone();
-            crate::midi::launch::runtime().attach_drive(midi_out_shared.clone(), midi_out_session.clone());
+            crate::midi::launch::runtime().attach_drive(
+                midi_out_shared.clone(),
+                midi_out_session.clone(),
+                drive_tables,
+            );
             midi_out.attach(midi_out_session, midi_out_shared);
             control_plane.attach_midi_out(midi_out);
 
-            // MIDI launch: hardware note-on → seek/loop/play. Installed
-            // here so the midir callback can fire without knowing the
-            // control plane. The callback is the midir thread, not RT.
+            // MIDI launch: hardware note-on → fire that binding's scene on
+            // its own clock (Plan V — V2, Task 8; it used to seek/loop/play
+            // the arrangement transport, which moved the user's playhead on
+            // every pad press). Installed here so the midir callback can fire
+            // without knowing the control plane. The callback is the midir
+            // thread, not RT.
             {
                 let cp = control_plane.clone();
                 crate::midi::launch::runtime().install_fire(std::sync::Arc::new(move |cmd| {
@@ -311,6 +322,13 @@ pub fn run() {
             midi::launch::launch_stop,
             midi::launch::launch_learn_arm,
             midi::launch::launch_learn_take,
+            // ---- Plan V — V2: players (a pad that is an instrument) ----
+            control::players_get,
+            control::player_add,
+            control::player_remove,
+            control::player_fire,
+            control::player_stop,
+            control::player_set_trigger_mode,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,

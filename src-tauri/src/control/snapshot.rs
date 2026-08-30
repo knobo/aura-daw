@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::audio::player::Player;
 use crate::audio::types::{Clip, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op};
 use crate::control::session::{PluginDoc, Session};
@@ -40,6 +41,11 @@ pub struct SessionSnapshot {
     pub created_at: Option<String>,
     pub tracks: Arc<Vec<TrackState>>,
     pub clips: Arc<Vec<Clip>>, // audio placements
+    /// Plan V players (V-1). Carried the same way `tracks`/`clips` are — the
+    /// engine's `rebuild` assembles its graph from THIS image, never the
+    /// live store, so a player missing here is a player no mixer row ever
+    /// gets built for.
+    pub players: Arc<Vec<Player>>,
     pub midi: MidiSnapshot,
     pub automation: Arc<Vec<AutomationLane>>,
     /// Track F graph. Captured wholesale (the doc is small relative to
@@ -93,6 +99,7 @@ pub struct ChangeSet {
     pub transport: bool,
     pub tracks: bool,
     pub clips: bool,
+    pub players: bool,
     pub midi_meta: bool,      // ppq / tempo_events / meter_events
     pub midi_structure: bool, // clip list add/remove (re-derive whole list)
     pub midi_clips: BTreeSet<ClipId>, // per-clip content rewrites
@@ -120,6 +127,7 @@ impl ChangeSet {
             transport: true,
             tracks: true,
             clips: true,
+            players: true,
             midi_meta: true,
             midi_structure: true,
             midi_clips: BTreeSet::new(),
@@ -148,7 +156,7 @@ impl ChangeSet {
     /// · PluginRemove→plugins+tracks (G-10 insert sweep)
     /// · InsertAdd/Remove/Reorder/SetBypass→tracks · TrackReorder→tracks
     /// · SendAdd/Remove/SetAmount/SetPreFader/TrackSetOutput→tracks
-    /// · HarmonySet→harmony
+    /// · HarmonySet→harmony · PlayerAdd/PlayerRemove/Set{Player,_}→players
     pub fn from_ops(ops: &[Op]) -> Self {
         let mut cs = ChangeSet::default();
         for op in ops {
@@ -163,6 +171,7 @@ impl ChangeSet {
                     }
                     ObjectRef::Transport => cs.transport = true,
                     ObjectRef::Plugin(_) => cs.plugins = true,
+                    ObjectRef::Player(_) => cs.players = true,
                 },
                 Op::TrackAdd { .. } | Op::TrackRemove { .. } => {
                     cs.tracks = true;
@@ -236,6 +245,8 @@ impl ChangeSet {
                 // `tracks` — clips are addressed by `trackId`, never by the
                 // track's position, so no clip row changes.
                 Op::TrackReorder { .. } => cs.tracks = true,
+                // Plan V (ruling V-1): structural player add/remove.
+                Op::PlayerAdd { .. } | Op::PlayerRemove { .. } => cs.players = true,
             }
         }
         cs
@@ -262,6 +273,7 @@ impl SessionSnapshot {
             created_at: None,
             tracks: Arc::new(Vec::new()),
             clips: Arc::new(Vec::new()),
+            players: Arc::new(Vec::new()),
             midi: MidiSnapshot {
                 ppq: 0,
                 tempo_events: Arc::new(Vec::new()),
@@ -357,6 +369,11 @@ impl SessionSnapshot {
             } else {
                 prev.clips.clone()
             },
+            players: if changed.players {
+                Arc::new(session.store.players.clone())
+            } else {
+                prev.players.clone()
+            },
             midi,
             automation: if changed.automation {
                 Arc::new(session.automation.lanes.clone())
@@ -412,6 +429,10 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
     if changed.clips {
         charge += next.clips.len() * size_of::<Clip>();
         charge += next.clips.iter().map(clip_heap).sum::<usize>();
+    }
+    if changed.players {
+        charge += next.players.len() * size_of::<Player>();
+        charge += next.players.iter().map(player_heap).sum::<usize>();
     }
     if changed.midi_meta {
         charge += next.midi.tempo_events.len() * size_of::<TempoEvent>();
@@ -478,6 +499,25 @@ pub(crate) fn track_heap(t: &TrackState) -> usize {
         + t.instrument_id.as_ref().map_or(0, String::len)
 }
 
+/// Same shallow accounting as `track_heap`: the row's own id/name strings
+/// plus the ids its `PlayerSource`/`PlayerNode` carry — not a recursive
+/// walk of `inserts`/`sends` (`track_heap` doesn't walk `TrackState`'s
+/// either; the charge is an approximation, not exact bytes — see
+/// `charge_of`'s doc).
+pub(crate) fn player_heap(p: &Player) -> usize {
+    use crate::audio::player::PlayerSource;
+    p.id.as_str().len()
+        + p.name.len()
+        + match &p.source {
+            PlayerSource::AudioClip { clip_id } => clip_id.as_str().len(),
+            PlayerSource::MidiClip { clip_id, instrument_id } => {
+                clip_id.as_str().len() + instrument_id.as_ref().map_or(0, String::len)
+            }
+            PlayerSource::None => 0,
+        }
+        + p.node.output.as_ref().map_or(0, |o| o.as_str().len())
+}
+
 pub(crate) fn clip_heap(c: &Clip) -> usize {
     c.id.as_str().len()
         + c.track_id.as_str().len()
@@ -537,6 +577,7 @@ fn launch_target_heap(t: &crate::midi::launch::LaunchTarget) -> usize {
             track_ids.iter().map(String::len).sum()
         }
         crate::midi::launch::LaunchTarget::Clip { clip_id } => clip_id.len(),
+        crate::midi::launch::LaunchTarget::Player { player_id } => player_id.as_str().len(),
     }
 }
 

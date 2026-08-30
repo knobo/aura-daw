@@ -115,7 +115,8 @@ class SurfaceStore {
         });
       }
     }
-    return { tracks, midiClips, automations, pluginParams };
+    const launchBindings = launch.bindings.map((b) => ({ id: b.id, name: b.name }));
+    return { tracks, midiClips, automations, pluginParams, launchBindings };
   }
 
   hydrate(projectDir: string | null) {
@@ -239,8 +240,8 @@ class SurfaceStore {
     return cellOptions(this.context());
   }
 
-  bindCell(widgetId: string, index: number, clipId: string | null) {
-    this.commit(setGridCell(this.layout, widgetId, index, clipId));
+  bindCell(widgetId: string, index: number, target: SurfaceTarget | null) {
+    this.commit(setGridCell(this.layout, widgetId, index, target));
     this.bindFor = null;
   }
 
@@ -378,8 +379,17 @@ class SurfaceStore {
   }
 
   async fireClip(clipId: string) {
-    const existing = launch.bindings.find((b) => b.target.kind === "clip" && b.target.clipId === clipId);
-    const binding = existing ?? (await launch.mapClip(clipId));
+    // Fix round 1, Critical 2 (re-fixed): `launch.mapClip` resolves a
+    // migrated `player` target via `launch.players`, so it CAN be
+    // delegated to unconditionally for correctness — but `mapClip` also
+    // focuses/seeks the transport on a hit, which `fireClip` must not do
+    // for the ordinary case of firing a pad that already has a binding
+    // (that would move the user's timeline/transport on every press,
+    // exactly the class of defect Task 8 killed on the Rust side).
+    // `existingBindingForClip` is the same lookup with no side effect;
+    // `mapClip` runs only to CREATE one, whose own focus is the "jump to
+    // what you just made" behaviour that predates this fix round.
+    const binding = launch.existingBindingForClip(clipId) ?? (await launch.mapClip(clipId));
     if (!binding) return;
     await launch.preview(binding.id);
   }
@@ -396,7 +406,13 @@ class SurfaceStore {
     const overlay = launch.overlay;
     if (!overlay) return false;
     const b = launch.bindings.find((x) => x.id === overlay.id);
-    return b?.target.kind === "clip" && b.target.clipId === clipId;
+    if (!b) return false;
+    // Fix round 3: shares `launch.bindingMatchesClip` with
+    // `existingBindingForClip` instead of its own copy of the same
+    // clip/player-target check — round 1, Critical 2 was exactly this
+    // kind of matching drifting apart across files; round 2 closed
+    // `fireClip`'s copy, this was the one left.
+    return launch.bindingMatchesClip(b, clipId);
   }
 
   /** Cut the shadow playhead if this clip is what is on it. */
@@ -415,6 +431,17 @@ class SurfaceStore {
     await launch.stopOverlay();
   }
 
+  /** Whether a target's pad should show solid — one rule shared by a loose
+   * pad and a pad-grid cell, so the two cannot drift apart on what "lit"
+   * means for a given target kind. A player has no lit indicator (same as
+   * today's loose pad): its clock is continuous, not a launch overlay. */
+  isLit(target: SurfaceTarget | null | undefined): boolean {
+    if (!target) return false;
+    if (target.kind === "clipLaunch") return this.isClipPlaying(target.clipId);
+    if (target.kind === "launchBinding") return this.isBindingPlaying(target.bindingId);
+    if (target.kind === "trackMute") return !!project.trackById(target.trackId)?.muted;
+    return false;
+  }
 }
 
 /** Value plus range for whatever a knob or fader is pointed at. */

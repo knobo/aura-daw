@@ -49,6 +49,12 @@ string_id!(/// A lane within a track (round-2 §5, ADR 0004). Every track
     /// its track (`LaneId -> TrackId`). Multi-lane UI and takes stay
     /// deferred; only the indirection ships.
     LaneId);
+string_id!(/// A player (Plan V): a mixer node with its own playhead, fired
+    /// from a pad. Family of `audio::player::Player::id`. NOT a `TrackId`
+    /// — ruling V-2 keeps players out of the timeline — though a player's
+    /// compiled `MixNode::id` borrows the `TrackId` newtype, which is the
+    /// mixer graph's node-identity family (see `audio::node`).
+    PlayerId);
 
 /// Fixed namespace for [`LaneId::default_for_track`]'s deterministic
 /// minting — a project-specific constant, minted once and frozen forever
@@ -65,6 +71,26 @@ impl LaneId {
     /// only lane-minting path that exists today.
     pub fn default_for_track(track_id: &str) -> Self {
         Self(uuid::Uuid::new_v5(&AURA_LANE_NS, track_id.as_bytes()).to_string())
+    }
+}
+
+/// Namespace for a player minted BY THE LAUNCH MIGRATION, so re-running it
+/// on the same clip yields the same id.
+const AURA_MIGRATED_PLAYER_NS: uuid::Uuid = uuid::uuid!("1f7b3c92-8e04-4a6d-9c15-2b8de6417a03");
+
+impl PlayerId {
+    /// The player the launch migration mints for a clip. Derived from the
+    /// clip id rather than random, because the migration is **in-memory
+    /// only** — it re-runs on every open until the project is saved, and a
+    /// random id would be a different player each time.
+    ///
+    /// What that costs if it is random: a control-surface pad bound to a
+    /// migrated player stores `player:<id>` in localStorage, which outlives
+    /// the session. Close without saving, reopen, and the pad points at an
+    /// id nothing has any more — a dead pad, silently. Deriving the id makes
+    /// the migration idempotent in IDENTITY, not merely in count.
+    pub fn for_migrated_clip(clip_id: &str) -> Self {
+        Self(uuid::Uuid::new_v5(&AURA_MIGRATED_PLAYER_NS, clip_id.as_bytes()).to_string())
     }
 }
 
