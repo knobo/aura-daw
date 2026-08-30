@@ -5,20 +5,39 @@ import Pad from "./Pad.svelte";
 afterEach(cleanup);
 
 describe("the pad", () => {
-  it("fires onpress once, on the click that closes the press", async () => {
+  it("fires onpress on pointerdown, not on the click that closes the press", async () => {
+    // A pad is an instrument: it sounds on the strike. Firing from `click`
+    // made the note wait for pointerup and for the browser to confirm both
+    // halves landed on the same element — tens of milliseconds set by how
+    // long a finger rests on the button.
     const onpress = vi.fn();
     render(Pad, { label: "KICK", ariaLabel: "Play kick", onpress });
     const el = screen.getByRole("button", { name: /play kick/i });
-    Object.assign(el, {
-      setPointerCapture: vi.fn(),
-      releasePointerCapture: vi.fn(),
-    });
+    Object.assign(el, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+
     await fireEvent.pointerDown(el, { button: 0, pointerId: 1 });
-    expect(onpress).not.toHaveBeenCalled();
+    expect(onpress).toHaveBeenCalledTimes(1);
+
+    // The browser synthesises a click after pointerup; it must not double-fire.
     await fireEvent.pointerUp(el, { pointerId: 1 });
-    // The browser synthesises the click after pointerup; jsdom does not.
     await fireEvent.click(el);
     expect(onpress).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not swallow a keyboard press after a cancelled pointer", async () => {
+    // pointercancel produces no click, so the guard that suppresses the
+    // pointer's own click has to be disarmed or the next Enter is eaten.
+    const onpress = vi.fn();
+    render(Pad, { label: "HAT", ariaLabel: "Play hat", onpress });
+    const el = screen.getByRole("button", { name: /play hat/i });
+    Object.assign(el, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+
+    await fireEvent.pointerDown(el, { button: 0, pointerId: 1 });
+    await fireEvent.pointerCancel(el, { pointerId: 1 });
+    expect(onpress).toHaveBeenCalledTimes(1);
+
+    await fireEvent.click(el);
+    expect(onpress).toHaveBeenCalledTimes(2);
   });
 
   it("plays from the keyboard", async () => {
