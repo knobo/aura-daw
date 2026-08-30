@@ -115,7 +115,8 @@ class SurfaceStore {
         });
       }
     }
-    return { tracks, midiClips, automations, pluginParams };
+    const launchBindings = launch.bindings.map((b) => ({ id: b.id, name: b.name }));
+    return { tracks, midiClips, automations, pluginParams, launchBindings };
   }
 
   hydrate(projectDir: string | null) {

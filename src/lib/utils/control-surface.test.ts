@@ -47,6 +47,10 @@ const ctx: SurfaceContext = {
     { id: "c2", name: "snare", trackId: "t1" },
     { id: "c3", name: "hat", trackId: "t1" },
   ],
+  launchBindings: [
+    { id: "lb1", name: "Scene 1" },
+    { id: "lb2", name: "Scene 2" },
+  ],
   automations: [
     { id: "a1", trackId: "t1", trackName: "Drums", paramLabel: "gain", target: { kind: "trackGain", trackId: "t1" } },
     { id: "a2", trackId: "t2", trackName: "Bass", paramLabel: "pan", target: { kind: "trackPan", trackId: "t2" } },
@@ -492,5 +496,21 @@ describe("bindWidget", () => {
     expect(w.target).toEqual({ kind: "trackArm", trackId: "t1" });
     expect(w.lampRole).toBe("arm");
     expect(w.label).toBe("ARM");
+  });
+});
+
+describe("launcher bindings on a pad", () => {
+  it("offers every launch binding, keyed apart from a clip of the same id", () => {
+    const opts = bindOptions("pad", ctx);
+    const launcher = opts.filter((o) => o.target.kind === "launchBinding");
+    expect(launcher.map((o) => o.label)).toEqual(["Scene 1", "Scene 2"]);
+    expect(launcher[0].key).toBe("launchBinding:lb1");
+    expect(targetKey({ kind: "launchBinding", bindingId: "x" })).not.toBe(
+      targetKey({ kind: "clipLaunch", clipId: "x" }),
+    );
+  });
+
+  it("leaves a pad-grid cell clip-only — a cell fires a clip or nothing", () => {
+    expect(cellOptions(ctx).every((o) => o.target.kind === "clipLaunch")).toBe(true);
   });
 });

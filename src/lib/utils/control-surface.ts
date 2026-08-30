@@ -188,6 +188,9 @@ export interface SurfaceContext {
   tracks: readonly SurfaceTrack[];
   midiClips: readonly SurfaceClip[];
   automations: readonly SurfaceAutomation[];
+  /** Launcher rows, so a pad can fire a whole scene and not only one clip.
+   * Optional: a caller that has no launcher simply offers none. */
+  launchBindings?: readonly { id: string; name: string }[];
   /** Optional: only instances whose params have been read are bindable. */
   pluginParams?: readonly SurfacePluginParam[];
 }
@@ -608,6 +611,13 @@ export function bindOptions(kind: SurfaceWidgetKind, ctx: SurfaceContext): BindO
     for (const t of tracks) add("METER", t.name, t.name, { kind: "meter", trackId: t.id });
   } else if (kind === "pad") {
     for (const c of ctx.midiClips) add("CLIP", c.name, c.name, { kind: "clipLaunch", clipId: c.id });
+    // A launcher row is not a clip: it may name a whole region across
+    // several tracks, or a player. The press path has handled
+    // `launchBinding` since the surface was built — fire, toggle-stop and
+    // the lit state all read it — and only this list was missing, so the
+    // capability existed with nothing offering it.
+    for (const b of ctx.launchBindings ?? [])
+      add("LAUNCHER", b.name, b.name, { kind: "launchBinding", bindingId: b.id });
     for (const t of tracks) add("MUTE", `${t.name} — mute`, `${t.name} MUTE`, { kind: "trackMute", trackId: t.id });
   } else if (kind === "lamp") {
     for (const t of tracks) add("MUTE", t.name, "MUTE", { kind: "trackMute", trackId: t.id }, "mute");
