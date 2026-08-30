@@ -1833,7 +1833,26 @@ impl ControlPlane {
     /// stranded on this scene's playhead. It releases only what THIS clock
     /// still owns (V-14), so a track another scene has claimed in the
     /// meantime stays with that scene.
-    pub fn fire_scene(&self, binding_id: &str, track_ids: &[String], start: u64, end: u64) -> bool {
+    /// `at` is the transport position a QUANTIZED press waits for, or `None`
+    /// for "now" — the same `Option` a player's press carries, resolved by
+    /// the same [`ControlPlane::quantize_target`], so "Q 1/4" means one
+    /// thing across both kinds of pad.
+    ///
+    /// The tracks are bound NOW even when the fire waits, and that is not an
+    /// oversight: a slot on a scene clock that is off falls back to the
+    /// arrangement (`mixer::node_playhead`'s fourth case), so the borrowed
+    /// tracks keep playing the song until the beat arrives, and the binding
+    /// is already in place when it does. Binding from `arm_pending` instead
+    /// is not available: that runs on the audio thread, and which slots a
+    /// scene names is a control-side map.
+    pub fn fire_scene(
+        &self,
+        binding_id: &str,
+        track_ids: &[String],
+        start: u64,
+        end: u64,
+        at: Option<u64>,
+    ) -> bool {
         let tables = self.tables.lock();
         let Some(&clock) = tables.scene_clocks.get(binding_id) else {
             log::warn!("launch: no clock for binding {binding_id} — dropping the fire");
@@ -1847,8 +1866,14 @@ impl ControlPlane {
                 tables.clocks.bind_slot(slot, clock);
             }
         }
-        // A scene carries no velocity: unity, as V2 fired it.
-        tables.clocks.fire(clock, start, end, false, 1.0);
+        // A scene carries no velocity: unity, as V2 fired it. V-18's gain is
+        // a PAD's, and a scene borrows real arrangement tracks — turning
+        // those down because someone tapped softly is a different feature,
+        // and not one anybody has asked for.
+        match at {
+            Some(at) => tables.clocks.fire_at(clock, at, start, end, false, 1.0),
+            None => tables.clocks.fire(clock, start, end, false, 1.0),
+        }
         true
     }
 
@@ -2107,7 +2132,7 @@ impl ControlPlane {
             // holds — so the cap only bites when the press needs a voice
             // that is not already spent. Without this a 32-pad deck could
             // steal a pad to make room for itself.
-            let stolen = if tables.clocks.holds_voice(clock)
+            let stolen = if tables.clocks.is_live(clock)
                 || tables.clocks.voices_in_use() < VOICE_CAP
             {
                 None
@@ -2151,7 +2176,7 @@ impl ControlPlane {
     /// * the tempo map cannot be built (no device, so no rate), or the
     ///   boundary converts back to a position that is not actually ahead of
     ///   the playhead.
-    fn quantize_target(&self, quantize: crate::audio::player::Quantize) -> Option<u64> {
+    pub(crate) fn quantize_target(&self, quantize: crate::audio::player::Quantize) -> Option<u64> {
         if quantize == crate::audio::player::Quantize::Off {
             return None;
         }
@@ -4911,6 +4936,13 @@ impl ControlPlane {
 
     /// Shared session lock. Used by crate-internal modules (MIDI launch)
     /// and by tests that assert on store state around a `commit`.
+    /// The RT-shared cell — transport position, play state, sample rate.
+    /// Crate-visible for the same reason `session` is: `midi::launch` lives
+    /// in another module and implements half of `ControlPlane`.
+    pub(crate) fn shared(&self) -> &Arc<SharedRt> {
+        &self.shared
+    }
+
     pub(crate) fn session(&self) -> &Arc<Mutex<Session>> {
         &self.session
     }

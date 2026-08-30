@@ -11,6 +11,68 @@ do not drive.
 
 User-facing: `docs/midi-input.md` § Launch. Trace: `AURA_LAUNCH_TRACE=1`.
 
+## Launch quantize — landed 2026-08-30 (PR #141)
+
+A binding carries a `quantize` division and fires on that boundary of the
+arrangement's grid instead of on the press. Same field, same wire form and
+same chip as a player pad's (`audio::player::Quantize`), deliberately one
+type rather than two: a deck has pads of both kinds side by side and
+"Q 1/4" has to mean the same thing on either.
+
+The clock machinery came from Plan V's V3 (PR #137) unchanged — `fire_at`
+and `arm_pending` live in `ClockTable` and were never bound to the player
+range — so this cut is entirely about the SCENE path, and about the two
+places where "off" used to be the same question as "over":
+
+* **`GraphTables::release_finished_scenes`** handed a waiting scene's
+  borrowed tracks back, because a clock armed for a beat is off. The fire
+  then started with nothing bound to it: a pad that lights up and sounds
+  nothing.
+* **the drive thread's release edge** (`launch.rs`, the 8 ms poll) read the
+  same "off" as an ending and announced — and cut — a scene before it had
+  begun.
+
+Both now ask `ClockTable::is_live` (running *or* waiting on a beat), which
+is the rename of V3's `holds_voice`; the voice cap asks the same question
+for its own reason.
+
+**The tracks are bound at PRESS time even though the fire waits**, and that
+is deliberate rather than an oversight: a slot on a scene clock that is off
+falls back to the arrangement (`mixer::node_playhead`'s fourth case), so the
+borrowed tracks keep playing the song until the beat arrives and the binding
+is already in place when it does. Binding from `arm_pending` instead is not
+available — that runs on the audio thread, and which slots a scene names is
+a control-side map.
+
+**The migrated-binding trap.** V2 migrated launch bindings onto players, and
+`launch_fire_from` returns early into `player_fire` for such a binding — so
+for a `player`-targeted binding the division that governs the press is the
+PLAYER's, and writing the binding's own field there sets a value nothing
+reads. The surface chip resolves through the binding's target for exactly
+this reason (`SurfacePanel.padQuantize` / `cyclePadQuantize`), and a DOM
+test pins it.
+
+**Deliberately NOT in scope: choke and velocity on a scene.** A scene
+borrows real arrangement tracks, so a choke would cut them mid-song and a
+velocity would duck them for as long as the scene ran. Both are different
+features from the pad ones that share their names, and neither has been
+asked for. Note that the mixer's velocity multiply already reads any
+non-transport clock's gain, so a future scene velocity would need no engine
+work — only a decision.
+
+**Known gaps.**
+
+- `LaunchFired { playing: true }` is emitted at the PRESS, not at the beat,
+  so the launcher lights up while the scene is still waiting. Emitting on
+  the beat needs a signal back from the audio thread (`arm_pending` runs
+  there); an "armed" state distinct from "playing" is the UI half of the
+  same thing. Neither is built.
+- Block-accurate, not sample-accurate, exactly as a player's press is
+  (V-21): ~5 ms worst case at 512 frames / 48 kHz.
+- The chip is per-binding. A GLOBAL launch quantize — one setting for the
+  whole launcher, which is how Ableton frames it — would sit on `LaunchMap`
+  beside `play_mode`, and nothing here forecloses it.
+
 ## Not in v0.1 — next
 
 ### Hardware GATE

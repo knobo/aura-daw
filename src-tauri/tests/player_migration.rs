@@ -117,6 +117,7 @@ fn clip_binding(id: &str, note: u8, clip_id: &str) -> LaunchBinding {
         name: id.into(),
         note,
         channel: None,
+        quantize: Default::default(),
         target: LaunchTarget::Clip { clip_id: clip_id.into() },
     }
 }
@@ -127,6 +128,7 @@ fn region_binding(id: &str, note: u8, track_id: &str) -> LaunchBinding {
         name: id.into(),
         note,
         channel: None,
+        quantize: Default::default(),
         target: LaunchTarget::Region {
             start_ticks: 0,
             length_ticks: 960,
@@ -430,6 +432,7 @@ fn a_project_already_migrated_and_saved_does_not_mint_a_second_player_on_open() 
                 name: "b1".into(),
                 note: 36,
                 channel: None,
+                quantize: Default::default(),
                 target: LaunchTarget::Player { player_id: existing_player_id.clone() },
             }],
             ..LaunchMap::default_map()

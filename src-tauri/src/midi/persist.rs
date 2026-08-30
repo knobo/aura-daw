@@ -1102,6 +1102,7 @@ mod tests {
                 name: "Kick".into(),
                 note: 36,
                 channel: None,
+                quantize: Default::default(),
                 target: crate::midi::launch::LaunchTarget::Region {
                     start_ticks: 0,
                     length_ticks: 960,

@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Launch quantize — a scene fires on the beat | `feat/launch-quantize` | 2026-08-30 | V3 gave players a quantized start; a launch-bound pad still fires on the press. Owner asked for it while ear-checking V3. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
@@ -62,11 +62,12 @@ sentence got written — if you find a row whose branch is gone from
    are the control surface's (open SURFACE, add two LPD8
    racks and a channel strip side by side, drag a fader, tap a pad) and
    G2's: one reverb on a bus, several tracks sent into it, one room — then
-   export and confirm the WAV has it. **New with V3 (PR #137):** two pads
+   export and confirm the WAV has it. **New with V3 (PR #137) and #141:** two pads
    in one choke group (the second press must cut the first with no click),
    and a pad quantized to 1/4 fired off the beat while the arrangement
    rolls (it must land ON the beat, and the ~5 ms block granularity must
-   not be audible as flam).
+   not be audible as flam) — and the same quantize check on a pad bound to
+   a LAUNCHER row (#141), which is the half the owner reached for first.
 2. **Plan V — V4: per-node automation clock.** `ParamDriver::tick` becomes
    per-node and `ClipEnvelope` is evaluated at the player's own position,
    which is what makes an envelope trigger-relative with no new document

@@ -5425,6 +5425,7 @@ mod tests {
             name: id.into(),
             note,
             channel: None,
+            quantize: Default::default(),
             target: crate::midi::launch::LaunchTarget::Region {
                 start_ticks: 0,
                 length_ticks: 960,

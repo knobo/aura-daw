@@ -423,9 +423,19 @@ impl ClockTable {
         1..=self.n_player_clocks
     }
 
-    /// Is this clock spending a voice — sounding, or waiting on a beat?
+    /// Is this clock LIVE — sounding, or waiting on a beat to sound?
+    ///
+    /// The distinction matters wherever "is it off?" was previously the same
+    /// question as "is it over?". It stopped being the same question when
+    /// `fire_at` arrived: an armed clock is off and has not started yet, and
+    /// reading that as "over" ends a scene before it ever begins (the launch
+    /// drive thread's release edge) or hands its borrowed tracks back
+    /// (`GraphTables::release_finished_scenes`).
+    ///
+    /// It is also V-19's voice question: a pad that will sound on the next
+    /// beat has already taken its voice.
     #[inline]
-    pub fn holds_voice(&self, clock: u32) -> bool {
+    pub fn is_live(&self, clock: u32) -> bool {
         self.is_on(clock) || self.is_pending(clock)
     }
 
@@ -433,7 +443,7 @@ impl ClockTable {
     /// count). A pending fire counts: a pad that will sound on the next beat
     /// has already taken its voice.
     pub fn voices_in_use(&self) -> usize {
-        self.player_clocks().filter(|&i| self.holds_voice(i)).count()
+        self.player_clocks().filter(|&i| self.is_live(i)).count()
     }
 
     /// The voice that has been sounding longest — what V-19 steals when the
@@ -443,7 +453,7 @@ impl ClockTable {
     /// never take the same number even from two threads.
     pub fn oldest_voice(&self) -> Option<u32> {
         self.player_clocks()
-            .filter(|&i| self.holds_voice(i))
+            .filter(|&i| self.is_live(i))
             .filter_map(|i| self.clocks.get(i as usize).map(|c| (c.seq.load(Relaxed), i)))
             .min()
             .map(|(_, i)| i)
