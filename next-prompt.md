@@ -58,10 +58,8 @@ sentence got written — if you find a row whose branch is gone from
 ## Next up — unclaimed
 
 1. **Owner ear-checks** are owed on several landed tracks. No suite
-   substitutes for them; each backlog file lists its own. The newest three
-   are Plan V — V2's (open SURFACE, put a WAV on a pad with `raw` ticked,
-   start the arrangement, hit the pad — bit-identical to browser audition,
-   playhead unmoved), the control surface's (open SURFACE, add two LPD8
+   substitutes for them; each backlog file lists its own. The newest two
+   are the control surface's (open SURFACE, add two LPD8
    racks and a channel strip side by side, drag a fader, tap a pad) and
    G2's: one reverb on a bus, several tracks sent into it, one room — then
    export and confirm the WAV has it.

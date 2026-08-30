@@ -89,12 +89,18 @@ playhead per player, `player_fire` / `player_stop`. The launch overlay is
   and the same pads fire the same material.
 - Undo of "add player" / "change player source" restores byte-identically.
 
-### Owner ear-check
+### Owner ear-check — done 2026-08-30
 
 Open SURFACE, put a WAV on a pad with `raw` ticked, start the arrangement,
 hit the pad. The pad must sound bit-identical to auditioning that file in
 the browser, and the arrangement's playhead must not move. Anything else
 means V-6/V-16 is not implemented as designed.
+
+The owner confirmed the pad fires and sounds **while the arrangement is
+playing** — which is the design §2.2 defect this cut exists to kill, and the
+half no test can stand in for. The bit-identity half rests on V-16 and on
+`raw`'s own tests; if a future ear ever disagrees with them, believe the ear
+and start at `Player::chain_applies()`.
 
 ### Rulings V-13…V-16 (full text and V-17 in the design doc's ruling table, §5)
 
