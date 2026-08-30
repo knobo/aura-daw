@@ -68,10 +68,13 @@ not exist. Branch min **2.01** µs — comparable only against this branch's
 own earlier sittings (1.89 at `bf0cb58`, 2.27 at round 4's, 3.26 at task
 10's), i.e. unmoved within a spread that does not travel between sittings.
 
-**Always use `--test-threads=1`.** The parallel run SIGSEGVs in
-`midi_out::tests` — a pre-existing project crash,
-[`docs/backlog/ci-hardening.md`](../../backlog/ci-hardening.md) item 5, not
-this branch's.
+**`--test-threads=1` is obsolete as of the `origin/main` merge.** The
+parallel SIGSEGV was diagnosed and fixed in #123 (a libtest binary has no
+`AURA_SCAN_WORKER` guard, so the scan worker's child ran the whole suite
+again and pinned pipewire at its fd limit). Verified on this branch,
+2026-08-30, three consecutive parallel runs: 1568 passed, 0 failed, in
+11.5–12.4 s against 112.9 s single-threaded. **Every brief in `…-BRIEFS/`
+still carries the old rule; it is stale, not wrong to have followed.**
 
 ## Pick up here
 

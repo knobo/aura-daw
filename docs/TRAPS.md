@@ -410,19 +410,19 @@ session burns an hour on something a sentence would have prevented.
   Pass the host's own `PluginInstanceInfo` through, do not reconstruct
   it.
 
-- **Run the local suite under `xvfb-run`, and single-threaded.**
+- **Run the local suite under `xvfb-run`.**
 
   ```sh
-  xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+  xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml
   ```
 
-  Two separate problems, one command. Zyn's LV2 UI is DPF ExternalWindow:
+  Zyn's LV2 UI is DPF ExternalWindow:
   it draws nothing itself and instead spawns `zynaddsubfx-ext-gui` as its
   own process, so the GUI tests put real windows on your desktop.
-  `xvfb-run` gives them a throwaway display that dies with the run.
-  `--test-threads=1` avoids the parallel crash below — which is what
-  leaves windows behind, because a process killed by a signal never runs
-  `Drop`, and `Drop` is the only thing that kills the GUI child.
+  `xvfb-run` gives them a throwaway display that dies with the run. This
+  used to also require `--test-threads=1`, because a process killed by a
+  signal never runs `Drop`, and `Drop` is the only thing that kills the
+  GUI child — but the signal is gone; see below.
 
   **Do not "fix" this by unsetting `DISPLAY`.** The three GUI tests gate
   on it and return early, so they go green having asserted nothing —
@@ -447,11 +447,18 @@ session burns an hour on something a sentence would have prevented.
   next one, check whether a rebuild happened in between before you go
   looking at the mixer.
 
-- **A parallel `cargo test --lib` can SIGSEGV**, not merely flake. Single
-  threaded it passes 1407/1407. If a full run dies with `signal: 11`, you
-  have not broken anything — see
-  [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 5, which has
-  the evidence and the two pieces of work it implies.
+- **`--test-threads=1` is no longer needed, and costs 9x.** A parallel
+  `cargo test --lib` used to SIGSEGV rather than merely flake, and every
+  instruction in this repo carried the workaround. The cause was found and
+  fixed in #123: a libtest binary has no `AURA_SCAN_WORKER` guard, so
+  `WorkerCommand::current_exe()`'s child ran the ENTIRE suite again and
+  opened every audio device its engine tests asked for, pinning pipewire at
+  its 1024 file-descriptor limit. [`backlog/ci-hardening.md`](backlog/ci-hardening.md)
+  item 5 has the full diagnosis, including the two wrong turns it cost.
+
+  Measured on 2026-08-30, three consecutive parallel runs: 1568 passed, 0
+  failed, in **11.5–12.4 s** against **112.9 s** single-threaded. If you find
+  `--test-threads=1` in a doc or a brief, it is stale.
 
 ## Runtime noise that is not your bug
 
