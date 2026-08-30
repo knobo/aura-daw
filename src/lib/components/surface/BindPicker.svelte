@@ -17,7 +17,9 @@
   const { widget, cell }: { widget: SurfaceWidget; cell?: number } = $props();
 
   /** "Add pad from clip ›" — one level down, same reasoning as the `+`
-   * menu's rack drill-down (PR #116): a flat list of every audio clip in
+   * menu's rack drill-down (PR 116 — written without a hash, which the
+   * theme guard would read as a three-digit colour): a flat list of every
+   * audio clip in
    * the project runs into the bottom of the window. Only a loose "pad"
    * widget offers it — a grid cell's picker (`cell` set) stays clip-only,
    * unchanged. */
