@@ -57,6 +57,9 @@
     let h = 0;
     let dpr = 1;
     let gradient: CanvasGradient | null = null;
+    // Signature of the last frame actually drawn; "" forces the next frame to
+    // draw. See draw() for why an unchanged frame is skipped at all.
+    let drawnSig = "";
 
     const ro = new ResizeObserver(() => {
       w = canvas.clientWidth;
@@ -65,6 +68,12 @@
       canvas.width = Math.max(1, Math.round(w * dpr));
       canvas.height = Math.max(1, Math.round(h * dpr));
       gradient = null;
+      // Writing canvas.width clears the canvas, so the picture the signature
+      // stands for is gone even though the levels behind it have not moved.
+      // Without this the meter stays blank until a level happens to change —
+      // which, stopped and silent, is never. A theme change needs no
+      // equivalent: reading theme.tokens re-runs this whole effect.
+      drawnSig = "";
     });
     ro.observe(canvas);
 
@@ -82,21 +91,15 @@
         { peak: m?.peakR ?? 0, rms: m?.rmsR ?? 0 },
       ];
 
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, w, h);
-
       const meterW = w - ledW - 3;
       const laneH = (h - gap) / 2;
 
-      if (!gradient) {
-        gradient = ctx.createLinearGradient(0, 0, meterW, 0);
-        gradient.addColorStop(0, tokens.cyanDeep);
-        gradient.addColorStop(norm(-18), tokens.cyan);
-        gradient.addColorStop(norm(-6), tokens.cyanBright);
-        gradient.addColorStop(norm(-3), tokens.magenta);
-        gradient.addColorStop(1, tokens.red);
-      }
-
+      // Advance the ballistics for both lanes BEFORE touching the canvas, so
+      // an unchanged frame can be skipped entirely. Stopped and silent, disp,
+      // rms and holdDb all sit pinned at DB_MIN within a couple of seconds and
+      // every subsequent frame would clear and refill the canvas with the
+      // identical picture — 22 tracks x 60/sec of tile uploads the compositor
+      // then has to re-raster for nothing.
       for (let i = 0; i < 2; i++) {
         const lane = lanes[i];
         const peakDb = linToDb(src[i].peak);
@@ -113,7 +116,33 @@
         } else if (now > lane.holdUntil) {
           lane.holdDb = Math.max(DB_MIN, lane.holdDb - 14 * dt);
         }
+      }
 
+      // Signature of everything the drawing below depends on, quantised to the
+      // half-pixel that actually survives to the canvas: below that the frame
+      // is visually identical, so redrawing it is pure cost.
+      const q = (db: number) => Math.round(norm(db) * meterW * 2);
+      const sig =
+        `${q(lanes[0].disp)},${q(lanes[0].rms)},${q(lanes[0].holdDb)},` +
+        `${q(lanes[1].disp)},${q(lanes[1].rms)},${q(lanes[1].holdDb)},` +
+        `${clipLatched ? 1 : 0}`;
+      if (sig === drawnSig) return;
+      drawnSig = sig;
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      if (!gradient) {
+        gradient = ctx.createLinearGradient(0, 0, meterW, 0);
+        gradient.addColorStop(0, tokens.cyanDeep);
+        gradient.addColorStop(norm(-18), tokens.cyan);
+        gradient.addColorStop(norm(-6), tokens.cyanBright);
+        gradient.addColorStop(norm(-3), tokens.magenta);
+        gradient.addColorStop(1, tokens.red);
+      }
+
+      for (let i = 0; i < 2; i++) {
+        const lane = lanes[i];
         const y = i * (laneH + gap);
 
         // track bed

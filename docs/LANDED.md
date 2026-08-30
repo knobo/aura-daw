@@ -5,6 +5,45 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## The meter canvas redrew every frame whether or not anything moved
+
+Found by profiling the webview, not from the backlog. `Meter.svelte`
+cleared and refilled its canvas on every animation frame regardless of
+whether the picture changed. Stopped and silent, the lane ballistics
+(`disp`, `rms`, `holdDb`) decay to `DB_MIN` in about two seconds and stay
+pinned there, so every frame after that drew a pixel-identical picture,
+dirtied the canvas anyway, and made the compositor re-upload its tile —
+22 tracks on screen means 22 canvases at 60/sec of work that changes
+nothing.
+
+The draw now advances both lanes' ballistics first, then compares a
+signature of what the drawing depends on (peak, rms and hold positions
+quantised to the half-pixel that survives to the canvas, plus the clip
+latch) and returns early when it matches the last frame drawn.
+Quantising rather than comparing raw dB is the point: the decay never
+settles exactly, so raw values would differ forever by amounts too small
+to see.
+
+`ResizeObserver` resets the signature, and that reset carries the
+correctness: writing `canvas.width` clears the canvas, so the picture the
+signature stands for is gone while the levels behind it have not moved.
+Without it the meter goes blank on resize and — stopped and silent, where
+no level ever changes again — stays blank.
+
+Idle web-process CPU over 25s, A/B/A against the running dev server:
+36.4%/39.8% without, 9.7%/8.5%/8.7% with.
+
+**This does not touch playback.** The meters genuinely change every frame
+there, the signature always differs, and the app still sits near 100% CPU
+with something playing. That is open, and the profile taken with the
+DMA-BUF renderer enabled points at `SkiaCompositingLayer::
+computeTransformsAndAnimations` and `TextBoxPainter`/`RenderBlock::paint`
+— text being repainted and layers recomposed every frame — as where to
+look next. No playback profile has been taken yet.
+
+PR: `fix/meter-idle-redraw` → #134. The webview experiment it was found
+in is #133.
+
 ## The WebKitGTK full-viewport repaint, closed out: one real bug, one accepted platform limit
 
 Direct follow-up to #131's "duplicate meter rendering" entry below — that
