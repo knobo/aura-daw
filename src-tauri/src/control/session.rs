@@ -1680,6 +1680,18 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             };
             crate::midi::launch::runtime().set_maps(session.midi.launch_maps.clone());
             effect.persist.midi = true;
+            // A scene binding's clock is sized from the document at rebuild
+            // (`engine::scene_binding_ids`), and a press must never rebuild —
+            // so the clock has to exist before the first press. Without this,
+            // a freshly marked scene fires into `fire_scene`'s "no clock"
+            // warn and is silently dropped until some unrelated edit happens
+            // to rebuild. `LaunchMapSet` has always asked for one; this arm
+            // changes the same set of bindings and needs it for the same
+            // reason. Observed in the running app: every press of a
+            // just-created scene dropped, and the fix that appeared to work
+            // was a routing change, whose only relevant effect was the
+            // rebuild it triggered.
+            effect.rebuild = true;
             Ok(Op::LaunchBindingSet {
                 map_id: resolved_map,
                 id: id.clone(),
@@ -4180,6 +4192,12 @@ mod tests {
         .unwrap();
         assert_eq!(m.lock().midi.launch_maps[0].bindings.len(), 1);
         assert!(c.effect.persist.midi);
+        // A scene binding's clock is sized from the DOCUMENT at rebuild
+        // (`engine::scene_binding_ids`), so a binding that arrives without
+        // one has no clock, and `fire_scene` drops the press with a warn
+        // until some unrelated edit happens to rebuild. `LaunchMapSet`
+        // already asks for one; this arm changes the same set of bindings.
+        assert!(c.effect.rebuild, "a new binding needs the rebuild that mints its clock");
         Session::transact(&m, TxMeta::user("undo"), |tx| {
             for op in c.inverses.clone() {
                 tx.apply(op)?;
