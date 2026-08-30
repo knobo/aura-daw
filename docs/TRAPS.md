@@ -474,18 +474,29 @@ session burns an hour on something a sentence would have prevented.
   next one, check whether a rebuild happened in between before you go
   looking at the mixer.
 
-- **`--test-threads=1` is no longer needed, and costs 9x.** A parallel
-  `cargo test --lib` used to SIGSEGV rather than merely flake, and every
-  instruction in this repo carried the workaround. The cause was found and
-  fixed in #123: a libtest binary has no `AURA_SCAN_WORKER` guard, so
-  `WorkerCommand::current_exe()`'s child ran the ENTIRE suite again and
-  opened every audio device its engine tests asked for, pinning pipewire at
-  its 1024 file-descriptor limit. [`backlog/ci-hardening.md`](backlog/ci-hardening.md)
-  item 5 has the full diagnosis, including the two wrong turns it cost.
+- **`--test-threads=1` is still needed, but not for the reason every doc in
+  this repo gives.** The SIGSEGV is gone: a libtest binary has no
+  `AURA_SCAN_WORKER` guard, so `WorkerCommand::current_exe()`'s child ran the
+  ENTIRE suite again and opened every audio device its engine tests asked
+  for, pinning pipewire at its 1024 file-descriptor limit. Fixed in #123 —
+  [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 5 has the
+  diagnosis and the two wrong turns it cost.
 
-  Measured on 2026-08-30, three consecutive parallel runs: 1568 passed, 0
-  failed, in **11.5–12.4 s** against **112.9 s** single-threaded. If you find
-  `--test-threads=1` in a doc or a brief, it is stale.
+  **A second, independent problem outlived it**, and it is a flake rather
+  than a crash: `midi::launch::tests` shares a process-wide `LaunchRuntime`
+  singleton, and the `plane()` fixture's `runtime().clear_sounding()` is only
+  safe while nothing else is mid-test. Measured 2026-08-30 —
+  `cargo test --lib midi::launch::tests` at default parallelism failed **5 of
+  6** consecutive runs, a different test each time; the same module under
+  `--test-threads=1` passed every run. See `backlog/ci-hardening.md` item 8.
+
+  **Do not read a green parallel run as proof.** Three consecutive full-suite
+  parallel runs passed 1568/1568 in 11.5–12.4 s against 112.9 s
+  single-threaded, and that is what this entry originally claimed as the end
+  of the rule. It was luck: a full run spreads the launch tests across many
+  threads and the collision window narrows, while running the module alone
+  concentrates them. The 9x is real and worth having — but it costs a flake
+  the whole suite cannot reliably show you, so it is not free yet.
 
 ## Runtime noise that is not your bug
 

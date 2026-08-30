@@ -68,7 +68,9 @@ not exist. Branch min **2.01** µs — comparable only against this branch's
 own earlier sittings (1.89 at `bf0cb58`, 2.27 at round 4's, 3.26 at task
 10's), i.e. unmoved within a spread that does not travel between sittings.
 
-**`--test-threads=1` is obsolete as of the `origin/main` merge.** The
+**`--test-threads=1` is NOT obsolete — that claim, made here earlier today, was wrong.** See `docs/TRAPS.md`: #123 removed the SIGSEGV, but `midi::launch::tests`'s process-global `LaunchRuntime` singleton flakes 5 runs in 6 at default parallelism. The paragraph below is kept for its measurements, which stand.
+
+**What #123 did fix, as of the `origin/main` merge.** The
 parallel SIGSEGV was diagnosed and fixed in #123 (a libtest binary has no
 `AURA_SCAN_WORKER` guard, so the scan worker's child ran the whole suite
 again and pinned pipewire at its fd limit). Verified on this branch,
