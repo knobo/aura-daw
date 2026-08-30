@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Pad fires on press, not release | `fix/pad-fires-on-press` | 2026-08-30 | `Pad.svelte` wires `onpress` to `onclick`, so a pad sounds when you let go. |
 
 ## Next up — unclaimed
 
