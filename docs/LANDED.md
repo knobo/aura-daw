@@ -41,6 +41,37 @@ same sitting: `origin/main` 564.7 µs, branch 462.4 µs.
 PR: `feat/plan-v3-polyphony` → #137.
 → [`docs/backlog/plan-v-players.md`](backlog/plan-v-players.md)
 
+## A pad sounded when you let go of it
+
+`Pad.svelte` wired `onpress` to the button's `onclick`. A `click` does not
+fire until pointerup, and not until the browser has confirmed that both
+halves of the press landed on the same element — so hitting a pad in a
+surface pad grid started the sound on release, delayed by however long a
+finger rests on the button. Sixty to a hundred milliseconds of latency
+decided by the player, not by the code.
+
+`onpress` now fires from `pointerdown`. Two things had to come with it:
+
+- The browser still synthesises a `click` after the pointer pair, so a flag
+  set on pointerdown is consumed by that click rather than firing twice.
+- Enter and Space on a `<button>` arrive as a `click` with no pointer pair in
+  front of them, which is now the only path that fires from `click` — a pad
+  stays playable from the keyboard. `pointercancel` disarms the flag, or a
+  cancelled pointer press would swallow the next keyboard press. Both have
+  their own test.
+
+Confirmed by ear by the owner: "mye bedre".
+
+This was found while chasing pad latency generally. Two other candidates in
+that chain are untouched and unmeasured: the audio output buffer
+(`engine.rs` takes `device.default_output_config()` and never sets
+`BufferSize`, so on ALSA/PipeWire the device default can be 1024-4096 frames
+— 23-93 ms at 44.1 kHz), and the IPC and control-thread hops, which are
+probably small beside it. `pressPad` already fires its command without
+awaiting, so the ordering there was never the problem.
+
+PR: `fix/pad-fires-on-press` → #140.
+
 ## The DMA-BUF workaround was removed, and put straight back
 
 Landed as #138 and reverted the same day in #139. Recorded here because the

@@ -111,7 +111,9 @@ const TRACK: TrackState = {
 
 const CLIP = { id: "c1", name: "Verse", trackId: "t1" };
 
-/** A click on a Pad: the pointer pair for the visual, then the click that fires. */
+/** A press on a Pad. `onpress` now fires from pointerdown, but the whole
+ *  sequence is still sent — the click the browser synthesises afterwards must
+ *  not fire it a second time, and this helper is what would catch that. */
 async function pressPad(el: HTMLElement) {
   Object.assign(el, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
   await fireEvent.pointerDown(el, { button: 0, pointerId: 1 });

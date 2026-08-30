@@ -68,17 +68,43 @@
   // The pointer pair only drives the pressed visual. Firing happens on
   // `click`, which a real <button> also delivers for Enter and Space — a
   // pointerup-only pad cannot be played from the keyboard at all.
+  /** Set when a pointer has already fired this press, so the `click` that
+   *  follows the pointer pair does not fire it a second time. */
+  let firedFromPointer = false;
+
   function down(e: PointerEvent) {
     if (e.button !== 0 || disabled) return;
     pressed = true;
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
     onpointerdown?.();
+    // A pad is an instrument: it sounds on the strike, not on the release.
+    // Firing from `click` meant the note waited for pointerup AND for the
+    // browser to confirm both halves landed on the same element — tens of
+    // milliseconds decided by how long a finger rests on the button, not by
+    // anything in the code.
+    firedFromPointer = true;
+    fire();
   }
   function up(e: PointerEvent) {
     if (!pressed) return;
     pressed = false;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
     onpointerup?.();
+  }
+  function cancel() {
+    pressed = false;
+    // No `click` follows a cancelled pointer, so the guard would otherwise
+    // stay armed and swallow the next keyboard press.
+    firedFromPointer = false;
+  }
+  function click() {
+    // Enter and Space on a `<button>` arrive as a click with no pointer pair
+    // in front of them, and that is the only path left that should fire here.
+    if (firedFromPointer) {
+      firedFromPointer = false;
+      return;
+    }
+    fire();
   }
   function fire() {
     if (disabled) return;
@@ -98,8 +124,8 @@
   disabled={disabled}
   onpointerdown={down}
   onpointerup={up}
-  onpointercancel={() => (pressed = false)}
-  onclick={fire}
+  onpointercancel={cancel}
+  onclick={click}
 >
   <span class="led" bind:this={ledEl}></span>
   <span class="silk caption">{label}</span>
