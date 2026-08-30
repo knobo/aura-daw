@@ -120,7 +120,11 @@ export type SurfaceTarget =
   | { kind: "meter"; trackId: string }
   | { kind: "clipLaunch"; clipId: string }
   | { kind: "launchBinding"; bindingId: string }
-  | { kind: "pluginParam"; instanceId: string; paramId: number };
+  | { kind: "pluginParam"; instanceId: string; paramId: number }
+  /** Plan V — V2: a pad that is a player (its own playhead), not a
+   * launch-map shortcut. Consumed by `players.svelte.ts`; a different
+   * seam from `LaunchTarget::Player` (task 12's `launch-map.ts`). */
+  | { kind: "player"; playerId: string };
 
 export interface SurfaceWidget {
   id: string;
@@ -259,6 +263,8 @@ export function targetKey(target: SurfaceTarget | null | undefined): string | nu
       return `launchBinding:${target.bindingId}`;
     case "pluginParam":
       return `pluginParam:${target.instanceId}:${target.paramId}`;
+    case "player":
+      return `player:${target.playerId}`;
   }
 }
 

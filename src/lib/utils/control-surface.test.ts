@@ -411,6 +411,26 @@ describe("target keys", () => {
   });
 });
 
+describe("player targets", () => {
+  it("gives a player target a stable key distinct from a clip's", () => {
+    expect(targetKey({ kind: "player", playerId: "p1" })).toBe("player:p1");
+    expect(targetKey({ kind: "player", playerId: "p1" })).not.toBe(
+      targetKey({ kind: "clipLaunch", clipId: "p1" }),
+    );
+  });
+
+  it("accepts a player target on a pad", () => {
+    // Brief's snippet calls `blankLayout()` / `addWidget(layout, "pad")`;
+    // neither exists on this branch's API (`emptyLayout()` +
+    // `addWidget(layout, widget)`, per the neighbouring tests in this
+    // file). Using the real signatures — same assertion.
+    const layout = addWidget(emptyLayout(), unboundWidget("pad"));
+    const pad = layout.pages[0].widgets[0];
+    const bound = bindWidget(layout, pad.id, { kind: "player", playerId: "p1" });
+    expect(bound.pages[0].widgets[0].target).toEqual({ kind: "player", playerId: "p1" });
+  });
+});
+
 describe("bind options", () => {
   it("offers levels, pans and automated plugin params to a knob", () => {
     const opts = bindOptions("knob", ctx);

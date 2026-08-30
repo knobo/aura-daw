@@ -122,20 +122,30 @@ export interface LaunchSnapshot {
 }
 
 // ── players (Plan V — V2) ────────────────────────────────────────────────
-// Minimal mirror of `crate::audio::player::{Player, PlayerSource}` —
-// just enough for the launch seam (fix round 1, Critical 2) to resolve a
-// `LaunchTarget::Player`'s underlying clip. Not the full player registry
-// task 13's control surface will need.
+// Mirror of `crate::audio::player::{Player, PlayerSource, Trigger,
+// TriggerMode}`. Task 12 added just enough (`id`/`name`/`source`) to
+// resolve a `LaunchTarget::Player` back to its clip; task 13 (the control
+// surface) additionally needs `raw` (V-6's marker) and `trigger.mode`
+// (gate vs. one-shot vs. loop) to render and fire a player pad.
 
 export type PlayerSource =
   | { kind: "audioClip"; clipId: string }
   | { kind: "midiClip"; clipId: string; instrumentId?: string | null }
   | { kind: "none" };
 
+export type PlayerTriggerMode = "oneShot" | "gate" | "loop";
+
 export interface PlayerInfo {
   id: string;
   name: string;
   source: PlayerSource;
+  /** V-6: absolute — the file at unity, bypassing the source track.
+   * Optional (defaults false) so Task 12's fixtures, built before this
+   * field existed, keep type-checking — the wire form from `players_get`
+   * always carries it (Rust's `#[serde(default)]` mirrors the same
+   * default). */
+  raw?: boolean;
+  trigger?: { mode: PlayerTriggerMode };
 }
 
 export type LaunchFireOrigin = "hardware" | "drive" | "preview";

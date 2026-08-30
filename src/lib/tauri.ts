@@ -58,6 +58,7 @@ import type {
   LaunchSnapshot,
   OpenSidecarEvent,
   PlayerInfo,
+  PlayerSource,
   PluginCatalog,
   PluginCatalogPatch,
   PluginDescriptor,
@@ -516,10 +517,17 @@ export interface Backend {
   launchLearnArm?(id: string | null): Promise<void>;
   launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
 
-  // ── players (Plan V — V2, Task 9) ──
+  // ── players (Plan V — V2, Task 9; Task 13 adds fire/stop/add) ──
   /** Every player in the document. Read-only; fix round 1, Critical 2
-   * uses it to resolve a `LaunchTarget::Player` back to its clip. */
+   * uses it to resolve a `LaunchTarget::Player` back to its clip, and
+   * Task 13's `players.svelte.ts` uses it to mirror the whole registry. */
   playersGet?(): Promise<PlayerInfo[]>;
+  /** Fire a player's own playhead from 0 (frozen name, Task 9). */
+  playerFire?(playerId: string): Promise<void>;
+  /** Cut a player's playhead (frozen name, Task 9) — gate mode's release. */
+  playerStop?(playerId: string): Promise<void>;
+  /** Create a player — undoable, journaled (frozen name, Task 9). */
+  playerAdd?(source: PlayerSource, raw?: boolean, name?: string | null): Promise<PlayerInfo>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -1174,6 +1182,15 @@ class TauriBackend implements Backend {
 
   playersGet() {
     return invoke<PlayerInfo[]>("players_get");
+  }
+  async playerFire(playerId: string) {
+    await invoke("player_fire", { playerId });
+  }
+  async playerStop(playerId: string) {
+    await invoke("player_stop", { playerId });
+  }
+  playerAdd(source: PlayerSource, raw = false, name: string | null = null) {
+    return invoke<PlayerInfo>("player_add", { source, raw, name });
   }
 
   libraryScan(dir: string) {
