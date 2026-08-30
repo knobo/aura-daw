@@ -37,6 +37,7 @@
       return launch.bindings.find((b) => b.id === target.bindingId)?.name ?? `${index + 1}`;
     }
     if (target.kind === "player") return playerById(target.playerId)?.name ?? `${index + 1}`;
+    if (target.kind === "trackMute") return project.trackById(target.trackId)?.name ?? `${index + 1}`;
     return `${index + 1}`;
   }
 
@@ -63,6 +64,15 @@
       // SurfacePanel's `pressPad` for why.
       if (triggerMode(target.playerId) === "gate") return;
       void firePlayer(target.playerId);
+      return;
+    }
+    // A cell's options ARE a loose pad's (`cellOptions` is literally
+    // `bindOptions("pad", ctx)`), so a cell can name a track mute and
+    // `isLit` already lights it from the track's state. Without this arm the
+    // cell reads the mute correctly and does nothing when pressed.
+    if (target.kind === "trackMute") {
+      const tr = project.trackById(target.trackId);
+      if (tr) void surface.writeMute(target.trackId, !tr.muted);
     }
   }
 
@@ -98,7 +108,7 @@
                 ? `Assign pad ${index + 1} — now ${cellLabel(index, target)}`
                 : `Assign pad ${index + 1}`
               : target
-                ? `Play ${cellLabel(index, target)}`
+                ? `${target.kind === "trackMute" ? "Mute" : "Play"} ${cellLabel(index, target)}`
                 : "Empty pad"}
             onpress={() => {
               if (edit) surface.toggleBind(surface.cellKey(widget.id, index));
@@ -136,17 +146,29 @@
   .slot {
     position: relative;
   }
+  /* The same chip SurfacePanel's handles became: this one removes the whole
+     pad grid and was left behind by that fix, so it stayed a faint glyph on
+     a transparent ground — the shape the owner could not see at all. */
   .kill {
     position: absolute;
     top: 4px;
     right: 6px;
-    border: none;
-    background: transparent;
-    color: var(--text-faint);
-    cursor: pointer;
     z-index: 1;
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 50%;
+    background: rgb(var(--bg-sunken-rgb) / 0.92);
+    color: var(--text-mid);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
   }
   .kill:hover {
     color: var(--red);
+    border-color: var(--red);
   }
 </style>

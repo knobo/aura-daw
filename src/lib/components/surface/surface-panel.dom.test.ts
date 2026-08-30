@@ -317,6 +317,23 @@ describe("a pad grid", () => {
     expect(calls).toEqual([]); // assigning a cell is layout chrome, not a command
   });
 
+  it("mutes a track from a grid cell, because a cell's options are a loose pad's", async () => {
+    // `cellOptions` IS `bindOptions("pad", ctx)`, so a cell can name a track
+    // mute — and `isLit` already lights it from the track's state. Without a
+    // trackMute arm in `pressCell` the cell reads the mute correctly and does
+    // nothing when pressed: lit, live-looking, inert.
+    const base = unboundWidget("padGrid");
+    const cells = [...(base.cells ?? [])];
+    cells[0] = { kind: "trackMute", trackId: "t1" };
+    const widget = { ...base, cells };
+    surface.layout = addWidget(emptyLayout(), widget);
+    render(PadGrid, { widget, edit: false });
+    // Named for its track, not "1" — the label arm was missing too, so the
+    // cell was both inert AND unlabelled.
+    await pressPad(screen.getByRole("button", { name: "Mute Drums" }));
+    await vi.waitFor(() => expect(calls).toContain("mute:t1:true"));
+  });
+
   it("adds a pad from an audio clip into a cell, same as a loose pad", async () => {
     const widget = unboundWidget("padGrid");
     surface.layout = addWidget(emptyLayout(), widget);
@@ -492,6 +509,12 @@ describe("a player pad", () => {
       unboundWidget("pad", { label: "GONE", target: { kind: "player", playerId: "dead" } }),
     );
     await tick();
-    expect(screen.getByRole("button", { name: "GONE" })).toBeTruthy();
+    const pad = screen.getByRole("button", { name: "GONE" }) as HTMLButtonElement;
+    expect(pad).toBeTruthy();
+    // The ledger's ruling, and the half this test used to miss: it must LOOK
+    // unbound. Enabled, it is indistinguishable from a working pad and does
+    // nothing when pressed — silence, which is the failure this branch keeps
+    // producing.
+    expect(pad.disabled).toBe(true);
   });
 });

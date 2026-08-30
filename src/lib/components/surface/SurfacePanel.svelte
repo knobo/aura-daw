@@ -192,11 +192,16 @@
               {:else if w.kind === "pad"}
                 {@const pt = w.target?.kind === "player" ? playerById(w.target.playerId) : null}
                 {@const padLabel = w.target?.kind === "player" ? (pt?.name ?? w.label) : w.label}
+                <!-- A pad naming a player nothing has any more must LOOK
+                     unbound: left enabled it is indistinguishable from a
+                     working pad and does nothing when pressed, which is the
+                     silent failure this branch exists to stop. -->
+                {@const dead = w.target?.kind === "player" && !pt}
                 <Pad
                   label={padLabel}
                   meterTrackId={meterTrackId(w, midi.clips)}
                   lit={padLit(w)}
-                  disabled={!w.target}
+                  disabled={!w.target || dead}
                   ariaLabel={padLabel}
                   onpress={() => pressPad(w)}
                   onpointerdown={() => padPointerDown(w)}
