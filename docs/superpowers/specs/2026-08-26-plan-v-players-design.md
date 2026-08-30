@@ -213,3 +213,27 @@ opposed to per-player) modulation, which modulation §8.8 already reserves;
 scene launching across many players at once; MIDI-out from a player to
 external gear; and printing a pad performance to audio in the same pass that
 records it.
+
+## 10. Known limits, found while building V2
+
+- **Two pads on one plugin instance instantiate two plugin instances.**
+  Correct as built, not a defect to schedule: the mixer processes one live
+  node per ROW, once per block, so two rows cannot share a node without
+  double-advancing it — sharing would mean the two pads become one row,
+  which is a deck concept and a design change, not a key change. It is
+  also not a regression: two tracks sharing an `instrument_id` already
+  instantiate twice today. Consequence: a drum deck of eight pads on one
+  Zyn loads Zyn eight times and splits its state, so a param edit lands on
+  one copy. A shared-instance deck row is V3+ territory if it is ever
+  wanted.
+- **A bare MIDI pad's release is hard-cut at the tail allowance, not
+  decayed.** This is V-17(b)'s accepted consequence: `tail_frames` bounds
+  how long a row keeps running after its clock stops, and what a live
+  node holds beyond its declared latency — a synth's release — is not in
+  that number, so an unbounded tail (a pad whose instrument release
+  outlasts the allowance) is cut cleanly mid-decay. This is not new
+  harshness: an ordinary MIDI track already sounds the same way when the
+  transport stops — its release decays into a fader gated shut rather
+  than a frozen voice, which is audibly similar since either way the
+  decay does not finish. A per-instrument release allowance (or a
+  minimum guaranteed pad tail) is V3 material, not V2's to fix.

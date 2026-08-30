@@ -53,19 +53,22 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Plan V — V2: one player, real | `feat/plan-v2-players` | 2026-08-28 | Per-node clocks replace the launch overlay; `session.players[]`, ops, graph slot, `player_fire`/`player_stop`. → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md) |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
 1. **Owner ear-checks** are owed on several landed tracks. No suite
-   substitutes for them; each backlog file lists its own. The newest two
-   are the control surface's (open SURFACE, add two LPD8 racks and a
-   channel strip side by side, drag a fader, tap a pad) and G2's: one reverb on a bus, several tracks sent into it, one
-   room — then export and confirm the WAV has it.
-2. **Plan V — V2: one player, real.** `session.players[]`, ops, a graph
-   slot, audio/MIDI sources, one playhead per player,
-   `player_fire`/`player_stop`; deletes the launch overlay. V1 (PR #118)
-   landed the `MixNode` refactor this stands on and its inherited gate.
+   substitutes for them; each backlog file lists its own. The newest three
+   are Plan V — V2's (open SURFACE, put a WAV on a pad with `raw` ticked,
+   start the arrangement, hit the pad — bit-identical to browser audition,
+   playhead unmoved), the control surface's (open SURFACE, add two LPD8
+   racks and a channel strip side by side, drag a fader, tap a pad) and
+   G2's: one reverb on a bus, several tracks sent into it, one room — then
+   export and confirm the WAV has it.
+2. **Plan V — V3: polyphony.** Voice cap, choke groups, quantized start,
+   velocity → gain. V2 (PR #121) landed one player real — document, ops,
+   graph slot, `player_fire`/`player_stop`, the launch overlay retired —
+   so V3 is unblocked.
    → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md)
 3. **G3 — sidechain edges** (bass ducks the pads). The graph now has
    buses and sends; a sidechain is the third routing primitive.
@@ -82,14 +85,16 @@ sentence got written — if you find a row whose branch is gone from
    harness on a modest laptop. Only chase the insert path (§9.5's
    flamegraph) if that run says a real session breaks.
 
-6. **Dropping `--test-threads=1` — blocked on one ON-HOLD bug.** The
-   `midi_out` and `clap_host` families are fixed; the first was a product
-   bug, not a thread race (see [`docs/LANDED.md`](docs/LANDED.md)), and the
-   full parallel suite went 0 of 8 fully green to 45 of 46. What remains is
-   PR #124's `lv2_ui` PDEATHSIG test, **deliberately deferred** — either a
-   pid-reuse artefact or a real orphaned-plugin-window bug, and nobody knows
-   which. Do not start it as a job; item 7 lists what should bring it back.
-   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 7
+6. **Dropping `--test-threads=1` — blocked on two bugs, one on hold, one
+   found 2026-08-30.** The `midi_out` and `clap_host` families are fixed;
+   the full parallel suite went 0 of 8 fully green to 45 of 46. PR #124's
+   `lv2_ui` PDEATHSIG test is **deliberately deferred** — either a
+   pid-reuse artefact or a real orphaned-plugin-window bug, item 7 lists
+   what brings it back. Newly found: `midi::launch::tests` shares a
+   process-wide `LaunchRuntime` singleton across eleven tests and flakes
+   under default parallelism (failed 4 of 6 runs). Do not start either as
+   a job.
+   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) items 7–8
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
 Plan G4 (envelope-follower modulators); the native-GUI embed work;
@@ -110,7 +115,8 @@ reopening it.
 
 | Track | File |
 |---|---|
-| **Plan V — players (V2 unclaimed)** | [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md) |
+| **Plan V — players (V3 unclaimed)** | [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md) |
+| Project provenance stamp (recommendation, not claimed) | [`docs/backlog/project-versioning.md`](docs/backlog/project-versioning.md) |
 | Plugin manager (preview slot open) | [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md) |
 | Mixer graph — inserts, sends, sidechain (Plan G; G3 next) | [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md) |
 | Insert FX / PDC task list (Plan G1) | [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md) |

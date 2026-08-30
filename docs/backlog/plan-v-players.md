@@ -1,6 +1,7 @@
 # Backlog: Plan V — players (a pad that is an instrument)
 
-**Opened 2026-08-26.** V1 landed 2026-08-27 (PR #118) — V2 is unclaimed.
+**Opened 2026-08-26.** V1 landed 2026-08-27 (PR #118). V2 landed 2026-08-30
+(PR #121) — V3 is unclaimed.
 
 Design + rulings V-1…V-12: [`docs/superpowers/specs/2026-08-26-plan-v-players-design.md`](../superpowers/specs/2026-08-26-plan-v-players-design.md).
 Audit of what the engine already has: [`docs/research/13-players-and-performance.md`](../research/13-players-and-performance.md).
@@ -24,8 +25,8 @@ tracks (§8.5) and per-voice modulation (§8.8). Plan V builds those arms.
 | Cut | What | State |
 |---|---|---|
 | **V1** | `MixNode` as the compiler's input; tracks and buses become producers. Behaviour-neutral. | landed — PR #118 |
-| **V2** | One player, real: document + ops, graph slot, audio/MIDI sources, own playhead, one-shot/gate/loop, `player_fire`/`player_stop`. Retires the overlay; migrates launch bindings. | **unclaimed — start here** |
-| V3 | Polyphony: voice cap, choke groups, quantized start, velocity → gain. | blocked on V2 |
+| **V2** | One player, real: document + ops, graph slot, audio/MIDI sources, own playhead, one-shot/gate/loop, `player_fire`/`player_stop`. Retires the overlay; migrates launch bindings. | landed — PR #121 |
+| V3 | Polyphony: voice cap, choke groups, quantized start, velocity → gain. | **unblocked — start here** |
 | V4 | Per-node automation clock; modulation §8.1 ports. | blocked on V2 (V3 not required) |
 | V5 | Macros (§8.3): document rows, cycle check, surface knobs bound through them. | blocked on V4 |
 | V6 | Recording: elements + automation, V-9 target rule, V-10 lane rule, V-11 deck arm. | blocked on V3 + V4 |
@@ -70,7 +71,7 @@ clips, arm) that `MixNode` must not inherit — it does not: no `clips`
 field, no serde. If a later cut adds one, V1's guarantee is broken and V2
 inherits the hidden-track trap (research §4).
 
-## V2 — one player, real
+## V2 — one player, real (landed, PR #121)
 
 **Goal.** `session.players[]`, ops, a graph slot, and two sources: an audio
 clip (raw or processed) and a MIDI clip with its own instrument. One
@@ -88,8 +89,78 @@ playhead per player, `player_fire` / `player_stop`. The launch overlay is
   and the same pads fire the same material.
 - Undo of "add player" / "change player source" restores byte-identically.
 
-**Owner ear-check owed.** A raw WAV pad must sound bit-identical to the same
-file auditioned in the browser. Anything else means V-6 is not implemented.
+### Owner ear-check
+
+Open SURFACE, put a WAV on a pad with `raw` ticked, start the arrangement,
+hit the pad. The pad must sound bit-identical to auditioning that file in
+the browser, and the arrangement's playhead must not move. Anything else
+means V-6/V-16 is not implemented as designed.
+
+### Rulings V-13…V-16 (full text and V-17 in the design doc's ruling table, §5)
+
+| Ruling | What it says |
+|---|---|
+| **V-13** | Clock 0 is the transport, and its `on` flag is the transport's play state. "Only launched tracks render while stopped" (the old `LaunchPlayhead::exclusive`) stops being a special case: a node whose clock is off renders nothing, and when the transport is stopped clock 0 is off. |
+| **V-14** | A slot's clock binding is last-writer-wins, and released by compare-exchange. Two scenes naming the same track is expressible now that scenes are no longer singular. Stopping scene A must not steal a track that scene B has since claimed, so release compares against the clock the releaser owns. |
+| **V-15** | Players do not exist in the offline bounce. `offline::render_project` compiles `mix_nodes(&store.tracks)` — tracks only. A pad performance is not arrangement material; V-8 (recording) is the way it becomes arrangement material. This is V-2's own argument made executable. |
+| **V-16** | A raw player plays the clip's source region at unity: the source file's samples from `clip.offset` for `clip.len`, with no clip gain, no fades, no chain, centre pan, straight to master. This is what makes the owner's ear-check (bit-identical to browser audition) a real test rather than an approximate one. |
+
+V-17 (delay compensation follows where a player is routed: unpadded to
+master, compensated to a bus it feeds) is not reproduced here — it is long,
+has two load-bearing sub-clauses (send-edge compensation, and a player's
+tail outliving its trigger), and its full text is under "Rulings this plan
+adds" in
+[`docs/superpowers/plans/2026-08-28-plan-v2-players.md`](../superpowers/plans/2026-08-28-plan-v2-players.md).
+The design doc's own §10 records the two known limits V-17 and this cut
+produced.
+
+### Known gaps and deferred debts
+
+- **`idle_players_block_cost` has no cross-branch baseline, and never
+  will.** It is an `#[ignore]`d perf test this branch added (32 idle pads,
+  512-frame block, release build), and V-15 keeps players out of the
+  offline-bounce harness every other perf gate reads — so at the branch's
+  merge-base the test does not exist (0 passed, filtered out), not "passed
+  at a different number". Four sittings, all read as unmoved within this
+  harness's normal spread, but **the absolute figures do not travel between
+  sittings on this machine** — only read them against each other: 1.89 µs
+  (bf0cb58), 2.27 µs (round 4), 3.26 µs (task 10, and again identically at
+  task 12), 2.69 µs (task 14). Any future gate-runner brief for this test
+  must ask for the branch figure alone, named against these sittings for
+  context, and must not ask for a base-side figure — there isn't one.
+- **The blocks-rendered counter deferred from Task 8.** `flush_pending_for`
+  (used to gate a scene's slot release on its flush having actually run)
+  proves a render block *began*, not that a node *read* inside it — the
+  gap is sub-millisecond (one poll landing inside one callback between
+  `begin_block` and a node's read) and costs at most one missed
+  `all_notes_off`. The airtight fix is a blocks-rendered counter, a new
+  RT-visible mechanism; parked as a ci/backlog follow-up rather than
+  built at the tail of an already-long task.
+- **`loopjam.rs:913` is correct for a reason that could stop being true.**
+  Its row is `RtTrack::clips(...)` with no live node, so the rate it
+  computes reaches only `graph.rate` and nothing on that path consumes it
+  — a test there could only assert code shape, not behaviour, so none was
+  written. If that row ever gains a live node, the site goes silently
+  wrong with no test to catch it; recheck it first if a future cut adds a
+  live node to a loop-jammed row.
+- **`live_tail_frames(0)` is a debug-only guard; `recompute_tail_frames` is
+  `pub`, and a release build returns a 0 flush window if it is ever called
+  in one without a debug assertion catching the mistake first.**
+  Reachable only from test code today. Keeping the one clamp (rather than
+  a second one purely for release builds) was the right call to keep the
+  documentation honest, but the gap is real if this function ever grows a
+  second caller.
+- **Two pre-existing defects, found but not fixed (pre-existing on
+  `origin/main`, untouched by this branch's diff):**
+  - `TransportAction::Stop` releases a slot's clock in the same breath as
+    the stop, dropping the flush frame — the same class of bug V-17(b)
+    exists to prevent, just on the stop path rather than the per-block
+    strip.
+  - `stop_drive_launch` (`launch.rs:892-902`) lets a stale
+    `FireCmd::Release` cut a scene that was re-fired after the release was
+    already queued.
+  Neither is created or worsened by V2; both are candidates for a future
+  cut that revisits the stop/release paths.
 
 ## V3 — polyphony
 

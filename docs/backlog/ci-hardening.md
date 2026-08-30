@@ -358,6 +358,25 @@ PR, but two categories of tests are currently skipped rather than exercised:
    default parallelism and keep the output of any run that is not
    `test result: ok`. It took ~46 runs to see once.
 
+8. **A second, independent reason parallel `--lib` is not yet safe:
+   `midi::launch::tests` shares a process-wide singleton — found and
+   confirmed 2026-08-30, after item 5 fixed the SIGSEGV.** Eleven tests in
+   that module build a `ControlPlane` through a `plane()` fixture whose doc
+   comment already says `LaunchRuntime` is process-wide and the fixture
+   "clears it, which is what keeps these independent of each other's
+   leftovers" — true only when nothing else can be mid-test at the same
+   moment. Measured: `cargo test --lib midi::launch::tests` at default
+   parallelism failed 4 of 6 runs, a different test each time
+   (`cutting_a_running_scene_keeps_its_tracks_bound_until_the_flush_is_read`,
+   `the_drive_loops_release_edge_reads_the_ledger_and_the_clock_table`,
+   `a_scene_ending_is_announced_once`); the same module at
+   `--test-threads=1` passed 3 of 3. So dropping `--test-threads=1` needs
+   **both** item 7's PDEATHSIG call **and** this module fixed (each test
+   building its own `LaunchRuntime` instead of reaching the `runtime()`
+   singleton, or the fixture taking a lock for the module) — item 7's
+   "take it off hold" list is necessary but no longer sufficient on its
+   own.
+
 ## Why deferred
 
 Getting a first green CI pipeline landed mattered more than full coverage.

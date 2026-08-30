@@ -332,6 +332,33 @@ session burns an hour on something a sentence would have prevented.
   Drive the vite dev server with Playwright and system Chrome instead, the
   same approach [`LANDED.md`](LANDED.md)'s layout scan used ("headless
   overflow scan (Chrome, browser demo mode)").
+- **A perf harness measures only what it actually builds — check the path
+  before writing the test, not after.** Plan V's Task 14 was asked for a
+  `plugin_load_profile.rs` case measuring idle players' cost, and that file's
+  only route to an `RtGraph` is `offline::build_graph`, which never takes or
+  reads `store.players` (ruling V-15 — a pad performance is not arrangement
+  material). Verified both ways: a harness session compiled with 0 and with
+  32 players produced bit-identical output, and `offline.rs`'s own tests
+  assert production must not read them. No production change to any
+  idle-player code path could have moved such a test — it would stay green
+  whether the early-out existed, was broken, or was deleted. That is
+  "measures nothing" wearing a measurement's clothes, and it survives no
+  amount of careful writing because it is structural: the file it lives in
+  cannot see what it is meant to test. `idle_players_block_cost` (in
+  `engine.rs`, hand-building an `RtGraph`) is the only place that
+  measurement can be made, which is why it lives outside the `tests/`
+  harness. Before adding a case to an existing perf fixture, trace what that
+  fixture actually compiles the graph from.
+- **A plan written before the worktree rule can carry instructions that are
+  now dangerous — re-read them at dispatch time, don't relay them.** Plan
+  V's own Task 14 text said `git stash` / `git checkout origin/main` /
+  `git stash pop` to measure a baseline. In a worktree the stash stack is
+  shared with the main checkout and every other session working in it, so
+  that sequence is exactly what [`CLAUDE.md`](../CLAUDE.md) forbids — it
+  was caught only because the dispatcher re-read the steps instead of
+  trusting the plan verbatim. The baseline-on-`origin/main` measurement
+  belongs in a throwaway worktree (`git worktree add` to a temp path),
+  never in a stash dance inside the branch's own worktree.
 
 ## Audio engine
 
