@@ -5,6 +5,53 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## AURA does not need WebKitGTK 2.53 — it needs its own DMA-BUF workaround gone
+
+#133 built WebKitGTK 2.53.91 to re-measure #132's accepted platform limit,
+and found AURA running on Skia's software rasteriser because `main.rs`
+disables the DMA-BUF renderer. #134 fixed the idle meter redraw on top of
+that. Playback moved in neither, and this closes out why.
+
+The first pass compared 2.53.91-with-DMA-BUF against stock 2.52.3-without,
+which moves two variables at once. Filling in the missing cells reverses the
+reading:
+
+| Webview | DMA-BUF | Idle | Playback | Playback, cap=1 |
+|---|---|---|---|---|
+| 2.52.3 (ships today) | off | 101% | 103% | 102.8% |
+| 2.52.3 | on | 4.8% | 109% | 19.7% |
+| 2.53.91 | on | 8.7% | 116% | 20.2% |
+
+**2.53.91 is level with or slightly worse than the webview Ubuntu already
+ships**, on every measure. The build was worth it as an instrument — it is
+what made the software rasteriser visible — but there is nothing to adopt,
+and shipping a non-distro webview is a problem the project does not have to
+take on after all.
+
+**The idle win belongs to the workaround, not the webview**: 101% to 4.8% on
+stock 2.52.3, three lines in `main.rs`. Deliberately not made — it is gated
+on whether the white-flash bug the workaround exists for is still real, which
+only a human watching the window under a heavy AI job can answer. What
+changed is that the question now has a price on it.
+
+**Canvas count drives playback, but only on the hardware path.** With the
+renderer off, capping how many meter canvases animate changes nothing
+(102.8% vs 103%) — the whole surface is rastered on any invalidation, which
+is exactly what #132 measured. With it on, the same cap is 19.7% against
+109%. So consolidating the per-track meter canvases into one compact canvas
+per region is worth building, but only after the renderer is on; tried
+today it would have measured as worthless and been abandoned.
+
+Four negatives are recorded in the backlog file so nobody repeats them: 30 Hz
+drawing, `dpr=1` meter canvases, `WEBKIT_SKIA_ENABLE_DDL=0`, and the shipped
+`surfaceHidesTrackMeters` preference all sat inside a +/-11 noise floor. The
+redundant-frame rate under playback is only ~25%, so there is no second
+idle-style win hiding there either.
+
+PRs: `exp/webkitgtk-2.53` → #133, `fix/meter-idle-redraw` → #134,
+`perf/playback-cpu` → #136.
+→ [`docs/backlog/webview-rendering.md`](backlog/webview-rendering.md)
+
 ## The meter canvas redrew every frame whether or not anything moved
 
 Found by profiling the webview, not from the backlog. `Meter.svelte`
