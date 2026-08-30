@@ -339,6 +339,50 @@ fn make_port_id(name: &str, index: usize) -> String {
     format!("{name}#{index}")
 }
 
+/// The name half of a port id: everything before a trailing `#<digits>`.
+/// An id with no such suffix is all name, which keeps hand-written and
+/// pre-slice-1 ids working.
+pub(crate) fn port_id_name(id: &str) -> &str {
+    match id.rsplit_once('#') {
+        Some((name, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => id,
+    }
+}
+
+/// Resolve a port id against the live enumeration, tolerating an index that
+/// has shifted underneath it. Returns the enumeration index to open.
+///
+/// `ports` is `(original enumeration index, port name)` for every port whose
+/// name could be read — the index must be the one from the full `.ports()`
+/// enumeration, so that ports skipped for a `port_name()` failure do not
+/// renumber the rest.
+///
+/// **Why the index cannot be part of the identity.** `midir`'s ALSA-seq
+/// backend orders ports by client number, so a *new* port lands at the end
+/// and disturbs nothing — but a port *closing* renumbers every port after
+/// it. Measured: a virtual port sitting at `"…129:0#3"` becomes `"…129:0#2"`
+/// when an unrelated, earlier port goes away. Same client, same name, same
+/// ALSA address; only the position in a list moved. An exact-string match
+/// rejects that id, so opening a port the user picked from a listing fails
+/// with "port not found" for a port that is plainly still there.
+///
+/// So: exact match first (nothing moved — the common case, and the only
+/// path that can distinguish same-named ports), then the *unique* port
+/// carrying that name. Names can legitimately repeat on backends whose
+/// names carry no device address — two identical USB keyboards on Windows
+/// MME — and that is the only reason an index is in the id at all. There we
+/// genuinely cannot tell which was meant, so this refuses rather than
+/// silently connecting the wrong device.
+pub(crate) fn resolve_port_id(ports: &[(usize, String)], id: &str) -> Option<usize> {
+    if let Some((i, _)) = ports.iter().find(|(i, name)| make_port_id(name, *i) == id) {
+        return Some(*i);
+    }
+    let wanted = port_id_name(id);
+    let mut named = ports.iter().filter(|(_, name)| name == wanted);
+    let only = named.next()?;
+    named.next().is_none().then_some(only.0)
+}
+
 /// Enumerate the MIDI input ports currently visible to the platform backend
 /// (ALSA-seq on Linux). Creates and drops a throwaway `midir::MidiInput`
 /// client — no connection is held.
@@ -482,18 +526,20 @@ impl MidiInputManager {
 
         let midi_in = MidiInput::new("aura-midi-input").map_err(|e| e.to_string())?;
         let ports = midi_in.ports();
-        let mut found = None;
-        for (i, p) in ports.iter().enumerate() {
-            let name = match midi_in.port_name(p) {
-                Ok(n) => n,
-                Err(_) => continue, // vanished mid-enumeration; skip
-            };
-            if make_port_id(&name, i) == id {
-                found = Some((p.clone(), MidiPortInfo { id: id.clone(), name }));
-                break;
-            }
-        }
-        let (port, info) = found.ok_or_else(|| format!("MIDI input port not found: {id}"))?;
+        // A port can vanish between `.ports()` and `.port_name()`; skip it
+        // rather than failing the call, and keep the ORIGINAL index so the
+        // skip does not renumber the ports after it.
+        let named: Vec<(usize, String)> = ports
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| midi_in.port_name(p).ok().map(|n| (i, n)))
+            .collect();
+        let idx = resolve_port_id(&named, &id)
+            .ok_or_else(|| format!("MIDI input port not found: {id}"))?;
+        let name = named.iter().find(|(i, _)| *i == idx).map(|(_, n)| n.clone()).unwrap_or_default();
+        // The id stays as the caller gave it: it is what the active
+        // connection is reported and keyed by.
+        let (port, info) = (ports[idx].clone(), MidiPortInfo { id: id.clone(), name });
 
         let shared = Arc::new(ConnShared::default());
         let opened_at = Instant::now();
@@ -667,6 +713,80 @@ mod tests {
     #[test]
     fn port_id_disambiguates_same_name_different_index() {
         assert_ne!(make_port_id("USB MIDI", 0), make_port_id("USB MIDI", 1));
+    }
+
+    fn enumeration(names: &[&str]) -> Vec<(usize, String)> {
+        names.iter().enumerate().map(|(i, n)| (i, (*n).to_string())).collect()
+    }
+
+    #[test]
+    fn an_unmoved_port_resolves_by_exact_id() {
+        let ports = enumeration(&["Midi Through 14:0", "LPK25 28:0", "Hydrogen 129:0"]);
+        assert_eq!(resolve_port_id(&ports, "Hydrogen 129:0#2"), Some(2));
+    }
+
+    /// The bug this whole change exists for. `midir`'s ALSA-seq backend
+    /// orders ports by client number, so closing an EARLIER port shifts
+    /// every later port down one and invalidates its `name#index` id — for
+    /// a port that never moved. Measured on real ALSA in
+    /// `midi_out`'s `a_ports_id_still_opens_after_an_earlier_port_closes`.
+    #[test]
+    fn a_shifted_index_still_resolves_by_name() {
+        let before = enumeration(&["Midi Through 14:0", "LPK25 28:0", "Hydrogen 129:0"]);
+        let id = make_port_id("Hydrogen 129:0", 2);
+        assert_eq!(resolve_port_id(&before, &id), Some(2));
+
+        // LPK25 is unplugged. Hydrogen is still there, now at index 1.
+        let after = enumeration(&["Midi Through 14:0", "Hydrogen 129:0"]);
+        assert_eq!(
+            resolve_port_id(&after, &id),
+            Some(1),
+            "the id names a port that is plainly still present"
+        );
+    }
+
+    /// The index is a tiebreaker, and the only thing that can tell two
+    /// same-named ports apart. When it has gone stale AND the name is
+    /// ambiguous, connecting the wrong device is worse than reporting that
+    /// the port is gone.
+    #[test]
+    fn an_ambiguous_name_with_a_stale_index_refuses_rather_than_guessing() {
+        let ports = enumeration(&["USB MIDI", "Other", "USB MIDI"]);
+        // Exact match still wins while the index holds.
+        assert_eq!(resolve_port_id(&ports, "USB MIDI#2"), Some(2));
+        // Stale index, two candidates: refuse.
+        assert_eq!(resolve_port_id(&ports, "USB MIDI#7"), None);
+        // One candidate, stale index: resolve.
+        assert_eq!(resolve_port_id(&ports, "Other#9"), Some(1));
+    }
+
+    #[test]
+    fn a_port_that_is_really_gone_is_still_not_found() {
+        let ports = enumeration(&["Midi Through 14:0"]);
+        assert_eq!(resolve_port_id(&ports, "Hydrogen 129:0#2"), None);
+    }
+
+    /// A name may legitimately contain a `#`, and an id may carry no index
+    /// at all (hand-written, or persisted before the scheme existed).
+    #[test]
+    fn the_name_half_survives_a_hash_in_the_name() {
+        assert_eq!(port_id_name("Synth #2 128:0#4"), "Synth #2 128:0");
+        assert_eq!(port_id_name("Synth #2 128:0"), "Synth #2 128:0");
+        assert_eq!(port_id_name("no index here"), "no index here");
+        let ports = enumeration(&["Synth #2 128:0"]);
+        assert_eq!(resolve_port_id(&ports, "Synth #2 128:0#4"), Some(0));
+        assert_eq!(resolve_port_id(&ports, "Synth #2 128:0"), Some(0));
+    }
+
+    /// The indices handed to `resolve_port_id` are the ones from the full
+    /// `.ports()` enumeration, so a port skipped for an unreadable name
+    /// must not renumber the ports after it.
+    #[test]
+    fn a_skipped_unreadable_port_does_not_renumber_the_rest() {
+        // Index 1's name could not be read, so it is absent from the list
+        // while index 2 keeps its number.
+        let ports = vec![(0, "Midi Through 14:0".to_string()), (2, "Hydrogen 129:0".to_string())];
+        assert_eq!(resolve_port_id(&ports, "Hydrogen 129:0#2"), Some(2));
     }
 
     #[test]

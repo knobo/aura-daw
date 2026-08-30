@@ -1,6 +1,7 @@
 /** Small shared UI facts (renderer badge, right-dock tab). */
 
 import { PREF_SCHEMA } from "../prefs/schema";
+import { RAIL_WIDTH_PX } from "../utils/lane-layout";
 import { prefs } from "../prefs/prefs.svelte";
 
 export type DockTab =
@@ -32,6 +33,12 @@ export const ui = $state({
   rollHeight: 340,
   /** Right dock width, CSS px. User-dragged (left edge); session only. */
   dockWidth: 340,
+  /** Track rail width, CSS px. User-dragged (RIGHT edge — the rail is
+   * anchored to the window's left, unlike the roll and the dock); session
+   * only. Seeded from `RAIL_WIDTH_PX`, which stays the single source for
+   * the default and for the CSS fallback in app.css. Published to
+   * `--rail-width`, which is what every consumer actually reads. */
+  railWidth: RAIL_WIDTH_PX,
   /** Ctrl+P plugin quick picker overlay. */
   pluginPickerOpen: false,
 });

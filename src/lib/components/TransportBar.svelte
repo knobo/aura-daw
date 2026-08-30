@@ -38,18 +38,33 @@
   // rAF timecode — writes textContent directly, outside reactivity
   $effect(() => {
     let raf = 0;
+    let clockShown = "";
+    let barsShown = "";
     const tick = (now: number) => {
       raf = requestAnimationFrame(tick);
       if (!clockEl || !barsEl) return;
       const pos = transport.positionAt(now);
-      clockEl.textContent = formatClock(pos, transport.snap.sampleRate);
-      barsEl.textContent = formatBarsBeats(
+      // Skip the DOM write once stopped at a fixed position — an
+      // unconditional textContent write every frame was found still
+      // invalidating layout on WebKitGTK even while nothing on screen was
+      // actually changing (STANDING-CONSTRAINTS.md "No continuously-
+      // animated SVG" section).
+      const clockText = formatClock(pos, transport.snap.sampleRate);
+      if (clockText !== clockShown) {
+        clockEl.textContent = clockText;
+        clockShown = clockText;
+      }
+      const barsText = formatBarsBeats(
         pos,
         transport.snap.sampleRate,
         project.tempoBpm,
         project.timeSignature[0],
         project.timeSignature[1],
       );
+      if (barsText !== barsShown) {
+        barsEl.textContent = barsText;
+        barsShown = barsText;
+      }
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
@@ -638,6 +653,14 @@
     background: rgb(var(--bg-0-rgb) / 0.75);
     /* A recessed display window: the lip runs the other way round. */
     box-shadow: var(--bevel-inset);
+    /* .clock/.bars textContent is rewritten every frame from the rAF loop
+       below (.clock unconditionally, the whole time the app is open) —
+       containment goes HERE, not on either child directly: `contain` on
+       .clock broke its shared `align-items: baseline` with .bars (layout
+       containment gives a contained box no baseline to share), and clipped
+       the playing-state glow below at the glyph edge. This padded box has
+       room for both. */
+    contain: paint;
   }
   .clock {
     font-size: 21px;

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { MATERIAL_KEYS, TOKEN_KEYS } from "../tokens";
 import {
   AURA_DARK,
+  BRUSHED_STEEL_DARK,
+  BRUSHED_STEEL_LIGHT,
   BUILTIN_BY_ID,
   BUILTIN_THEMES,
   CONSOLE_NOIR,
@@ -96,7 +98,7 @@ describe("the flat themes", () => {
 });
 
 describe("the material layer", () => {
-  const STRENGTHS = ["bevel", "relief", "sheen", "grain"] as const;
+  const STRENGTHS = ["bevel", "relief", "sheen", "grain", "brush"] as const;
 
   it("keeps every material strength inside 0..1", () => {
     for (const theme of BUILTIN_THEMES) {
@@ -174,6 +176,78 @@ describe("the material themes", () => {
       for (const key of MATERIAL_KEYS) {
         expect(theme.tokens[key], `${theme.id}.${key}`).toBeDefined();
       }
+    }
+  });
+});
+
+describe("the Brushed Steel pair", () => {
+  const PAIR = [BRUSHED_STEEL_DARK, BRUSHED_STEEL_LIGHT];
+
+  // The one claim the pair makes. `brush` is direction; `grain` is speckle;
+  // a brushed surface with as much speckle as streak has stopped being
+  // brushed and gone back to cast metal, so the ordering is the theme.
+  it("streaks far harder than it speckles", () => {
+    for (const theme of PAIR) {
+      expect(Number(theme.tokens.brush), theme.id).toBeGreaterThan(
+        Number(theme.tokens.grain) * 3,
+      );
+    }
+  });
+
+  // It is the reason the token exists: every other built-in is a surface
+  // with no direction to it, and if one of them ever picks up a brush value
+  // the pair is no longer showing anything the others do not.
+  it("is the only built-in that is brushed at all", () => {
+    for (const theme of BUILTIN_THEMES) {
+      if (PAIR.includes(theme)) continue;
+      expect(theme.tokens.brush, theme.id).toBe("0");
+    }
+  });
+
+  // Steel is cut, not moulded. A 9px corner on a brushed face reads as
+  // painted plastic no matter what the texture underneath it says.
+  it("cuts a hard corner rather than moulding a soft one", () => {
+    for (const theme of PAIR) {
+      expect(theme.tokens.ctrlRadius, theme.id).toBe("3px");
+    }
+  });
+
+  it("is solid, not glass — a steel panel is not a window", () => {
+    for (const theme of PAIR) {
+      expect(theme.tokens.glassBlur, theme.id).toBe("0px");
+      expect(theme.tokens.glassAlpha, theme.id).toBe("1");
+      expect(theme.tokens.panelAlpha, theme.id).toBe("1");
+    }
+  });
+
+  // One lamp, the same one the knob's dot ring is lit with.
+  it("points the primary-interactive slot at its one green lamp", () => {
+    for (const theme of PAIR) {
+      expect(theme.tokens.cyan, theme.id).toBe(theme.tokens.green);
+    }
+  });
+
+  // The light half is not the dark half inverted: on it, "more raised" means
+  // lighter, and a call site asking for bg3 is asking for more raised.
+  it("runs the light half's surface ramp upward from the panel", () => {
+    const hex = (c: string) => parseInt(c.slice(1), 16);
+    const t = BRUSHED_STEEL_LIGHT.tokens;
+    expect(hex(t.bg3)).toBeGreaterThan(hex(t.bg2));
+    expect(hex(t.bg2)).toBeGreaterThan(hex(t.bg1));
+    // …and the gutter still has to be darker than the face, or the module
+    // blocks stop reading as separate objects.
+    expect(hex(t.bg1)).toBeGreaterThan(hex(t.bg0));
+  });
+
+  // Black shadows on steel read as holes punched through the panel. Both
+  // halves tint the shadow with the surface's own blue-grey; this is a
+  // decision, not a typo for #000000.
+  it("tints both shadows cool rather than leaving them black", () => {
+    for (const theme of PAIR) {
+      expect(theme.tokens.shadow, theme.id).not.toBe("#000000");
+      const h = theme.tokens.shadow.slice(1);
+      const [r, , b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+      expect(b, `${theme.id} shadow is cooler than it is warm`).toBeGreaterThan(r);
     }
   });
 });

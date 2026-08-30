@@ -34,6 +34,39 @@ session burns an hour on something a sentence would have prevented.
   and `LanePluginStrip.svelte` both hit this with `plugins.ensureParams`
   reading `paramCache`; both now follow the same
   read-then-`untrack`-the-call shape.)
+- **A CSS selector for a CHILD COMPONENT's element matches nothing.**
+  Svelte scopes styles per component, so `.metadata-row .strip { … }`
+  written in `TrackHeader.svelte` gets that file's hash while `.strip`
+  carries `LanePluginStrip`'s. The rule compiles, ships and is silently
+  ignored. It cost a measurement pass to notice — the rule was right
+  there in the file and the layout did not move. Put the rule in the
+  component that owns the element.
+- **Style the box the parent SIZES, not the box inside it.** A `.picker`
+  that is only `position: relative` is an inline box: a flex row sizes
+  the wrapper, the wrapper does not pass that width down, and the chip
+  inside renders at its own `max-width` straight across its neighbours —
+  its `text-overflow: ellipsis` never fires because the chip is never
+  narrow. Caps and floors belong on the wrapper (`inline-flex;
+  min-width: 0`), and the child gets `max-width: 100%`. Watch the
+  specificity too: `.status.outchip { max-width: 96px }` and
+  `.metadata-row .name-picker > * { max-width: 100% }` are the SAME
+  specificity, so the one further down the file wins.
+- **`flex-wrap: wrap` inside a fixed-height box does not relieve
+  pressure, it stacks content on top of the row below.** `TrackHeader`'s
+  `.header` is `height: var(--track-height)` and has to match the lane
+  column row for row, so it cannot grow. Worse, wrapping DEFEATS a
+  `min-width: 0; overflow: hidden` belt on a child: a wrapping container
+  breaks the line on an item's CONTENT width, before shrinking is ever
+  considered, so the child is never asked to shrink. Use `nowrap` and
+  give every item a floor.
+- **A flex item's automatic minimum is its min-content width, so
+  `flex-shrink` alone stops at the longest word** and then overflows.
+  `min-width: 0` is what actually lets a name ellipse — and a floor is
+  what keeps it from vanishing entirely, which it will: a chip allotted
+  0px is present in the DOM, invisible, and impossible to click.
+- **An `auto` margin eats the row's free space BEFORE `flex-grow` runs.**
+  `.metadata-lanes { margin-left: auto }` is why a `flex: 1` chip beside
+  it measured its basis and never grew.
 
 ## Backend
 
@@ -45,6 +78,17 @@ session burns an hour on something a sentence would have prevented.
   `/proc/<pid>/fd/1` and `fd/2` before assuming the guard covers it. Open
   defect, written up in [`backlog/plugin-manager.md`](backlog/plugin-manager.md).
 
+- **A `"<name>#<index>"` MIDI port id is only as stable as the port list.**
+  `midir`'s ALSA-seq enumeration is ordered by client number, so a new port
+  lands at the end harmlessly, but a port *closing* renumbers every port
+  after it. Measured: `"…129:0#3"` becomes `"…129:0#2"` when an unrelated
+  earlier port goes away, and an exact-string lookup then reports "port not
+  found" for a port that never moved. Resolve through
+  `midi_input::resolve_port_id` — the index is a tiebreaker for same-named
+  ports, never the identity. Persisted routing was always safe here
+  (`midi_out::persist` keys by name and strips the ALSA address); the hazard
+  is holding an id across anything that closes a port.
+
 - **`Session::rev` is not "the current revision" for a history guard.**
   Transient commits — `transport play`, `transport stop`, `transport set
   loop`, every mid-gesture fold — go through `transact` and bump `rev`
@@ -53,7 +97,100 @@ session burns an hour on something a sentence would have prevented.
   → `UndoPath::head()`) is the value that means "the history has not moved";
   it is what `history_undo_to` guards on.
 
+- **AURA's `PATH` reaches plugin UI children, and the sidecar venv on it
+  breaks them.** `run-aura` prepends `.venv-sidecars/bin` (correct — the AI
+  sidecars need it), but a plugin that runs a Python UI inherits that
+  `PATH`. Carla's does: `/usr/lib/lv2/carla.lv2/resources/carla-plugin` is
+  `#!/usr/bin/env python3`, so it picks up `.venv-sidecars/bin/python3`,
+  which has no PyQt5 — that is the apt package `python3-pyqt5`, installed
+  only for `/usr/bin/python3`. It dies on the import and **no window ever
+  appears**. Same shape as the pyenv trap, different venv.
+
+  What makes it expensive is that the symptom points elsewhere. AURA's own
+  line is `lv2 ui: …carlarack has no osc_port yet; showInterface window may
+  stay empty`, which is true and irrelevant — `osc_port` is Zyn's
+  mechanism. The cause is a bare `ModuleNotFoundError: No module named
+  'PyQt5'` further up the log, unprefixed, because it is a child's raw
+  stderr. Read the whole log, not our own WARN lines, before concluding a
+  plugin "has no GUI".
+
+- **Xlib's DEFAULT error handler calls `exit(1)`.** X errors are also
+  ASYNCHRONOUS, so both halves of that bite. Any code that acts on a window
+  id discovered in a previous round trip — `wm_stack`'s `xdotool` search is
+  ours — can hand the server an id that has since died, and the process
+  simply vanishes: rc=1, no panic, no signal, no core, just
+  `X Error of failed request: BadWindow` on stderr. Under a parallel test
+  run it looks like a flaky harness; in the app it is the session's unsaved
+  work. `x11ewmh::Display` now installs a handler for its own connection.
+  If you add one anywhere else, note the second half: an error is delivered
+  when the connection is next read, so restoring the previous handler and
+  syncing afterwards protects NOTHING. Sync first, restore second —
+  measured both ways.
+
+  The race is much wider than "a millisecond": discovery shells out, so
+  between `windows_of_pid` returning an id and the X call landing on it
+  there are 2–3 process spawns. Measured on the owner's box, `xdotool
+  search` alone is **70 ms** and `getwindowname` 7 ms — call it ~80 ms of
+  exposure per restack. Rare enough to look like chance, frequent enough
+  to happen.
+
+- **`libc` is not required to call a libc function.** `prctl`, `getppid`
+  and friends live in the glibc every Rust binary on this target already
+  links, so a bare `extern "C"` block reaches them — which is how
+  `plugins/lv2_ui.rs` and `plugins/wm_stack.rs` do it. `ci-hardening.md`
+  had `PR_SET_PDEATHSIG` recorded as blocked on the frozen `Cargo.toml`
+  for weeks on the strength of "needs the `libc` crate", which was never
+  tested. Before parking work on a frozen manifest, try linking it.
+
+- **Project-open time is almost entirely one thing: plugin instantiation,
+  not project loading.** `plugins::state::reactivate_restored_with_progress`
+  instantiates every restored instance SERIALLY and SYNCHRONOUSLY through
+  `plugin_main().run(...)` (`host.rs`'s `recv_timeout(30s)`), and the FIRST
+  LV2 instance in the process pays for `livi::World::new()` — a full
+  system-wide LV2 bundle scan (326 hostable plugins on this box). Measured
+  restoring a 6-plugin project on this machine: `plugins adopted in 2221 ms`
+  against `project opened in 2247 ms total` — every other stage is 0–21 ms.
+  It is not a hang and there is no bug to chase; it is unparallelised
+  first-touch work with no cache across process starts, paid again on
+  every launch.
+
+- **The audio sample cache is in-memory only and is never persisted.**
+  `AudioEngine::ensure_loaded` re-decodes every clip's WAV from disk on
+  EVERY process start. Waveform pyramids ARE cached on disk, under
+  `<project>/cache/waveforms/` — the decoded samples backing them are not.
+  It also runs on the engine control thread AFTER `open_project` has
+  already returned, which is exactly why "await the open command" could
+  never have reported it: measured, `media: prepared 6 file(s)/clip(s) in
+  2121 ms` lands entirely outside the 2247 ms the open command itself
+  took. PR #130's `project://media-progress` event now carries it to the
+  UI, but nothing about the wait itself got shorter.
+
+  Both numbers above came from a log, not a debugger: the `open:` and
+  `media:` `log::info!` lines PR #130 added are permanent, not scaffolding
+  — a slow start is now diagnosable by reading a log, without reproducing
+  it live.
+
+
 ## Tests
+
+- **A test that drives `SharedRt::position` from its own thread is asserting
+  about the scheduler.** The `midi_out` loopback tests spawn a 2 ms loop that
+  advances `position` in wall-clock time. Spawn it before `open_port` and it
+  free-runs through the enumeration and connection, so a note at tick 0 is
+  gone before the output thread's first tick — the trace shows note-OFFs
+  with no note-ONs. Wait for `PortStatus::note_snapshots > 0` before letting
+  position move, and wait for the bytes you are asserting on rather than
+  sleeping a round number. Under enough load the same loop is descheduled
+  past the drift tolerance and the clock resyncs, which releases notes on
+  its own — a test that needs "no resync happened" cannot be made reliable,
+  only honest about when it cannot conclude.
+
+- **`plugin_main()` is one process-wide FIFO queue, shared by every CLAP and
+  LV2 test.** A `post`-then-sleep test is guessing at how much work other
+  tests have queued, and LV2 instantiation is slow enough to make the guess
+  wrong: one clap_host test failed 3/3 beside `plugins::lv2_host::` and
+  passed 3/3 beside `plugins::clap_host::` alone. `plugin_main().run(|_| ())`
+  is a barrier on the same channel — use it instead of a duration.
 
 - **Before any new `*.dom.test.ts`**, read
   [`2026-08-18-dom-test-environment.md`](superpowers/plans/2026-08-18-dom-test-environment.md).
@@ -73,9 +210,69 @@ session burns an hour on something a sentence would have prevented.
   formatting instead of the plain `toFixed(2)` you were expecting — pick
   a fixture name without those substrings unless you're testing the
   frequency path on purpose.
-- **Parallel `cargo test` intermittently SIGSEGVs** (Cardinal CLAP
-  teardown). Use `-- --test-threads=1`. Never run `cargo test` and `tauri
-  dev` against the same `src-tauri/target/`.
+- **A libtest binary must never be re-executed as a subprocess worker.**
+  `plugins::scan_worker::WorkerCommand::current_exe()` re-runs the current
+  binary and depends on the `AURA_SCAN_WORKER` guard in `src/main.rs` to
+  route the child into `worker_main`. A libtest binary has no such guard,
+  so the child runs **the whole suite again**, and the parent BLOCKS until
+  that suite ends: every line the child prints resets `LINE_TIMEOUT`, and a
+  running suite prints constantly, so the timeout never fires. Meanwhile the
+  recursive suite opens every audio device its engine tests ask for.
+
+  **What made it invisible for weeks** is worth knowing before you build any
+  subprocess worker: the worker env is INHERITED, so the recursive suite's
+  own hidden worker case ran the worker body and returned correct
+  descriptors. The parent got the right answer — after running the suite
+  twice to get it — so no test failed and no log complained. The only thing
+  that separates a scan from a suite is how many tests the child ran; that
+  is what the regression test asserts.
+
+  Fixed under `cfg(test)` (2026-08-28). **The same trap is live for
+  integration test binaries**, which link the lib without `cfg(test)`, and
+  there it fails the opposite way: `tests/plugin_load_profile.rs` has no
+  hidden worker case, so its child runs its own seven gated tests, returns
+  in 3.5 ms with no NDJSON at all, and the parent aborts the CLAP scan
+  ("worker made no progress") — `scan_all()` silently loses every CLAP
+  plugin. If you add a subprocess worker of any kind, ask what happens when
+  the parent is libtest.
+- **A SIGSEGV inside `libpipewire` is not your memory bug — count the
+  daemon's file descriptors first.** `pipewire` and `wireplumber` run under
+  systemd's `LimitNOFILESoft=1024`. A test process holding ~25 concurrent
+  engine streams gets close on its own; anything that multiplies that
+  reaches it, and at `EMFILE` the daemon cannot finish a client handshake,
+  wireplumber dies with SIGSEGV, and YOUR process segfaults inside
+  `libpipewire-module-protocol-native.so` on the broken connection. The
+  faulting thread is called `alsa-pipewire` and no AURA frame appears in
+  its stack. Two commands settle it in a minute:
+
+  ```sh
+  grep 'open files' /proc/$(pgrep -x pipewire)/limits
+  while :; do ls /proc/$(pgrep -x pipewire)/fd | wc -l; sleep 0.2; done
+  ```
+
+  A clean parallel `--lib` run peaks around 578 against that 1024. Reaching
+  1024 means something is multiplying the streams, not that the audio path
+  is corrupt. `journalctl --user -u pipewire -u wireplumber` says
+  `Too many open files` outright. Recovery when the server is left wedged
+  (`pactl info` hangs): `systemctl --user restart wireplumber
+  pipewire-pulse pipewire`, then re-check `pactl get-default-sink` — it can
+  flip to Bluetooth.
+- **`PULSE_SINK` does not redirect this app's audio, whatever CONTRIBUTING
+  used to imply.** ALSA's `default` PCM resolves to the **pipewire** plugin
+  here (`libasound_module_pcm_pipewire.so` — you can see it in a backtrace,
+  and clients show up as `PipeWire ALSA [<binary>]`), and the pulse client
+  variable is never consulted on that path. To pin a sink for a test run,
+  override the PCM instead:
+
+  ```sh
+  # asound-pin.conf
+  </usr/share/alsa/alsa.conf>
+  pcm.!default { type pipewire playback_node "alsa_output.pci-…analog-stereo" }
+  ```
+
+  `ALSA_CONFIG_PATH=asound-pin.conf cargo test …`. Verified 2026-08-28.
+- **Never run `cargo test` and `tauri dev` against the same
+  `src-tauri/target/`.**
 - **Do not run `cargo fmt`.** This tree is not rustfmt-default-formatted:
   `cargo fmt --check` wants to rewrite ~40 files it has no business in,
   and nothing gates on it: `.github/workflows/tests.yml` runs no fmt check
@@ -129,6 +326,12 @@ session burns an hour on something a sentence would have prevented.
   no longer exists — which happened here, with `apply_fader` and
   `apply_fader_into` sitting side by side. `rm -rf target/criterion` before a
   run whose numbers you intend to publish.
+- **`import -window` / `xwd` screenshots of the AURA window come back
+  blank white on this Xwayland box, whatever is actually on screen** — they
+  are not evidence about the UI, so do not read one as "nothing rendered".
+  Drive the vite dev server with Playwright and system Chrome instead, the
+  same approach [`LANDED.md`](LANDED.md)'s layout scan used ("headless
+  overflow scan (Chrome, browser demo mode)").
 
 ## Audio engine
 

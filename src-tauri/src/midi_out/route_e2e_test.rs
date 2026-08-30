@@ -578,9 +578,16 @@ fn a_persisted_route_survives_a_new_alsa_client_number() {
 
     let routes = out.routes();
     let got = routes.get(&RouteScope::Track("t-1".into()));
+    // Compare NAMES, not ids. What this test is about is the address inside
+    // the name — `999:0` in the file against the live one. The `#<index>`
+    // half of an id is a position in an enumeration that any port closing
+    // anywhere renumbers, so `adopt_project` re-resolving from a later
+    // enumeration than the one `target` came from can legitimately land on a
+    // different index for the same port. Asserting on it made this test fail
+    // 2 runs in 10 under parallel `midi_out::`.
     assert_eq!(
-        got.map(|t| t.port_id.as_str()),
-        Some(target.id.as_str()),
+        got.map(|t| crate::midi_input::port_id_name(&t.port_id)),
+        Some(crate::midi_input::port_id_name(&target.id)),
         "the route resolved to the device at its NEW address: {routes:?}"
     );
 

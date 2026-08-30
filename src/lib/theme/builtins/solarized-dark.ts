@@ -54,5 +54,7 @@ export const SOLARIZED_DARK_TOKENS: ThemeTokens = {
   relief: "0.4",
   sheen: "0.25",
   grain: "0.06",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "5px",
 };

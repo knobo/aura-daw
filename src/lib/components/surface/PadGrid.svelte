@@ -76,7 +76,7 @@
     border-radius: calc(var(--ctrl-radius) + 4px);
     background-color: var(--bg-1);
     background-image: var(--sheen-face);
-    box-shadow: var(--bevel-raised), var(--relief-2);
+    box-shadow: var(--bevel-frame), var(--relief-2);
   }
   .pads {
     display: grid;

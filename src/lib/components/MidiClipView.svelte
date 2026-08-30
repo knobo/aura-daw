@@ -18,6 +18,7 @@
   import { clipSelection } from "../state/clip-selection.svelte";
   import { clipDrag } from "../state/clip-drag.svelte";
   import { selectionModeFor } from "../utils/selection-modifiers";
+  import { uiZoomFactor } from "../utils/ui-zoom";
   import { focusAndSelect } from "../utils/focusAndSelect";
 
   let { clip, track }: { clip: MidiClip; track: TrackState } = $props();
@@ -139,11 +140,18 @@
 
   const EDGE_PX = 8;
 
+  /** rect/clientX are VISUAL px; EDGE_PX is meant as a LAYOUT-px hit zone
+   * (so it scales with the UI like everything else under zoom) — divide
+   * out the interface zoom before comparing. */
+  function isNearRightEdge(rect: DOMRect, clientX: number): boolean {
+    return (rect.right - clientX) / uiZoomFactor() <= EDGE_PX;
+  }
+
   let hoverEdge = $state(false);
   function updateHoverEdge(e: PointerEvent) {
     if (dragging) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    hoverEdge = rect.right - e.clientX <= EDGE_PX;
+    hoverEdge = isNearRightEdge(rect, e.clientX);
     clipDrag.edgeHoverActive = hoverEdge;
   }
 
@@ -166,13 +174,12 @@
     midi.select(clip.id);
     project.select(null);
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const nearRightEdge = rect.right - e.clientX <= EDGE_PX;
-    dragMode = nearRightEdge ? "resize" : "move";
+    dragMode = isNearRightEdge(rect, e.clientX) ? "resize" : "move";
     // Which half of the clip the gesture started in, decided by geometry
     // rather than by e.target: the capture below retargets the following
     // click/dblclick to this element, and the name tag is a 9px-tall hit
     // target nobody can reliably hit anyway.
-    downOnHeader = e.clientY - rect.top <= HEADER_PX;
+    downOnHeader = (e.clientY - rect.top) / uiZoomFactor() <= HEADER_PX;
     clipDrag.begin(ref, e.clientX, dragMode);
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   }

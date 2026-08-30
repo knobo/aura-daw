@@ -75,5 +75,7 @@ export const CONSOLE_NOIR_TOKENS: ThemeTokens = {
   relief: "0.9",
   sheen: "0.7",
   grain: "0.38",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "3px",
 };

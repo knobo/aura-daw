@@ -1,11 +1,11 @@
 # Themes in AURA
 
-AURA features a full, tokenised theme system supporting eleven built-in themes and user-authored JSON themes from disk. Every visual element—from UI chrome, panels, and dialogs to canvas-rendered timeline tracks, piano roll notes, and audio meters—is styled strictly through reactive theme tokens.
+AURA features a full, tokenised theme system supporting thirteen built-in themes and user-authored JSON themes from disk. Every visual element—from UI chrome, panels, and dialogs to canvas-rendered timeline tracks, piano roll notes, and audio meters—is styled strictly through reactive theme tokens.
 
 A theme controls two independent things. Its **palette** says what colour a
 surface is. Its **material** says what that surface is made of — milled
-aluminium, moulded plastic, or flat vector — and that is what makes one
-palette shippable as both a flat theme and a hardware theme. See §6.
+aluminium, brushed steel, moulded plastic, or flat vector — and that is what
+makes one palette shippable as both a flat theme and a hardware theme. See §6.
 
 ---
 
@@ -21,7 +21,7 @@ Theme switching is instantaneous: tokens update reactively across the entire app
 
 ## 2. Built-in Themes
 
-AURA ships with eight built-in themes:
+AURA ships with thirteen built-in themes:
 
 1. **AURA Dark** (`aura-dark`): The default house dark theme with deep obsidian backgrounds, signature cyan and magenta highlights, subtle glassmorphism, and glow affordances.
 2. **AURA Light** (`aura-light`): The house palette adapted for daytime and bright environments, using crisp light surfaces and darkened accent tones that clear WCAG AA contrast.
@@ -33,7 +33,9 @@ AURA ships with eight built-in themes:
 8. **Gruvbox Dark** (`gruvbox-dark`): Retro warm groove palette with earthy backgrounds and pastel accents.
 9. **Console Noir** (`console-noir`): The flagship material theme — a machined outboard rack unit in bead-blasted graphite, with an amber lamp as the primary interactive colour instead of a neon glow. Solid panels, deep bevels, heavy grain.
 10. **Rack Slate** (`rack-slate`): Cool steel modules on a dark gutter, lit by one orange lamp — the front-panel idiom, where the window is a grid of separate module blocks rather than one flat surface. The theme the `.module` layout language (§7) was tuned against.
-11. **Studio Ivory** (`studio-ivory`): The light half of the material pair — cream injection-moulded plastic with softer corners, a satin sheen, and a warm brown shadow rather than a black one.
+11. **Studio Ivory** (`studio-ivory`): The light half of the moulded-plastic pair — cream injection-moulded plastic with softer corners, a satin sheen, and a warm brown shadow rather than a black one.
+12. **Brushed Steel Dark** (`brushed-steel-dark`): A dark-anodised steel front panel under one green lamp. The theme the `brush` token (§6) exists for: long fine horizontal streaks with almost no speckle over them, hard 3px corners, and the LED green the knob's dot ring is lit with in the primary-interactive slot.
+13. **Brushed Steel Light** (`brushed-steel-light`): The same panel in bare stainless under a bright room. Not the dark half inverted — the surface ramp runs upward, the cast shadow is shallower, the glow all but goes out, and the sheen is held *below* the dark half's because a white dome highlight on a near-white face reads as plastic rather than as metal.
 
 ---
 
@@ -71,13 +73,14 @@ User themes are standard JSON files. The filename stem (e.g. `midnight-neon.json
     "relief": "0.8",
     "sheen": "0.6",
     "grain": "0.3",
+    "brush": "0",
     "ctrlRadius": "3px",
     "panelAlpha": "1"
   }
 }
 ```
 
-The last five keys are the material layer (§6). Because material is
+The last six keys are the material layer (§6). Because material is
 independent of palette, that block alone turns any theme it is pasted into
 from a flat one into a hardware one — the colours need not change at all.
 
@@ -169,7 +172,7 @@ surface in the app — so unlike the `glassBlur`/`glassAlpha` pairing, which a
 theme can still get wrong and which a test has to police, this one cannot be
 got wrong at all.
 
-The five **material** tokens (`bevel`, `relief`, `sheen`, `grain`,
+The six **material** tokens (`bevel`, `relief`, `sheen`, `grain`, `brush`,
 `ctrlRadius`) validate on this same path but are documented on their own
 in §6, since they are tuned as a set rather than one at a time.
 
@@ -181,9 +184,9 @@ Pair `glassAlpha: "1"` with `glassBlur: "0px"`. A panel that is translucent but 
 
 ## 6. Material Tokens
 
-The five material tokens describe how a surface catches light. They are
+The six material tokens describe how a surface catches light. They are
 deliberately orthogonal to the palette: changing them restyles every control
-in the app without touching a single colour, and setting all four strengths
+in the app without touching a single colour, and setting all five strengths
 to `0` gives exactly the flat look AURA had before they existed.
 
 The virtual key light is fixed at top-centre — the angle every real front
@@ -196,20 +199,30 @@ casts downward, and a recessed well is that same edge inverted.
 | `relief` | `0`–`1` | Depth of the shadow a raised element CASTS on the panel behind it. Separate from `bevel` because a thick-edged button lying flat on a panel and a thin card floating above it are different objects. |
 | `sheen` | `0`–`1` | Strength of the specular gradient down a face — the sweep of reflected light that makes a knob cap read as domed rather than as a circle. |
 | `grain` | `0`–`1` | Opacity of the micro-texture overlay: the fine speckle of bead-blasted metal or moulded plastic. The single cue that most separates "photograph of hardware" from "rectangle with a gradient". |
+| `brush` | `0`–`1` | Strength of the *anisotropic* streak of brushed metal — the long fine horizontal scratches a wire wheel leaves. Its own token rather than a mode of `grain` because the two are different finishes and a real panel carries both: bead-blasted metal is speckled and not brushed, brushed steel is streaked and only faintly speckled, moulded plastic is neither. |
 | `ctrlRadius` | a length | Corner radius of controls. A length rather than a strength, because hard-edged rack gear and soft-cornered consumer plastic differ here and nowhere else. |
 
 ### Built-in material at a glance
 
-| Theme | `bevel` | `relief` | `sheen` | `grain` | `ctrlRadius` |
-|---|---|---|---|---|---|
-| AURA Dark | 0.4 | 0.55 | 0.3 | 0.1 | 6px |
-| AURA Light | 0.35 | 0.4 | 0.35 | 0.08 | 6px |
-| Console Noir | 0.95 | 0.9 | 0.7 | 0.38 | 3px |
-| Studio Ivory | 0.85 | 0.65 | 0.55 | 0.28 | 9px |
-| High Contrast (both) | 0 | 0 | 0 | 0 | 4px |
-| Solarized (both) | 0.3 | 0.35–0.4 | 0.25–0.3 | 0.06 | 5px |
-| Nord | 0.35 | 0.45 | 0.3 | 0.08 | 6px |
-| Gruvbox Dark | 0.45 | 0.5 | 0.28 | 0.16 | 4px |
+| Theme | `bevel` | `relief` | `sheen` | `grain` | `brush` | `ctrlRadius` |
+|---|---|---|---|---|---|---|
+| AURA Dark | 0.4 | 0.55 | 0.3 | 0.1 | 0 | 6px |
+| AURA Light | 0.35 | 0.4 | 0.35 | 0.08 | 0 | 6px |
+| Brushed Steel Dark | 0.9 | 0.8 | 0.6 | 0.14 | 0.85 | 3px |
+| Brushed Steel Light | 0.8 | 0.6 | 0.45 | 0.12 | 0.6 | 3px |
+| Console Noir | 0.95 | 0.9 | 0.7 | 0.38 | 0 | 3px |
+| Studio Ivory | 0.85 | 0.65 | 0.55 | 0.28 | 0 | 9px |
+| High Contrast (both) | 0 | 0 | 0 | 0 | 0 | 4px |
+| Solarized (both) | 0.3 | 0.35–0.4 | 0.25–0.3 | 0.06 | 0 | 5px |
+| Nord | 0.35 | 0.45 | 0.3 | 0.08 | 0 | 6px |
+| Gruvbox Dark | 0.45 | 0.5 | 0.28 | 0.16 | 0 | 4px |
+
+The `brush`/`grain` pair is the one place a theme can contradict itself
+without anything looking broken: raise the speckle to match the streak and
+the finish quietly goes back to cast metal. A test holds the Brushed Steel
+pair's `brush` well above its `grain` for that reason, and holds every other
+built-in's `brush` at exactly `0` — the token has to be showing something the
+others do not, or the pair is just two more palettes.
 
 ### Writing CSS against the material
 
@@ -222,7 +235,9 @@ a raised thing look like" decision is made:
 | `--bevel-raised` / `--bevel-inset` | The lit/shadowed lips of a face, and the same inverted for a well. |
 | `--relief-1` / `--relief-2` / `--relief-3` | Cast shadow at three heights: sitting on, lifted off, floating above. |
 | `--sheen-face` / `--sheen-dome` | The specular sweep down a flat face, and across a dome. |
+| `--bevel-frame` / `--bevel-frame-inset` | The four-sided moulded rim of a BOX — an instrument rack, a module, a channel strip — as opposed to `--bevel-raised`'s two lips. See below. |
 | `--grain-tex` | The tiling speckle texture, applied at `opacity: var(--grain)`. |
+| `--brush-tex` | The tiling streak texture, applied at `opacity: var(--brush)`. |
 
 So a control writes:
 
@@ -238,7 +253,19 @@ So a control writes:
 }
 ```
 
-and inherits every theme's material for free. `app.css` also ships `.raised`,
+and inherits every theme's material for free.
+
+**Two lips or four.** `--bevel-raised` lights the top edge and shadows the
+bottom one, which is right for a control that is small enough to read as a
+face. At the size of a *box* — an instrument rack, a module block, a channel
+strip — two horizontal lips read as a card with a highlight, while all four
+read as a bezel you could get a fingernail under: the vertical pair is what
+the eye uses to decide an object has thickness. `--bevel-frame` is that rim,
+`--bevel-frame-inset` is the same thing routed into the surface instead of
+standing on it, and at `bevel: 0` every colour in both is fully transparent,
+so a flat theme is untouched by either.
+
+`app.css` also ships `.raised`,
 `.inset` and `.grain` utility classes for markup written against the system
 from the start — but note that a Svelte component's scoped selectors outrank
 a bare global class, so an existing component opts in through the composite
@@ -249,12 +276,17 @@ variables instead.
 > that utility up and Svelte's scoping does not prevent it — the element still
 > carries the bare class name. Prefix component class names.
 
+> **`.grain` owns both pseudo-elements.** The speckle is its `::after` and the
+> brushing its `::before`, so an element marked `.grain` has neither left to
+> spend. Put a component's own `::before` on an inner element instead.
+
 ### Accessibility
 
-The high-contrast themes zero all four strengths, and a test enforces it. A
-bevel is a low-contrast cue by construction and grain is literal noise across
-text, so they belong to the same family of decisions as `glassBlur` and
-`glowScale`; a theme that flattens one and not the other is half-done.
+The high-contrast themes zero all five strengths, and a test enforces it. A
+bevel is a low-contrast cue by construction, and grain and brush are literal
+noise across text, so they belong to the same family of decisions as
+`glassBlur` and `glowScale`; a theme that flattens one and not the other is
+half-done.
 
 ---
 
@@ -303,12 +335,78 @@ module to `--bg-1` and on most themes it goes level with the dock behind it
 and vanishes.
 
 Because every value is a token, the same markup is painted steel under Rack
-Slate, milled aluminium under Console Noir, and plain flat boxes under either
-high-contrast theme — no variants, no per-theme markup.
+Slate, brushed steel under either Brushed Steel, milled aluminium under
+Console Noir, and plain flat boxes under either high-contrast theme — no
+variants, no per-theme markup.
 
 ---
 
-## 8. Exporting Themes
+## 8. Meter Faces
+
+The round meters on the control surface (`Gauge.svelte`) come in four faces,
+chosen by **Preferences → Interface → Meter face**. It is a preference rather
+than a theme token because it is a reading preference, not a look: which one
+suits you depends on what you are doing with the meter, and all four are drawn
+entirely from the theme, so any of them follows whichever theme is loaded.
+
+| Face | What it is | What it is for |
+|---|---|---|
+| **LED ARC** (default) | A ring of 44 segments around a sunken well, the number inside it. | Matching the knobs — same 270° travel, same lamps, so a rack of knobs and meters reads as one instrument rather than as two widgets that happen to be round. |
+| **DIAL** | One continuous arc filling round the same well, a fine needle riding its head. | Reading a small change. A continuous arc has no step size, so it is the most precise face of the four. |
+| **LADDER** | The horizontal PPM bargraph in a routed slot. | Balancing a mix. It is the only face that is not round, and that is the point: across a row of channel strips the eye compares bar LENGTHS far faster than it compares angles. |
+| **ANALOG VU** | The swinging needle over a printed scale. | Ballistics. You see the *shape* of a transient rather than a number that already happened. |
+
+Every face carries a **peak hold** — the highest reading of the last second,
+shown ahead of the level — except ANALOG VU, which by construction cannot: a
+needle *is* the peak, and once it has fallen back the peak is gone. That is
+the one thing the original face could not show you.
+
+No face carries a colour of its own. The lamp ramp is
+`green → amber → red` off the palette at −12 dB and 0 dB, so a theme with no
+green in it is not a meter with the wrong green in it.
+
+---
+
+## 9. Strip Keys
+
+The mute / solo / arm keys on a channel strip come in two shapes, chosen by
+**Preferences → Interface → Mute / solo / arm**:
+
+| Variant | What it is |
+|---|---|
+| **KEYS** (default) | Three keys standing proud of the panel, moulded on all four sides. Lit, a key presses *in* and its legend lights with a bar along its bottom lip — the `.module.lit` idiom, where the legend carries the state and the face does not. |
+| **SEGMENTED** | One routed slot divided into three by hairlines. Lit, a segment fills solid with the legend knocked out. It reads as one switch rather than three buttons, which is the truer description: they belong to the same channel. |
+
+Three things about them are decisions rather than styling, and all three
+came out of the row that shipped before them:
+
+1. **The row is a `1fr` grid with `min-width: 0`, not three fixed widths.**
+   The old row was 3 × 28px + 2 × 4px = 92px of content inside a 76px box,
+   so the outer keys sat on the strip's own bevel. A grid item defaults to
+   `min-width: auto` — its content's width — and a `1fr` track will still
+   refuse to go under that, so the `min-width: 0` is the line that makes the
+   overflow *impossible* rather than merely unlikely.
+2. **The row keeps a margin.** Not overflowing is not the same as looking
+   right: everything else on the strip sits inside a margin (a 72px gauge in
+   a 76px box), so a key row running exactly to the padding edge is the only
+   thing on the strip touching the walls.
+3. **A compact key says A, not R.** Not because A is an industry convention
+   — it is not; most DAWs draw record-arm as a red dot and hardware surfaces
+   print REC. It is A because AURA's own track header and lane group header
+   already say A M S, and because `R` is spent: `AutomationModeSelector`
+   prints R for automation *Read*, in the same track header row. The full
+   word stays on the key's `title` and its accessible name.
+
+Neither lit state uses `--text-on-accent` for a legend on a solid accent
+fill. That token is one value per theme, and the value that reads on red does
+not read on amber. KEYS lights the legend in the accent instead; SEGMENTED
+knocks it out in `--bg-sunken`, which is safe on both a light and a dark
+theme because the well sits on the same side of the surface ramp as the
+panel, and an accent is by construction chosen to contrast with the panel.
+
+---
+
+## 10. Exporting Themes
 
 To quickly create a custom theme, navigate to **Preferences** → **Interface** and click **EXPORT CURRENT THEME…**.
 
@@ -318,7 +416,7 @@ Exporting never overwrites: if that name is taken, the next free one is used (`a
 
 ---
 
-## 9. Reloading & Error Handling
+## 11. Reloading & Error Handling
 
 - **Discovery**: When AURA launches, it scans the themes directory and registers all valid user themes. Adding or deleting a `.json` file requires restarting AURA to discover the file.
 - **Robust Validation**: The theme parser never crashes. If a file contains invalid JSON or lacks a `name`, it is skipped, and a toast notification informs you of the failure. If an individual token has an invalid color or unknown name, only that key is ignored while the rest of the theme loads safely against its base.

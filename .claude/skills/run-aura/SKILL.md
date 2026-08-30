@@ -27,6 +27,21 @@ No `.venv-sidecars` yet, or don't need real models this session? Set
 `AURA_SIDECAR_SIMULATE=1` instead — every AI worker returns deterministic
 placeholder output.
 
+**From a worktree, `npm run tauri dev` fails before it starts.** A fresh
+worktree has no `node_modules` and no `.venv-sidecars` — and `CLAUDE.md`
+requires a worktree per branch, so this is the normal case, not the edge
+one. Link both to the main checkout rather than installing a second copy
+per branch — `node_modules` is gitignored, so nothing notices either way,
+but a real copy costs an `npm ci` and a few hundred MB every time:
+
+```sh
+ln -sfn /path/to/main/checkout/node_modules   node_modules
+ln -sfn /path/to/main/checkout/.venv-sidecars .venv-sidecars
+```
+
+Share the main checkout's `CARGO_TARGET_DIR` too, or the first build in
+each worktree recompiles the world.
+
 Rust changes need a restart (no hot reload): stop the process
 (Ctrl-C / kill the pid group) and re-run the command above. Frontend-only
 changes hot-reload via Vite.

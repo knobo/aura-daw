@@ -151,6 +151,91 @@ Historical plans called this `next-prompt.md` §2.
   gets its numbers by subtraction from outside instead; §9 explains
   how.
 
+- **No continuously-animated SVG.** A WebKit Timelines capture on the
+  native (Tauri/WebKitGTK) build showed a `requestAnimationFrame` loop
+  mutating SVG attributes (`Gauge.svelte`'s needle/arc rotation, up to 44
+  segment elements) getting folded into a full-viewport repaint —
+  `quad: [0,0,3840,0,3840,1384,...]`, ~600ms per paint, on every meter
+  tick. Browser demo mode (Chromium/Gecko) hid this; only profiling the
+  real webview surfaced it. `Gauge.svelte` is now the second reference
+  shape alongside `Meter.svelte` — both fully rewritten to canvas, no SVG
+  or per-element DOM mutation left in either. SVG stays fine for static
+  vector art (icons, one-shot illustrations). Anything redrawn every
+  frame — meters, VU needles, playhead markers, gauges — is one of:
+  - **canvas 2D**, imperative draw calls inside the rAF tick (`Meter.svelte`
+    and `Gauge.svelte` are the reference shape: read the state, clear,
+    redraw, no DOM/CSSOM involved at all).
+  - **a plain HTML element moved via `style.transform`**, with
+    `will-change: transform` on it (`Timeline.svelte`'s `.marker`).
+
+  Either way the element needs `contain: paint` on the canvas itself (or
+  `contain: content` on a wrapper with non-canvas children, like
+  `Gauge.svelte`'s `.face-canvas`/`.ladder-canvas` do) so its own redraw
+  can't escape into the surrounding page even once the technique is right
+  — containment and technique are two separate fixes, verify both. Watch
+  containment doesn't clip something that's meant to bleed outside the
+  box (a glow, a baseline shared with a sibling) — `TransportBar.svelte`'s
+  clock lost its baseline alignment with `.bars` and had its playing-state
+  glow clipped this way; contained elements with a shadow/glow or a
+  baseline dependency need the containment moved to a padded ancestor
+  instead, not dropped onto the glowing element itself. If a WebKit
+  Timelines re-capture ever shows a full-page quad again, this is the
+  first section to reread.
+
+- **Guard every per-frame `textContent`/attribute write against the
+  unchanged case, always** — even one that "obviously" changes every
+  frame doesn't, the moment the thing it's showing goes idle.
+  `TransportBar.svelte`'s clock/bars and `MasterBar.svelte`'s dB readout
+  wrote `textContent` unconditionally on every rAF tick; while transport
+  is `"stopped"`, `positionAt()` returns a fixed value, so this wrote the
+  identical string 60×/sec, forever, with the app just sitting there. A
+  WebKit Timelines capture with the app fully idle (no playback, no
+  interaction) showed a full-viewport `invalidate-styles` →
+  `recalculate-styles` → `layout` → `paint` cycle repeating anyway, at the
+  same ~160ms cadence found under real interaction — the unconditional
+  write was the entire cause. Fixed with the same `if (text !== shown)`
+  guard `Meter.svelte`/`Gauge.svelte` already used; re-capturing idle
+  afterward showed zero non-paint layout events. `Pad.svelte`'s `.led`
+  brightness tick has the analogous unconditional `style.opacity =` write
+  and was NOT given this treatment — it's gated by playback/lit state
+  already and wasn't implicated by profiling, but if a future capture
+  points at it, this is the fix.
+
+- **A full-viewport paint that scales with window AREA, not with what
+  changed, is not a bug the frontend can fix.** After the SVG rewrite,
+  the containment pass, and the `textContent` fix above, idle capture
+  showed zero spurious invalidation — but resizing the Surface panel (no
+  playback) and resizing-while-playing both still produced a `paint`
+  record covering the exact full window every time, with duration
+  tracking window pixel area almost exactly (2× the area → 1.94× the
+  duration, across two captures at different window sizes). That's
+  WebKitGTK's compositor doing a full-surface raster on any invalidation
+  rather than an incremental/tile-based repaint of just the damaged
+  region — a platform/compositor characteristic, not something reachable
+  by more `contain`, `will-change`, canvas rewrites, or (seriously
+  considered and rejected — see the reasoning if this comes up again)
+  WebAssembly/SIMD: script execution was already under 5% of total time
+  across every capture in this investigation, so nothing on the
+  computation side was ever the bottleneck; the cost sits entirely in
+  rasterization, which happens identically no matter what language issued
+  the draw calls. Reaching further into this needs WebKitGTK's own
+  compositing/GPU-acceleration configuration, not application code — a
+  different, environment-level investigation.
+
+- **A `Forced Layout` entry with a stack frame from a `ResizeObserver`
+  callback that reads geometry (`offsetWidth`/`clientWidth`/
+  `getBoundingClientRect`) is usually two independent triggers landing
+  close together, not a bug on its own.** Found in
+  `TransportBar.svelte`'s `recompute()` (measures each toolbar item's
+  `offsetWidth` to decide overflow) during resize-while-playing: the
+  clock tick's legitimate per-frame `textContent` write left layout
+  dirty, and a resize-triggered `ResizeObserver` firing moments later
+  forced a synchronous flush on its `offsetWidth` read. Sub-millisecond
+  each, 17 times over 14.6s — not worth chasing given the paint cost
+  above dwarfs it by orders of magnitude, but the fix if it ever is
+  worth doing is deferring the read to the next `requestAnimationFrame`
+  rather than reading synchronously inside the observer callback.
+
 ## Tests and docs
 
 - **The dated-count convention**: any task that changes test counts

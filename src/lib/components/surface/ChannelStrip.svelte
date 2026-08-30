@@ -7,6 +7,7 @@
   import Gauge from "../controls/Gauge.svelte";
   import Knob from "../controls/Knob.svelte";
   import Lamp from "../controls/Lamp.svelte";
+  import { prefs } from "../../prefs/prefs.svelte";
 
   const {
     widgets,
@@ -27,12 +28,14 @@
     <button class="kill" type="button" title="Remove strip" onclick={() => surface.removeStrip(groupId)}>×</button>
   {/if}
   <header class="silk name">{track?.name ?? "missing"}</header>
-  <div class="lamps">
+  <div class="lamps" class:bar={prefs.values.stripKeys === "bar"}>
     {#each widgets.filter((w) => w.kind === "lamp") as w (w.id)}
       <Lamp
         on={w.lampRole === "mute" ? !!track?.muted : w.lampRole === "solo" ? !!track?.soloed : !!track?.armed}
         label={w.label}
         role={w.lampRole ?? "mute"}
+        variant={prefs.values.stripKeys}
+        compact
         ariaLabel="{track?.name ?? "track"} {w.label}"
         onclick={() => {
           if (!track || !w.lampRole) return;
@@ -96,7 +99,7 @@
     border-radius: calc(var(--ctrl-radius) + 2px);
     background-color: var(--bg-1);
     background-image: var(--sheen-face);
-    box-shadow: var(--bevel-raised), var(--relief-1);
+    box-shadow: var(--bevel-frame), var(--relief-1);
   }
   .strip.missing {
     opacity: 0.55;
@@ -108,9 +111,27 @@
     white-space: nowrap;
     color: var(--text-mid);
   }
+  /* Three equal columns of whatever is left, rather than three fixed widths
+     that have to add up. The row cannot overflow the strip at any label
+     length, which the fixed version did by 16px — see Lamp.svelte.
+
+     `margin-inline` rather than a full-bleed `width: 100%`: stopping the
+     overflow is not the same as making it look right, and a row that runs
+     exactly to the padding edge reads as badly as one that runs past it —
+     the strip's other contents (a 72px gauge in a 76px box, a narrower
+     fader) all sit inside a margin, and the key row has to sit inside the
+     same one or it is the only thing on the strip touching the walls. */
   .lamps {
-    display: flex;
-    gap: 4px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 3px;
+    align-self: stretch;
+    margin-inline: 4px;
+  }
+  /* The segmented variant is one switch, so its parts are butted together
+     and the slot's rounded ends come from the first and last key. */
+  .lamps.bar {
+    gap: 0;
   }
   .pots {
     display: flex;

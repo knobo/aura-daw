@@ -58,7 +58,7 @@
         <div class="queue silk">+{mcp.pending.length - 1} more waiting</div>
       {/if}
 
-      <div class="fuse"><div class="burn" style:width="{fuse * 100}%"></div></div>
+      <div class="fuse"><div class="burn" style:transform="scaleX({fuse})"></div></div>
 
       <div class="actions">
         <button class="deny mono" onclick={() => mcp.resolve(current.id, false)}>DENY · ESC</button>
@@ -194,9 +194,14 @@
     margin-bottom: 12px;
   }
   .burn {
+    width: 100%;
     height: 100%;
     background: linear-gradient(90deg, var(--red), var(--amber));
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.6);
+    /* Draining is a transform (scaleX from the left edge), not a width
+       rewrite — width is a layout property, transform is compositor-only. */
+    transform-origin: left;
+    will-change: transform;
   }
 
   .actions {

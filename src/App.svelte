@@ -57,6 +57,8 @@
   import { releaseRehearse, setRehearseSource } from "./lib/state/rehearse.svelte";
   import { theme } from "./lib/theme/theme.svelte";
   import { loadUserThemes } from "./lib/theme/load";
+  import { boot } from "./lib/state/boot.svelte";
+  import BootOverlay from "./lib/components/BootOverlay.svelte";
 
   onMount(() => {
     let automationRefresh: Promise<unknown> = Promise.resolve();
@@ -76,33 +78,49 @@
     });
     prefs.init(); // restore persisted preferences before anything paints or boots
     theme.bootstrap(prefs.values.theme); // paint the right colours on frame one
+    const stopBootWire = boot.wire();
+    boot.armSafetyTimeout(); // honest label if boot never reports ready (§4)
     void (async () => {
-      // Wait out the empty-session snapshot before reopening the last
-      // project — a parallel restore would race project.init() and could
-      // paint the blank slate over the adopted one.
-      await Promise.all([
-        loadUserThemes(),
-        transport.init(),
-        project.init(),
-        midi.init(),
-        instruments.refresh(),
-        plugins.refresh(),
-        automation.reload(),
-        modulation.reload(),
-        mcp.init(),
-        loopjam.init(),
-        launch.init(),
-      ]);
-      exporter.init();
-      generation.init(); // adopt jobs an agent starts over MCP
-      void startMeterStream();
-      await projectops.restoreLast();
+      try {
+        boot.setPhase("stores");
+        // Wait out the empty-session snapshot before reopening the last
+        // project — a parallel restore would race project.init() and could
+        // paint the blank slate over the adopted one.
+        await Promise.all([
+          loadUserThemes(),
+          transport.init(),
+          project.init(),
+          midi.init(),
+          instruments.refresh(),
+          plugins.refresh(),
+          automation.reload(),
+          modulation.reload(),
+          mcp.init(),
+          loopjam.init(),
+          launch.init(),
+        ]);
+        exporter.init();
+        generation.init(); // adopt jobs an agent starts over MCP
+        void startMeterStream();
+        boot.setPhase("project");
+        await projectops.restoreLast();
+        // restoreLast() resolves the same way whether it actually reopened a
+        // project or returned early (demo mode, nothing remembered, a
+        // project already open) — every one of those is a successful boot.
+        boot.finish();
+      } catch (error) {
+        // Ordering/awaited semantics above are unchanged; this only keeps a
+        // thrown boot error from leaving the overlay stuck forever.
+        boot.fail(error);
+      }
     })();
     return () => {
       stopMeterStream();
       generation.dispose();
       stopAutomationChanged();
       stopAutomationHistoryChanged();
+      stopBootWire();
+      boot.clearSafetyTimeout();
     };
   });
 
@@ -386,6 +404,7 @@
 {#if ui.pluginPickerOpen}
   <PluginQuickPick />
 {/if}
+<BootOverlay />
 
 <style>
   .app {

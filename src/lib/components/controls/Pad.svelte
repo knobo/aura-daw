@@ -134,6 +134,8 @@
     opacity: 0.12;
     box-shadow: 0 0 calc(14px * var(--glow-scale)) var(--pad-led);
     pointer-events: none;
+    /* Opacity is rewritten every frame from the rAF loop above. */
+    will-change: opacity;
   }
   .pad.lit .led {
     opacity: 1;

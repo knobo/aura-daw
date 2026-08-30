@@ -11,6 +11,7 @@
   import { openPluginParams } from "../state/plugin-panel";
   import { modulation } from "../state/modulation.svelte";
   import { ui } from "../state/ui.svelte";
+  import { prefs } from "../prefs/prefs.svelte";
   import { lanes } from "../state/lanes.svelte";
   import { library } from "../state/library.svelte";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
@@ -397,8 +398,8 @@
         <button class="del" title="Remove track" aria-label="Remove track {track.name}" onclick={() => project.removeTrack(track.id)}>×</button>
       </div>
 
-      <div class="metadata-row" role="gridcell" aria-label="Routing and FX for {track.name}">
-        <span class="picker">
+      <div class="metadata-row" class:named={track.kind === "midi" && !isAutomation} role="gridcell" aria-label="Routing and FX for {track.name}">
+        <span class="picker" class:name-picker={group !== null}>
           <!-- Owner note (2026-08-24): the word "Group" was on every lane
                whether or not the lane had one. The VALUE is the news; the
                word is what the tooltip is for. Ungrouped shows a dim
@@ -410,12 +411,22 @@
           <span class="kindchip automation-kind mono" title="Automation track — drives bindings, renders no audio">⌁</span>
         {:else if track.kind === "midi"}
           <button class="instchip mono" class:bound={!!instrument} class:plugin={!!pluginInst} class:stub={pluginInst?.status === "stub"} class:crashed={pluginInst?.status === "crashed"} title={pluginInst ? "Open plugin parameters for " + pluginInst.name : instrument ? "Open instrument browser for " + instrument.name : "Assign an instrument"} onclick={openInstrumentPanel}>
-            {#if pluginInst}Instrument · {patch?.name ?? pluginInst.name}{:else if instrument}Instrument · {instrument.name}{:else}Instrument · polysynth{/if}
+            <!-- Owner note (2026-08-24) applied to this chip too: the VALUE
+                 is the news, the word is what the tooltip is for. The
+                 "Instrument · " prefix was 13 characters of the ~5 the chip
+                 actually gets in a 298px rail, so every lane read "Inst…"
+                 and named nothing. The title still spells it out. -->
+            {#if pluginInst}{patch?.name ?? pluginInst.name}{:else if instrument}{instrument.name}{:else}polysynth{/if}
           </button>
         {:else if track.kind === "bus"}
           <span class="kindchip bus-kind mono" title="Return bus — fed by other tracks' sends and outputs">B</span>
         {:else}
-          <span class="kindchip mono" title="Audio track">A</span>
+          <!-- Nothing for a plain audio lane. "A" was on every audio track,
+               which is to say it marked the default — the same thing the
+               owner removed from the group chip and shrank the kind chip
+               for on 2026-08-24. A bus still says B and an automation lane
+               still says ⌁, because those ARE the news; the waveform in
+               the lane says "audio" better than a letter can. -->
         {/if}
         {#if !isAutomation}
           <LanePluginStrip {track} onoverflow={() => (fxPopoverOpen = true)} />
@@ -435,7 +446,7 @@
               <InsertChain {track} onclose={() => (fxPopoverOpen = false)} />
             {/if}
           </span>
-          <span class="picker">
+          <span class="picker" class:name-picker={!!track.output}>
             <button
               class="status outchip"
               class:on={outPopoverOpen}
@@ -447,7 +458,16 @@
               aria-expanded={outPopoverOpen}
               onclick={() => (outPopoverOpen = !outPopoverOpen)}
             >
-              →{outTarget ? ` ${outTarget.name}` : " MASTER"}
+              <!-- Owner note (2026-08-24) a third time: the value is the
+                   news, the word is what the tooltip is for. Every track
+                   reaches the master unless it says otherwise, so
+                   "→ MASTER" spent 57px of a 298px row saying "normal" —
+                   and the row was exactly full, so it was spending it
+                   against the instrument name. The bare arrow keeps the
+                   control findable, the way an ungrouped lane keeps a dim
+                   "GRP"; the destination reappears the moment there is one
+                   worth naming. -->
+              →{outTarget ? ` ${outTarget.name}` : ""}
             </button>
             {#if outPopoverOpen}
               <OutputPicker {track} onclose={() => (outPopoverOpen = false)} />
@@ -525,7 +545,12 @@
         </div>
 
         <div class="level-area" role="gridcell" aria-label="Level controls for {track.name}">
-          <div class="level-head"><span class="section-label mono">Level</span><Meter trackId={track.id} height={8} /></div>
+          <div class="level-head">
+            <span class="section-label mono">Level</span>
+            {#if !(prefs.values.surfaceHidesTrackMeters && ui.bottomPanel === "surface")}
+              <Meter trackId={track.id} height={8} />
+            {/if}
+          </div>
           <div class="level-controls">
             <label class="level-control gain-control">
               <span class="control-label">Gain</span>
@@ -873,6 +898,17 @@
 
   .picker {
     position: relative;
+    /* `inline-flex` with `min-width: 0`, not a bare inline box. The row
+       sizes the WRAPPER, and an inline box does not pass that width down —
+       so a shrunken `.picker` still rendered its chip at full width, and
+       the chip's own `text-overflow: ellipsis` never fired because the
+       chip was never narrow. What you saw instead was a group name drawn
+       straight across the chips beside it. */
+    display: inline-flex;
+    min-width: 0;
+  }
+  .picker > * {
+    max-width: 100%;
   }
   .tog {
     width: 20px;
@@ -916,12 +952,20 @@
     align-items: center;
     min-width: 0;
     flex: none;
-    /* A safety valve, not the layout: everything fits one line on a normal
-       lane, but a midi track carries an extra MIDI OUT control in this row
-       and a narrow lane would otherwise push the automation chips out of
-       the header entirely. */
-    flex-wrap: wrap;
-    row-gap: 2px;
+    /* `nowrap`, and it has to be. This was `flex-wrap: wrap`, called "a
+       safety valve" — but the rows sit in a `.header` of fixed
+       `var(--track-height)` (it must match the lane column row for row),
+       so a wrapped line has nowhere to go and renders straight on top of
+       the row beneath it. Measured on a grouped lane with two plugins:
+       `.metadata-row` 17px tall, scrollHeight 48, three chips landing at
+       y=52 over a `.status-row` at y=45.
+       Worse, the wrap DEFEATED the belt it was meant to back up.
+       `LanePluginStrip` already carries `min-width: 0; overflow: hidden`
+       (Ruling P-6) so a long chain gives way instead of pushing the FX
+       chip out — but a wrapping container breaks the line on an item's
+       CONTENT width, before any shrinking is considered, so the strip was
+       never asked to shrink. With `nowrap` the belt does its job. */
+    flex-wrap: nowrap;
   }
   .identity-row {
     height: 17px;
@@ -931,6 +975,10 @@
     color: var(--text-faint);
   }
   .metadata-row {
+    /* Fixed, not `min-height`: `.header` is `height: var(--track-height)`
+       and must match the lane column row for row, so a row that grows
+       overlaps the level slider below it instead of making room. Fitting
+       on one line is therefore the requirement, not a preference. */
     height: 17px;
     gap: 6px;
     padding-left: 20px;
@@ -945,13 +993,65 @@
     min-width: 48px;
     height: 17px;
   }
-  .metadata-row .groupchip {
+  /* One rule for every chip in this row that carries a NAME — the group
+     it is in, and the bus it outputs to. Both are shrinkable, both have a
+     floor, and both are governed on the WRAPPER rather than the chip.
+
+     Governing the chip does not work: the row sizes the `.picker`, so a
+     picker squeezed to 31px around a chip holding its own 96px cap drew
+     the group name straight across its neighbours (measured; it is what
+     the owner photographed first).
+
+     The floor is not decoration either. With a long group name AND an
+     output routed to a long bus name, the group chip was allotted 0px —
+     present in the DOM, invisible, and impossible to click, while the row
+     still overflowed by 11px. A control you cannot see is a control you
+     cannot use, so nothing here shrinks past a target you can hit; the
+     names ellipse instead. 38 + 38 for these two, 22 for the plugin dots
+     and 132 for the three fixed chips leaves the 288px row 58px of slack
+     even in that worst case.
+
+     Applied per-lane, not blanket: an ungrouped lane's dim "GRP" and an
+     unrouted lane's bare "→" carry no name to protect, and floored at 38px
+     they were 21px of empty box each — dead space on the calm lanes, taken
+     out of the instrument name beside them. */
+  .metadata-row .name-picker {
+    flex: 0 1 auto;
+    min-width: 38px;
     max-width: 96px;
   }
+  .metadata-row .name-picker > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+  /* Shrink priority for this row is stated in LanePluginStrip's own CSS,
+     not here: Svelte scopes styles per component, so a `.strip` selector
+     written in this file gets this component's hash and silently matches
+     nothing. It cost a measurement pass to notice — the rule was there,
+     the layout ignored it. */
+  .metadata-row .groupchip {
+    /* Shrink, and `min-width: 0` with it: a flex item's automatic minimum
+       is its min-content width, so shrinking alone would stop at the
+       longest word and start overflowing again. The cap and the floor are
+       the wrapper's job, above. */
+    flex: 0 1 auto;
+  }
   .metadata-row .instchip {
-    flex: 1;
+    /* basis 0, not auto: the chip must never be the item that decides the
+       line breaks, only the one that soaks up what is left. */
+    flex: 1 1 0;
+    min-width: 0;
     max-width: none;
   }
+  /* `.metadata-lanes` has `margin-left: auto`, and an auto margin consumes
+     the row's free space BEFORE flex-grow ever runs — which is why the
+     instrument chip measured 42px while 33px of the row sat empty beside
+     it. On a lane that has an instrument to name, the chips read as one
+     left-aligned group and the slack goes to the name instead. */
+  .metadata-row.named .metadata-lanes {
+    margin-left: 0;
+  }
+
   .kindchip {
     /* A one-letter badge now (owner note, 2026-08-24), so it sizes like
        one instead of reserving room for "Automation track". */
@@ -1047,13 +1147,24 @@
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
   }
   .status.outchip {
-    min-width: 40px;
-    max-width: 96px;
+    /* 40px is the room a destination NAME needs. Kept for `.routed` below;
+       the bare-arrow state reserves nothing, because the reservation came
+       straight out of the instrument name next to it. */
+    min-width: 0;
+    padding-inline: 5px;
+    /* `100%`, governed by `.name-picker`'s 96px cap on the wrapper. A 96px
+       cap HERE tied that rule on specificity and won on source order, so a
+       wrapper squeezed to 38px still painted a 96px chip — straight over
+       the SEND chip beside it. Caps belong on the box the row sizes. */
+    max-width: 100%;
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
   }
   .status.outchip.routed {
+    /* No `min-width` here any more — `.name-picker` owns the floor, and a
+       40px floor on the chip inside a 38px wrapper only overflowed it. */
+    padding-inline: 7px;
     color: var(--amber);
     border-color: rgb(var(--amber-rgb) / 0.45);
   }

@@ -1,12 +1,27 @@
 <script lang="ts">
   /**
-   * A rotary control that is actually a knob: a domed cap with a milled
-   * edge, a machined indicator, a ring of ticks and a value arc.
+   * A rotary control that is actually a knob: a collared cap with a raised
+   * inner dome, a single lit indicator, and a ring of LEDs for its value.
+   *
+   * The dot ring replaced a painted arc and a row of tick lines, and it is
+   * worth saying why, because an arc is less code. An arc shows you a
+   * QUANTITY; a ring of discrete LEDs shows you a POSITION ON A SCALE, and
+   * a scale is what a knob's travel actually is — you learn where two
+   * o'clock is on this control and reach for it again. The dots are also
+   * what make the unlit part of the travel visible: an arc that has not got
+   * there yet is nothing at all, while an unlit LED is still a stop you can
+   * see and aim for.
+   *
+   * The leading dot lights FRACTIONALLY (`litness` below), so the display
+   * stays continuous under a slow drag rather than stepping between 31
+   * positions. That single detail is the difference between a readout that
+   * feels like hardware and one that feels like a progress bar.
    *
    * Everything physical about it comes from the material tokens rather than
    * from constants here, so the SAME component is a milled aluminium pot
-   * under Console Noir, a moulded plastic one under Studio Ivory and a flat
-   * circle under High Contrast — no variants, no per-theme markup.
+   * under Console Noir, a moulded plastic one under Studio Ivory, a brushed
+   * steel one under Brushed Steel and a flat circle under High Contrast —
+   * no variants, no per-theme markup.
    *
    * The gesture is the one every DAW has trained people on: drag vertically
    * (never radially — radial drags lose the pointer the moment it crosses
@@ -15,6 +30,7 @@
    * range, and 200px is deliberately long: a knob you can slam end to end
    * in a flick is unusable for the 0.1 dB adjustments this is for.
    */
+  import { uiZoomFactor } from "../../utils/ui-zoom";
 
   interface Props {
     value: number;
@@ -65,10 +81,27 @@
   const SWEEP = 270;
 
   const CX = 50;
-  const R = 41;
-  const CIRC = 2 * Math.PI * R;
-  /** Arc length of the live part of the ring. */
-  const ARC = CIRC * (SWEEP / 360);
+  /**
+   * The LED ring, in viewBox units. `LED_R + LED_DOT` must stay under 50 or
+   * the outer dots are cut off by the `.knob` box, and `LED_R - LED_DOT`
+   * must stay clear of the cap: the cap is `--knob-size` inside a box of
+   * `--ring-size` (1.3×), so its rim reaches 100 / 1.3 / 2 ≈ 38.5 units.
+   * 44.1 is where the dots begin, which is the 3px gap the reference gear
+   * leaves between the cap and its collar of lamps.
+   */
+  const LED_R = 46.5;
+  const LED_DOT = 2.4;
+  /** Enough that the ring reads as a scale rather than as eight lamps, and
+   * few enough that each dot is still a dot at a 38px cap. */
+  const LEDS = 31;
+  /** Fraction of the range one dot covers. */
+  const STEP = 1 / (LEDS - 1);
+
+  /** Each lamp's angle from 12 o'clock and its position along the travel. */
+  const leds = Array.from({ length: LEDS }, (_, i) => ({
+    deg: -SWEEP / 2 + (i / (LEDS - 1)) * SWEEP,
+    at: i * STEP,
+  }));
 
   const span = $derived(max - min || 1);
   /** 0..1 position of the current value within the range. */
@@ -78,20 +111,22 @@
   const home = $derived(resetTo ?? (bipolar ? 0 : min));
 
   /**
-   * The value arc as a dash pattern. Unipolar grows from the start of the
-   * sweep; bipolar grows out of the middle in whichever direction the value
-   * went, which is why it needs the leading `0 <gap>` pair.
+   * How lit one lamp is, 0..1. Fully lit once the value has reached it, dark
+   * one step before, and linearly in between — so the head of the ring
+   * fades in as the value crosses it and the display never steps.
+   *
+   * Bipolar measures from the centre outwards rather than from the start, so
+   * a pan or a ±dB trim lights a band either side of twelve o'clock and a
+   * centred value lights exactly the middle lamp.
    */
-  const dash = $derived.by(() => {
-    if (!bipolar) return `${(frac * ARC).toFixed(2)} ${CIRC.toFixed(2)}`;
-    const from = Math.min(frac, 0.5);
-    const len = Math.abs(frac - 0.5);
-    return `0 ${(from * ARC).toFixed(2)} ${(len * ARC).toFixed(2)} ${CIRC.toFixed(2)}`;
-  });
-
-  /** Tick marks around the ring — the printed scale on the panel. */
-  const TICKS = 11;
-  const ticks = Array.from({ length: TICKS }, (_, i) => -SWEEP / 2 + (i / (TICKS - 1)) * SWEEP);
+  const lit = $derived.by(() =>
+    leds.map(({ at }) => {
+      const reach = bipolar
+        ? Math.min(at - Math.min(frac, 0.5), Math.max(frac, 0.5) - at)
+        : frac - at;
+      return Math.min(1, Math.max(0, reach / STEP + 1));
+    }),
+  );
 
   let dragging = $state(false);
   /** Pointer Y and the value when the drag began. A drag is measured from
@@ -116,8 +151,10 @@
 
   function onPointerMove(e: PointerEvent) {
     if (!dragging) return;
-    // Up is more, which is why the delta is negated.
-    const dy = originY - e.clientY;
+    // Up is more, which is why the delta is negated. clientY is VISUAL px;
+    // FULL_TRAVEL_PX is a LAYOUT-px constant — divide out the interface
+    // zoom or the knob gets more sensitive as zoom rises.
+    const dy = (originY - e.clientY) / uiZoomFactor();
     const scale = e.shiftKey ? 0.2 : 1;
     oninput?.(clamp(originValue + (dy / FULL_TRAVEL_PX) * span * scale));
   }
@@ -170,19 +207,35 @@
     onkeydown={onKeyDown}
   >
     <svg class="dial" viewBox="0 0 100 100" aria-hidden="true">
-      <g transform="rotate(135 {CX} {CX})">
-        <circle class="dial-track" cx={CX} cy={CX} r={R} stroke-dasharray="{ARC.toFixed(2)} {CIRC.toFixed(2)}" />
-        <circle class="dial-arc" cx={CX} cy={CX} r={R} stroke-dasharray={dash} />
+      <!-- The unlit ring is drawn whole and once: an LED you can see but
+           have not reached is a stop you can aim for, and it is what makes
+           the travel legible on a knob that is off. -->
+      <g class="dial-holes">
+        {#each leds as l (l.deg)}
+          <circle cx={CX} cy={CX - LED_R} r={LED_DOT} transform="rotate({l.deg} {CX} {CX})" />
+        {/each}
       </g>
-      <g class="dial-ticks">
-        {#each ticks as t (t)}
-          <line x1={CX} y1="4" x2={CX} y2="9" transform="rotate({t} {CX} {CX})" />
+      <!-- and the lit ones over them, the head of the ring part-lit. -->
+      <g class="dial-lamps">
+        {#each leds as l, i (l.deg)}
+          {#if lit[i] > 0}
+            <circle
+              cx={CX}
+              cy={CX - LED_R}
+              r={LED_DOT}
+              opacity={lit[i]}
+              transform="rotate({l.deg} {CX} {CX})"
+            />
+          {/if}
         {/each}
       </g>
     </svg>
 
-    <!-- The cap. `.grain` needs a positioned parent, which `.cap` is. -->
+    <!-- The cap. `.grain` needs a positioned parent, which `.cap` is — and
+         it owns both ::before and ::after, so the inner dome and the
+         indicator are real elements rather than pseudo-elements on it. -->
     <div class="cap grain">
+      <div class="cap-face"></div>
       <div class="pointer" style:transform="rotate({angle}deg)"></div>
     </div>
   </div>
@@ -231,34 +284,40 @@
     height: 100%;
     overflow: visible;
   }
-  .dial circle {
-    fill: none;
-    stroke-width: 5;
-    stroke-linecap: butt;
+  /* An unlit lamp is a drilled hole with a dark lens in it. `--line` rather
+     than `--shadow` so it survives on a theme whose ground already IS the
+     shadow colour — on High Contrast Dark a black dot on black is no scale
+     at all. */
+  .dial-holes circle {
+    fill: rgb(var(--line-rgb) / 0.26);
+    stroke: rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.55));
+    stroke-width: 0.7;
   }
-  .dial-track {
-    stroke: rgb(var(--line-rgb) / 0.22);
+  /* The glow is one filter over the whole group rather than one per lamp:
+     31 drop-shadows re-evaluated on every pointer move is a different
+     component. At `glowScale: 0` it collapses to the bare dots. */
+  .dial-lamps {
+    filter: drop-shadow(0 0 calc(2.5px * var(--glow-scale)) var(--knob-accent));
   }
-  .dial-arc {
-    stroke: var(--knob-accent);
-    filter: drop-shadow(0 0 calc(4px * var(--glow-scale)) var(--knob-accent));
-    transition: stroke-dasharray 40ms linear;
-  }
-  .dial-ticks line {
-    stroke: rgb(var(--line-rgb) / 0.35);
-    stroke-width: 2;
-    stroke-linecap: round;
+  .dial-lamps circle {
+    fill: var(--knob-accent);
   }
 
-  /* The cap: a dome, not a disc. The radial sheen puts the highlight up and
-     left of centre, the bevel gives it a milled rim, and the cast shadow
-     lifts it off the ring behind it. */
+  /* The cap is two parts, the way a moulded knob is: a COLLAR that meets the
+     panel, and a raised inner dome sitting in it. One disc with a gradient
+     is a circle; a disc with a second disc casting a shadow into it is an
+     object, and the ring of shadow between the two is the whole cue.
+
+     The collar is `bg-2` and the dome `bg-3` — the same "more raised is a
+     step up the ramp" reading every other surface uses, which is what makes
+     it work on a light theme, where up the ramp means lighter, without a
+     single per-theme rule. */
   .cap {
     position: relative;
     width: var(--knob-size);
     height: var(--knob-size);
     border-radius: 50%;
-    background-color: var(--bg-3);
+    background-color: var(--bg-2);
     background-image: var(--sheen-dome);
     box-shadow:
       inset 0 var(--border-width) 0 0 var(--bevel-hi),
@@ -266,6 +325,22 @@
       inset 0 0 0 calc(1px + 1px * var(--bevel)) rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.35)),
       var(--relief-2);
     transition: box-shadow 120ms, transform 120ms;
+  }
+
+  /* The inner dome. Its first shadow is cast OUTWARDS onto the collar — the
+     dark ring that separates the two — and the two lips light its own rim. */
+  .cap-face {
+    position: absolute;
+    inset: 16%;
+    border-radius: 50%;
+    background-color: var(--bg-3);
+    background-image: var(--sheen-dome);
+    box-shadow:
+      0 calc(1px * var(--relief)) calc(2px + 3px * var(--relief))
+        rgb(var(--shadow-rgb) / calc(var(--relief) * 0.55)),
+      inset 0 var(--border-width) 0 0 var(--bevel-hi),
+      inset 0 calc(-1 * var(--border-width)) 0 0 var(--bevel-lo);
+    pointer-events: none;
   }
   /* Under the thumb the cap settles into the panel — the same 1px drop the
      `.raised` utility uses, for the same reason. */
@@ -277,26 +352,29 @@
       var(--relief-1);
   }
 
-  /* The indicator is a machined slot, so it is lit like one: the accent
-     line with a shadow above it rather than a flat painted stripe. */
+  /* The indicator is a single lamp set into the collar, not a painted line:
+     it is round, it glows, and it is lit from inside, which is why it takes
+     an inset lip along its bottom rather than a shadow above it. Percentage
+     sizing keeps it in proportion at every `size` a caller passes. */
   .pointer {
     position: absolute;
     inset: 0;
     border-radius: inherit;
+    pointer-events: none;
   }
   .pointer::before {
     content: "";
     position: absolute;
     left: 50%;
-    top: 8%;
-    width: 2px;
-    height: 34%;
-    margin-left: -1px;
-    border-radius: 1px;
+    top: 5.5%;
+    width: 14%;
+    height: 14%;
+    margin-left: -7%;
+    border-radius: 50%;
     background: var(--knob-accent);
     box-shadow:
-      0 0 calc(5px * var(--glow-scale)) var(--knob-accent),
-      0 -1px 0 rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.6));
+      0 0 calc(6px * var(--glow-scale)) var(--knob-accent),
+      inset 0 calc(-1px * var(--bevel)) 0 rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.5));
   }
 
   .knob-label {

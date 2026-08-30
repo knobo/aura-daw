@@ -699,7 +699,7 @@
   </header>
 
   <div class="lane" bind:this={wrap}>
-    <canvas bind:this={canvas} style:width="100%" style:height="100%"></canvas>
+    <canvas bind:this={canvas} style:width="100%" style:height="100%" style:contain="paint"></canvas>
   </div>
 
   {#if takeClipId && showReport}

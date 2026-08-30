@@ -10,35 +10,53 @@
     clampSize,
     createPanelDrag,
     type PanelDrag,
+    type PanelEdge,
     type ResizeSpec,
   } from "../utils/panel-resize";
+  import { uiZoomFactor } from "../utils/ui-zoom";
 
   let {
     axis,
     size,
     spec,
     label,
+    edge = "start",
     onresize,
   }: {
-    /** "y": horizontal bar on the top edge (ns-resize). "x": vertical bar on the left edge (ew-resize). */
+    /** "y": horizontal bar on a top/bottom edge (ns-resize). "x": vertical bar on a left/right edge (ew-resize). */
     axis: "x" | "y";
     /** Current panel size in CSS px (height for "y", width for "x"). */
     size: number;
     spec: ResizeSpec;
     label: string;
+    /** Which edge of the panel this handle sits on. "start" (default) is
+     * the edge nearest the app centre, where dragging INWARD grows the
+     * panel — the roll's top and the dock's left. The track rail is
+     * anchored to the window's left, so its handle is on the "end" edge
+     * and every direction flips: the CSS side, the drag sign, and which
+     * arrow key grows it. */
+    edge?: PanelEdge;
     onresize: (px: number) => void;
   } = $props();
 
   let drag: PanelDrag | null = null;
   let dragging = $state(false);
 
-  const coord = (e: PointerEvent) => (axis === "y" ? e.clientY : e.clientX);
-  const viewport = () => (axis === "y" ? window.innerHeight : window.innerWidth);
+  // clientX/Y and window.inner{Width,Height} are VISUAL px; `size`/`spec`
+  // (panel-resize.ts) are LAYOUT px ("current panel size in CSS px") —
+  // divide out the interface zoom so a drag doesn't resize the panel by
+  // more than the pointer actually moved.
+  const coord = (e: PointerEvent) => (axis === "y" ? e.clientY : e.clientX) / uiZoomFactor();
+  const viewport = () => (axis === "y" ? window.innerHeight : window.innerWidth) / uiZoomFactor();
 
   function onDown(e: PointerEvent) {
     if (e.button !== 0) return;
     e.preventDefault();
-    drag = createPanelDrag(spec, size, coord(e));
+    // The rail is a `role="grid"` with its own pointerdown for lane
+    // selection, and a resize gesture is not a lane click. Harmless where
+    // the parent has no handler (the roll, the dock).
+    e.stopPropagation();
+    drag = createPanelDrag(spec, size, coord(e), edge);
     dragging = true;
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   }
@@ -52,8 +70,9 @@
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
   }
   function onKeydown(e: KeyboardEvent) {
-    const grow = axis === "y" ? "ArrowUp" : "ArrowLeft";
-    const shrink = axis === "y" ? "ArrowDown" : "ArrowRight";
+    const inward = edge === "end";
+    const grow = axis === "y" ? (inward ? "ArrowDown" : "ArrowUp") : inward ? "ArrowRight" : "ArrowLeft";
+    const shrink = axis === "y" ? (inward ? "ArrowUp" : "ArrowDown") : inward ? "ArrowLeft" : "ArrowRight";
     if (e.key !== grow && e.key !== shrink) return;
     e.preventDefault();
     const step = e.key === grow ? 16 : -16;
@@ -65,7 +84,7 @@
 <!-- ARIA window-splitter pattern: a focusable separator with valuenow IS an
      interactive widget; Svelte's checker just doesn't model that variant. -->
 <div
-  class="handle {axis}"
+  class="handle {axis} {edge}"
   class:dragging
   role="separator"
   aria-orientation={axis === "y" ? "horizontal" : "vertical"}
@@ -101,6 +120,14 @@
     bottom: 0;
     width: 7px;
     cursor: ew-resize;
+  }
+  .handle.x.end {
+    left: auto;
+    right: -3px;
+  }
+  .handle.y.end {
+    top: auto;
+    bottom: -3px;
   }
 
   /* the visible affordance: a hairline that wakes up cyan on hover/drag */

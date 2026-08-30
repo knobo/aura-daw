@@ -54,5 +54,7 @@ export const AURA_LIGHT_TOKENS: ThemeTokens = {
   relief: "0.4",
   sheen: "0.35",
   grain: "0.08",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "6px",
 };

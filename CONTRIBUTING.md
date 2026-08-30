@@ -82,22 +82,35 @@ npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```
 
-**A Bluetooth default output sink fails 18 engine tests, and it does not look
-like an audio problem.** The engine opens a stream and publishes a sample rate
-— so it appears to have started — and then no callback ever arrives: the
-transport stays at 0, no meter frames appear, and every `control::loopjam`
-test reports `"audio engine did not respond"`. Point the test process at a
-real ALSA sink instead. This changes nothing globally, so your own audio stays
-where it is:
+**"audio engine did not respond" is usually the environment, not your
+change.** The engine opens a stream and publishes a sample rate — so it
+appears to have started — and then no callback arrives: the transport stays
+at 0, no meter frames appear, and every `control::loopjam` test reports
+`"audio engine did not respond"`. Two different causes produce that same
+line, and the timeouts are the runtime either way:
+
+- **A Bluetooth default sink.** Check `pactl get-default-sink` before
+  filing an engine, transport, loopjam or meter failure as a regression.
+- **Parallel load.** The same ~18 tests fail deterministically under
+  default parallelism and pass in isolation — engines starved of callbacks
+  while ~25 of them hold a device at once
+  (`backlog/ci-hardening.md` item 4). `--test-threads=1` is the answer,
+  not a sink change.
+
+To pin a sink, override the ALSA PCM. **`PULSE_SINK` does not work here**:
+ALSA's `default` resolves to the *pipewire* plugin on this box, not the
+pulse one, so the pulse client variable is never consulted (verified
+2026-08-28 — see [`docs/TRAPS.md`](docs/TRAPS.md)).
 
 ```sh
-PULSE_SINK=$(pactl list short sinks | grep alsa_output | head -1 | cut -f2) \
-  cargo test -- --test-threads=1
+cat > /tmp/asound-pin.conf <<'EOF'
+</usr/share/alsa/alsa.conf>
+pcm.!default { type pipewire playback_node "REPLACE_WITH_A_SINK_NAME" }
+EOF
+# `pactl list short sinks | grep alsa_output` names the candidates.
+ALSA_CONFIG_PATH=/tmp/asound-pin.conf \
+  cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 ```
-
-Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
-Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
-before filing an engine, transport, loopjam or meter failure as a regression.
 
 Run the local suite under a virtual display and single-threaded:
 
@@ -107,15 +120,30 @@ xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 
 Zyn's LV2 UI spawns `zynaddsubfx-ext-gui` as a separate process, so the GUI
 tests open real windows; `xvfb-run` sends them to a display that dies with
-the run. `--test-threads=1` is what CI uses and avoids a parallel SIGSEGV
-(`backlog/ci-hardening.md` item 5) that leaves those windows orphaned.
-Unsetting `DISPLAY` instead makes the three GUI tests pass without
-asserting anything — see [`docs/TRAPS.md`](docs/TRAPS.md).
+the run. `--test-threads=1` is what CI uses. Unsetting `DISPLAY` instead
+makes the three GUI tests pass without asserting anything — see
+[`docs/TRAPS.md`](docs/TRAPS.md).
 
-Counts, measured 2026-08-28 on `perf/plugin-load-profile` with a pinned
-ALSA sink: **1457 backend** (1407 lib + 50 integration, 2 `#[ignore]`d
-plugin repros, 16 plugin-gated tests skipped politely) in ~104 s, and
-**1383 frontend** across 126 files in ~5 s.
+The parallel SIGSEGV that used to make `--test-threads=1` mandatory is
+**fixed** (2026-08-28): a lib test's plugin scan was re-executing the whole
+suite as its own subprocess worker, and the resulting flood of audio streams
+exhausted the PipeWire daemon's file descriptors until wireplumber died and
+took our client's connection with it. Zero signal deaths in twelve
+default-parallelism runs, against three in four on the parent commit.
+
+**Do not read that as "parallel runs are fine now."** They still fail 1–18
+tests depending on how loaded the audio server is (item 4's engine
+starvation), and about half of them still ABORT — `X Error of failed
+request: BadWindow`, exit 1, no test summary — because Xlib's default error
+handler calls `exit(1)` when we restack an already-closed plugin window
+(item 5's open list). Single-threaded remains the gate.
+`backlog/ci-hardening.md` items 4–5 have the measurements.
+
+Counts, measured 2026-08-28 on `fix/parallel-test-sigsegv`: **1459 backend**
+(1409 lib + 50 integration, 2 `#[ignore]`d plugin repros, 16 plugin-gated
+tests skipped politely) — 64 s for the lib half plus 70 s for the
+integration half, the latter including the link of its eleven binaries —
+and **1383 frontend** across 126 files in ~5 s.
 
 The lib half needs `-- --test-threads=1` to be measured at all: the
 `midi_out::tests` race below flakes 2–5 names out of a parallel run, and

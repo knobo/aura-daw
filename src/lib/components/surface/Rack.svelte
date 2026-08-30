@@ -126,7 +126,7 @@
     border-radius: 10px;
     background-color: var(--bg-1);
     background-image: var(--sheen-face);
-    box-shadow: var(--bevel-raised), var(--relief-3);
+    box-shadow: var(--bevel-frame), var(--relief-3);
     width: max-content;
     max-width: 100%;
   }

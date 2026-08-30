@@ -82,11 +82,14 @@ sentence got written — if you find a row whose branch is gone from
    harness on a modest laptop. Only chase the insert path (§9.5's
    flamegraph) if that run says a real session breaks.
 
-6. **The parallel test suite SIGSEGVs.** Not the documented `midi_out`
-   race — an actual crash, twice in three runs, where
-   `--test-threads=1` passes 1407/1407. It is also why zyn GUI windows
-   get left behind: a signal death skips the `Drop` that kills them.
-   Undiagnosed. → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 5
+6. **Dropping `--test-threads=1` — blocked on one ON-HOLD bug.** The
+   `midi_out` and `clap_host` families are fixed; the first was a product
+   bug, not a thread race (see [`docs/LANDED.md`](docs/LANDED.md)), and the
+   full parallel suite went 0 of 8 fully green to 45 of 46. What remains is
+   PR #124's `lv2_ui` PDEATHSIG test, **deliberately deferred** — either a
+   pid-reuse artefact or a real orphaned-plugin-window bug, and nobody knows
+   which. Do not start it as a job; item 7 lists what should bring it back.
+   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 7
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
 Plan G4 (envelope-follower modulators); the native-GUI embed work;

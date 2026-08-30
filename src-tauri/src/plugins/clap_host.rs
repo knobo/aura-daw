@@ -1567,7 +1567,16 @@ mod tests {
             started.elapsed()
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // A barrier, not a sleep. `post_params` is fire-and-forget onto the
+        // process-wide `plugin_main()` queue, and what has to happen before
+        // `render_blocks` is the write itself: the plugin adopts a value when
+        // it processes, so a block rendered *before* the write still reports
+        // the old one. A sleep guesses at the queue depth, and any LV2 test
+        // running concurrently shares that queue and makes the guess wrong —
+        // this test failed 3/3 alongside `plugins::lv2_host::` and passed
+        // 3/3 with `plugins::clap_host::` alone. `run` is FIFO on the same
+        // channel, so it returns only once the posted write has executed.
+        plugin_main().run(|_| ()).expect("plugin main drains the posted write");
         let _ = render_blocks(node.as_mut(), 2, 512);
         let live = get_params(&id).expect("get");
         let got = live.iter().find(|q| q.id == p.id).unwrap().value;

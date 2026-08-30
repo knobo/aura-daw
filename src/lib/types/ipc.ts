@@ -1538,6 +1538,28 @@ export interface UndoToOutcome {
   label: string | null;
 }
 
+/**
+ * Mid-restore progress from `openProject` (backend-side): which step of
+ * loading a project's tracks/MIDI/plugins/automation is running. Emitted
+ * repeatedly while one project opens; `step: "done"` is the last one.
+ */
+export interface ProjectOpenProgressEvent {
+  step: "load" | "midi" | "journal" | "plugins" | "automation" | "midiOut" | "modulation" | "rebuild" | "done";
+  index: number;
+  total: number;
+  label: string;
+  detail: string | null;
+}
+
+/** Mid-restore progress decoding/peaking a project's audio files. */
+export interface ProjectMediaProgressEvent {
+  loaded: number;
+  total: number;
+  name: string | null;
+  phase: "decode" | "peaks";
+  done: boolean;
+}
+
 // ── app events (frozen names, §3.4) ─────────────────────────────────────────
 
 export interface AuraEventMap {
@@ -1547,6 +1569,8 @@ export interface AuraEventMap {
   "sidecar://done": SidecarDoneEvent;
   "sidecar://error": SidecarErrorEvent;
   "project://changed": Project;
+  "project://open-progress": ProjectOpenProgressEvent;
+  "project://media-progress": ProjectMediaProgressEvent;
   "automation://changed": { trackId: string };
   "mcp://confirm-requested": PendingConfirmation;
   "export://progress": ExportProgressEvent;

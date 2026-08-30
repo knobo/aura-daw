@@ -1206,14 +1206,13 @@
     </footer>
   </div>
 {:else}
-  <div class="roll glass" style:height="{ui.rollHeight}px">
-    <PanelResizeHandle
-      axis="y"
-      size={ui.rollHeight}
-      spec={ROLL_RESIZE}
-      label="Resize piano roll"
-      onresize={(px) => (ui.rollHeight = px)}
-    />
+  <!-- No clip: the panel is its own tab strip and nothing else. Holding
+       `ui.rollHeight` here reserved 340 px of empty chassis to say one
+       sentence — 42 % of an 800 px window — and it was the single biggest
+       reason the timeline and the track rail felt cramped. The height is
+       remembered, not spent: opening a clip restores it. No resize handle
+       either, since dragging it could only make the emptiness taller. -->
+  <div class="roll glass collapsed">
     <header class="head">
       <BottomPanelTabs current="roll" />
       <span class="silk">open a MIDI clip to edit notes</span>
@@ -1233,6 +1232,12 @@
     background: rgb(var(--bg-sunken-rgb) / 0.92);
     position: relative;
     z-index: 10;
+  }
+
+  /* Header only. `.head` is `flex: none; height: 36px`, so `auto` resolves
+     to exactly the tab strip — no inline height, no reserved void. */
+  .roll.collapsed {
+    height: auto;
   }
 
   .head {
@@ -1352,6 +1357,8 @@
     width: 100%;
     height: 100%;
     pointer-events: none;
+    /* Redrawn from a rAF loop while a selection/note-flash is active. */
+    contain: paint;
   }
   .gridwrap {
     flex: 1;
