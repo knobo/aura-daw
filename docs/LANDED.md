@@ -5,6 +5,38 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## The DMA-BUF workaround is gone, and hardware rendering is the default
+
+`main.rs` set `WEBKIT_DISABLE_DMABUF_RENDERER=1` at startup for everyone —
+the accepted Tauri workaround ([tauri#9304]) for the renderer white-flashing
+or killing the web process when the GPU is saturated by ACE-Step inference.
+
+#136 measured what that cost. Disabling the renderer denies the web process
+a GL context, so Skia falls back to its CPU raster pipeline and every frame
+of every session is rastered in software. Idle, transport stopped, on the
+WebKitGTK 2.52.3 Ubuntu 24.04 ships: **101% of a core with the workaround,
+4.8% without**. Paid continuously, against a bug that only appears under
+heavy GPU load.
+
+The block is deleted rather than inverted, so WebKit reads the environment
+itself and the escape hatch is the plain one: a user who does hit the flash
+sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` and has the old behaviour back.
+README's Linux/GPU troubleshooting section now leads with that instead of
+explaining how to opt out of the workaround.
+
+**What was and was not verified.** The app was run in exactly this
+configuration (stock 2.52.3, renderer enabled, hardware GL and
+`SkiaGPUWorker` threads both confirmed in the running process) through
+several minutes of ordinary use with no flash and no web-process respawn.
+The heavy case was **not** reached: no ACE-Step job ran, so the load the
+workaround exists for is still untested. That is the known gap, and the
+escape hatch is what covers it.
+
+PR: `fix/dmabuf-renderer-default` → #138.
+→ [`docs/backlog/webview-rendering.md`](backlog/webview-rendering.md)
+
+[tauri#9304]: https://github.com/tauri-apps/tauri/issues/9304
+
 ## AURA does not need WebKitGTK 2.53 — it needs its own DMA-BUF workaround gone
 
 #133 built WebKitGTK 2.53.91 to re-measure #132's accepted platform limit,
