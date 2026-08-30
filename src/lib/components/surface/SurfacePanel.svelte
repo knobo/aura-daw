@@ -108,11 +108,7 @@
 
   /** Lit = actually sounding (or actually muted). Never a local guess. */
   function padLit(widget: SurfaceWidget): boolean {
-    const t = widget.target;
-    if (t?.kind === "clipLaunch") return surface.isClipPlaying(t.clipId);
-    if (t?.kind === "launchBinding") return surface.isBindingPlaying(t.bindingId);
-    if (t?.kind === "trackMute") return !!project.trackById(t.trackId)?.muted;
-    return false;
+    return surface.isLit(widget.target);
   }
 </script>
 

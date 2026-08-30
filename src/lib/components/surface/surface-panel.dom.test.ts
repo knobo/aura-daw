@@ -270,7 +270,10 @@ describe("a channel strip", () => {
 
 describe("a pad grid", () => {
   it("fires the clip in a filled cell", async () => {
-    const widget = { ...unboundWidget("padGrid"), cells: ["c1", null, null, null, null, null, null, null] };
+    const widget = {
+      ...unboundWidget("padGrid"),
+      cells: [{ kind: "clipLaunch" as const, clipId: "c1" }, null, null, null, null, null, null, null],
+    };
     render(PadGrid, { widget });
     await pressPad(screen.getByRole("button", { name: /play verse/i }));
     await vi.waitFor(() => expect(calls).toContain("fire:b1"));
@@ -283,16 +286,68 @@ describe("a pad grid", () => {
     expect(calls.some((c) => c.startsWith("seek:"))).toBe(false);
   });
 
+  it("fires a player cell exactly like a loose player pad, including gate mode", async () => {
+    players.list = [
+      { id: "p1", name: "KICK", source: { kind: "audioClip", clipId: "c1" }, raw: true, trigger: { mode: "gate" } },
+    ];
+    const widget = {
+      ...unboundWidget("padGrid"),
+      cells: [{ kind: "player" as const, playerId: "p1" }, null, null, null, null, null, null, null],
+    };
+    render(PadGrid, { widget });
+    const pad = screen.getByRole("button", { name: "Play KICK" });
+    Object.assign(pad, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await fireEvent.pointerDown(pad, { button: 0, pointerId: 1 });
+    await fireEvent.pointerUp(pad, { pointerId: 1 });
+    // A gate cell must not ALSO fire on the click a pointer pair produces.
+    await fireEvent.click(pad);
+    expect(calls).toEqual(["player_fire:p1", "player_stop:p1"]);
+  });
+
   it("assigns an empty cell from the picker in edit mode", async () => {
     const widget = unboundWidget("padGrid");
     surface.layout = addWidget(emptyLayout(), widget);
     render(PadGrid, { widget, edit: true });
     // In edit mode the pad opens its cell picker instead of firing.
     await pressPad(screen.getByRole("button", { name: /assign pad 1/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^clip/i }));
     await fireEvent.click(screen.getByRole("menuitem", { name: "Verse" }));
     const cells = surface.page.widgets.find((w) => w.id === widget.id)?.cells;
-    expect(cells?.[0]).toBe("c1");
+    expect(cells?.[0]).toEqual({ kind: "clipLaunch", clipId: "c1" });
     expect(calls).toEqual([]); // assigning a cell is layout chrome, not a command
+  });
+
+  it("adds a pad from an audio clip into a cell, same as a loose pad", async () => {
+    const widget = unboundWidget("padGrid");
+    surface.layout = addWidget(emptyLayout(), widget);
+    project.clips = [
+      {
+        id: "ac1",
+        trackId: "t1",
+        name: "KICK.wav",
+        sourcePath: "audio/kick.wav",
+        sourceChannels: 2,
+        sourceSampleRate: 48000,
+        sourceLengthSamples: 4800,
+        timelineStartSamples: 0,
+        offsetSamples: 0,
+        lengthSamples: 4800,
+        gainDb: 0,
+        fadeInSamples: 0,
+        fadeOutSamples: 0,
+      },
+    ];
+    render(PadGrid, { widget, edit: true });
+    await pressPad(screen.getByRole("button", { name: /assign pad 1/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: /add pad from clip/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "KICK.wav" }));
+    await vi.waitFor(() =>
+      expect(surface.page.widgets.find((w) => w.id === widget.id)?.cells?.[0]).toEqual({
+        kind: "player",
+        playerId: "new-p1",
+      }),
+    );
+    expect(calls).toEqual([`player_add:${JSON.stringify({ kind: "audioClip", clipId: "ac1" })}:true`]);
   });
 });
 
@@ -301,6 +356,9 @@ describe("the bind picker", () => {
     const widget = unboundWidget("knob");
     surface.layout = addWidget(emptyLayout(), widget);
     render(BindPicker, { widget });
+    // Root is now one drill tile per group; the flat list runs into the
+    // bottom of the window once a project has real content.
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^level/i }));
     await fireEvent.click(screen.getByRole("menuitem", { name: /drums — level/i }));
     const bound = surface.page.widgets.find((w) => w.id === widget.id);
     expect(bound?.target).toEqual({ kind: "trackGain", trackId: "t1" });
@@ -308,11 +366,28 @@ describe("the bind picker", () => {
     expect(surface.bindFor).toBe(null);
   });
 
+  it("drills into a group and back out again", async () => {
+    const widget = unboundWidget("knob");
+    surface.layout = addWidget(emptyLayout(), widget);
+    render(BindPicker, { widget });
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^level/i }));
+    expect(screen.getByRole("menuitem", { name: /drums — level/i })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /^pan/i })).toBeNull();
+    const menu = screen.getByRole("menu");
+    await fireEvent.keyDown(menu, { key: "Escape" });
+    // Escape from a group peels one level rather than closing the picker —
+    // the root's tiles (LEVEL, PAN, …) are back, not the leaf items.
+    expect(screen.getByRole("menuitem", { name: /^level/i })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /^pan/i })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /drums — level/i })).toBeNull();
+  });
+
   it("carries the lamp role a lamp needs to act", async () => {
     const widget = unboundWidget("lamp");
     surface.layout = addWidget(emptyLayout(), widget);
     render(BindPicker, { widget });
-    await fireEvent.click(screen.getAllByRole("menuitem", { name: "Drums" })[1]); // SOLO group
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^solo/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Drums" }));
     const bound = surface.page.widgets.find((w) => w.id === widget.id);
     expect(bound?.target).toEqual({ kind: "trackSolo", trackId: "t1" });
     expect(bound?.lampRole).toBe("solo");

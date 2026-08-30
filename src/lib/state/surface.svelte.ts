@@ -240,8 +240,8 @@ class SurfaceStore {
     return cellOptions(this.context());
   }
 
-  bindCell(widgetId: string, index: number, clipId: string | null) {
-    this.commit(setGridCell(this.layout, widgetId, index, clipId));
+  bindCell(widgetId: string, index: number, target: SurfaceTarget | null) {
+    this.commit(setGridCell(this.layout, widgetId, index, target));
     this.bindFor = null;
   }
 
@@ -431,6 +431,17 @@ class SurfaceStore {
     await launch.stopOverlay();
   }
 
+  /** Whether a target's pad should show solid — one rule shared by a loose
+   * pad and a pad-grid cell, so the two cannot drift apart on what "lit"
+   * means for a given target kind. A player has no lit indicator (same as
+   * today's loose pad): its clock is continuous, not a launch overlay. */
+  isLit(target: SurfaceTarget | null | undefined): boolean {
+    if (!target) return false;
+    if (target.kind === "clipLaunch") return this.isClipPlaying(target.clipId);
+    if (target.kind === "launchBinding") return this.isBindingPlaying(target.bindingId);
+    if (target.kind === "trackMute") return !!project.trackById(target.trackId)?.muted;
+    return false;
+  }
 }
 
 /** Value plus range for whatever a knob or fader is pointed at. */

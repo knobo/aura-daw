@@ -8,10 +8,16 @@
  * ids; they do not own mix or launch state.
  */
 
-export const SURFACE_LAYOUT_VERSION = 2 as const;
+export const SURFACE_LAYOUT_VERSION = 3 as const;
 
 /** v1 kept a device as a page mode (`page.templateId`); v2 makes it a group. */
-const LEGACY_LAYOUT_VERSION = 1;
+const LEGACY_LAYOUT_VERSION_1 = 1;
+
+/** v2 kept a pad-grid cell as a bare clip id; v3 makes it a `SurfaceTarget`,
+ * the same union a loose pad's `target` holds, so a cell can be a clip, a
+ * player or a launcher row instead of a string whose meaning was implied
+ * by position. */
+const LEGACY_LAYOUT_VERSION_2 = 2;
 
 /** Widgets stamped by one device share a `rack:<id>` group. */
 export const RACK_GROUP_PREFIX = "rack:";
@@ -139,8 +145,10 @@ export interface SurfaceWidget {
   lampRole?: LampRole;
   cols?: number;
   rows?: number;
-  /** Pad-grid cells: clip ids (or null = empty). Length = cols * rows. */
-  cells?: Array<string | null>;
+  /** Pad-grid cells: a target (or null = empty). Length = cols * rows. Same
+   * union a loose pad's `target` holds, so a cell can be a clip, a player,
+   * or a launcher row. */
+  cells?: Array<SurfaceTarget | null>;
 }
 
 export interface SurfacePage {
@@ -276,9 +284,7 @@ export function pageHasTarget(page: SurfacePage, target: SurfaceTarget): boolean
   if (!key) return false;
   for (const w of page.widgets) {
     if (targetKey(w.target) === key) return true;
-    if (w.kind === "padGrid" && target.kind === "clipLaunch") {
-      if (w.cells?.includes(target.clipId)) return true;
-    }
+    if (w.kind === "padGrid" && w.cells?.some((c) => targetKey(c) === key)) return true;
   }
   return false;
 }
@@ -371,12 +377,12 @@ export function padGridForClips(clips: readonly SurfaceClip[]): SurfaceWidget {
 
 /** A grid of a fixed size, filled from the bottom-left pad upward. */
 function padGrid(cols: number, rows: number, clips: readonly SurfaceClip[]): SurfaceWidget {
-  const cells: Array<string | null> = Array(cols * rows).fill(null);
+  const cells: Array<SurfaceTarget | null> = Array(cols * rows).fill(null);
   for (let i = 0; i < clips.length && i < cells.length; i++) {
     const col = i % cols;
     const rowFromBottom = Math.floor(i / cols);
     const rowFromTop = rows - 1 - rowFromBottom;
-    cells[padIndex(cols, rows, col, rowFromTop)] = clips[i].id;
+    cells[padIndex(cols, rows, col, rowFromTop)] = { kind: "clipLaunch", clipId: clips[i].id };
   }
   return { id: newId(), kind: "padGrid", label: "PADS", target: null, cols, rows, cells };
 }
@@ -557,7 +563,12 @@ export function setPadMode(layout: SurfaceLayout, widgetId: string, padMode: Pad
   );
 }
 
-export function setGridCell(layout: SurfaceLayout, widgetId: string, index: number, clipId: string | null): SurfaceLayout {
+export function setGridCell(
+  layout: SurfaceLayout,
+  widgetId: string,
+  index: number,
+  target: SurfaceTarget | null,
+): SurfaceLayout {
   const page = activePage(layout);
   return replaceActive(
     layout,
@@ -565,7 +576,7 @@ export function setGridCell(layout: SurfaceLayout, widgetId: string, index: numb
       if (w.id !== widgetId || w.kind !== "padGrid" || !w.cells) return w;
       if (index < 0 || index >= w.cells.length) return w;
       const cells = w.cells.slice();
-      cells[index] = clipId;
+      cells[index] = target;
       return { ...w, cells };
     }),
   );
@@ -629,16 +640,13 @@ export function bindOptions(kind: SurfaceWidgetKind, ctx: SurfaceContext): BindO
   return out.filter((o) => (seen.has(o.key) ? false : (seen.add(o.key), true)));
 }
 
-/** Clips a pad-grid cell can hold. Same rows the pad picker shows, without
- * the track-mute alternatives — a grid cell fires a clip or nothing. */
+/** What a pad-grid cell can be pointed at: a cell now holds a full
+ * `SurfaceTarget`, the same union a loose pad's `target` holds, so it gets
+ * exactly the same option set a loose pad does (clip, launcher row, or
+ * track mute) — "Add pad from clip ›" included, offered by the picker
+ * itself alongside these. */
 export function cellOptions(ctx: SurfaceContext): BindOption[] {
-  return ctx.midiClips.map((c) => ({
-    key: `clipLaunch:${c.id}`,
-    group: "CLIP",
-    label: c.name,
-    widgetLabel: c.name,
-    target: { kind: "clipLaunch", clipId: c.id } as SurfaceTarget,
-  }));
+  return bindOptions("pad", ctx);
 }
 
 /** Plugin params worth offering: the ones already automated (they have a
@@ -679,19 +687,38 @@ interface StoredPage {
 export function parseLayout(raw: unknown): SurfaceLayout | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as { version?: unknown; pages?: unknown; activePageId?: unknown };
-  const legacy = o.version === LEGACY_LAYOUT_VERSION;
-  if (o.version !== SURFACE_LAYOUT_VERSION && !legacy) return null;
+  const legacy1 = o.version === LEGACY_LAYOUT_VERSION_1;
+  const legacy2 = o.version === LEGACY_LAYOUT_VERSION_2;
+  if (o.version !== SURFACE_LAYOUT_VERSION && !legacy1 && !legacy2) return null;
   if (!Array.isArray(o.pages) || o.pages.length === 0) return null;
   if (typeof o.activePageId !== "string") return null;
   const pages: SurfacePage[] = [];
   for (const raw of o.pages as StoredPage[]) {
     if (!raw || typeof raw.id !== "string" || typeof raw.name !== "string") return null;
     if (!Array.isArray(raw.widgets)) return null;
-    const widgets = raw.widgets.filter(isWidget);
-    pages.push({ id: raw.id, name: raw.name, widgets: legacy ? migrateV1Page(raw, widgets) : widgets });
+    let widgets = raw.widgets.filter(isWidget);
+    // v1's rack wrapping and v3's cell shape are independent migrations —
+    // a v1 deck's grid cells were still bare clip ids (migrateV1Page never
+    // touched them), so both legacy versions need the cell migration.
+    widgets = migrateCellsToTargets(widgets);
+    if (legacy1) widgets = migrateV1Page(raw, widgets);
+    pages.push({ id: raw.id, name: raw.name, widgets });
   }
   const activePageId = pages.some((p) => p.id === o.activePageId) ? o.activePageId : pages[0].id;
   return { version: SURFACE_LAYOUT_VERSION, pages, activePageId };
+}
+
+/** v2→v3: a stored cell was a bare clip id, "this is a clipLaunch" implied
+ * by position. Wrap it in the same target shape a loose pad's `target`
+ * holds. A v3 cell (already an object, or null) passes through untouched. */
+function migrateCellsToTargets(widgets: SurfaceWidget[]): SurfaceWidget[] {
+  return widgets.map((w) => {
+    if (w.kind !== "padGrid" || !w.cells) return w;
+    const raw = w.cells as unknown as Array<string | SurfaceTarget | null>;
+    if (!raw.some((c) => typeof c === "string")) return w;
+    const cells = raw.map((c) => (typeof c === "string" ? ({ kind: "clipLaunch", clipId: c } as SurfaceTarget) : c));
+    return { ...w, cells };
+  });
 }
 
 /**
