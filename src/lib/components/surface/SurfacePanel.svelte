@@ -397,34 +397,43 @@
   .mode:hover {
     color: var(--cyan);
   }
-  .kill {
-    position: absolute;
-    top: -6px;
-    right: -6px;
-    z-index: 1;
-    border: none;
-    background: transparent;
-    color: var(--text-faint);
-    cursor: pointer;
-  }
+  /* Both edit handles were a faint 12px glyph on a transparent ground, and
+     the owner could not see the bind one at all — which made binding a pad
+     unreachable in practice, not merely hard. They are chips now: a filled
+     ground and a border, so the eye reads a control rather than stray
+     punctuation. Only shown in edit mode, so the weight costs the playing
+     surface nothing. */
+  .kill,
   .tool {
     position: absolute;
     top: -6px;
-    left: -6px;
     z-index: 1;
-    border: none;
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
     padding: 0;
-    background: transparent;
-    color: var(--text-faint);
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 50%;
+    background: rgb(var(--bg-sunken-rgb) / 0.92);
+    color: var(--text-mid);
     font-size: 12px;
     line-height: 1;
     cursor: pointer;
   }
+  .kill {
+    right: -6px;
+  }
+  .tool {
+    left: -6px;
+  }
   .tool:hover {
     color: var(--cyan);
+    border-color: var(--cyan);
   }
   .kill:hover {
     color: var(--red);
+    border-color: var(--red);
   }
   .ghost {
     color: var(--text-faint);
