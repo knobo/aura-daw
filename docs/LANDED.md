@@ -32,7 +32,7 @@ The heavy case was **not** reached: no ACE-Step job ran, so the load the
 workaround exists for is still untested. That is the known gap, and the
 escape hatch is what covers it.
 
-PR: `fix/dmabuf-renderer-default` → #137.
+PR: `fix/dmabuf-renderer-default` → #138.
 → [`docs/backlog/webview-rendering.md`](backlog/webview-rendering.md)
 
 [tauri#9304]: https://github.com/tauri-apps/tauri/issues/9304
