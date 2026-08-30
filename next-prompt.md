@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| DMA-BUF renderer default | `fix/dmabuf-renderer-default` | 2026-08-30 | Stop disabling hardware rendering at startup. Idle web-process CPU 101% → 4.8% (#136's matrix). |
 
 ## Next up — unclaimed
 
