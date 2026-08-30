@@ -62,11 +62,17 @@ sentence got written — if you find a row whose branch is gone from
    are the control surface's (open SURFACE, add two LPD8
    racks and a channel strip side by side, drag a fader, tap a pad) and
    G2's: one reverb on a bus, several tracks sent into it, one room — then
-   export and confirm the WAV has it.
-2. **Plan V — V3: polyphony.** Voice cap, choke groups, quantized start,
-   velocity → gain. V2 (PR #121) landed one player real — document, ops,
-   graph slot, `player_fire`/`player_stop`, the launch overlay retired —
-   so V3 is unblocked.
+   export and confirm the WAV has it. **New with V3 (PR #137):** two pads
+   in one choke group (the second press must cut the first with no click),
+   and a pad quantized to 1/4 fired off the beat while the arrangement
+   rolls (it must land ON the beat, and the ~5 ms block granularity must
+   not be audible as flam).
+2. **Plan V — V4: per-node automation clock.** `ParamDriver::tick` becomes
+   per-node and `ClipEnvelope` is evaluated at the player's own position,
+   which is what makes an envelope trigger-relative with no new document
+   type; modulation §8.1's ports land here. V3 (PR #137) landed the deck's
+   polyphony — voice cap, choke groups, quantized start, velocity — so V4
+   is unblocked, and V5/V6 sit behind it.
    → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md)
 3. **G3 — sidechain edges** (bass ducks the pads). The graph now has
    buses and sends; a sidechain is the third routing primitive.
@@ -113,7 +119,7 @@ reopening it.
 
 | Track | File |
 |---|---|
-| **Plan V — players (V3 unclaimed)** | [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md) |
+| **Plan V — players (V4 unclaimed)** | [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md) |
 | Project provenance stamp (recommendation, not claimed) | [`docs/backlog/project-versioning.md`](docs/backlog/project-versioning.md) |
 | Plugin manager (preview slot open) | [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md) |
 | Mixer graph — inserts, sends, sidechain (Plan G; G3 next) | [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md) |

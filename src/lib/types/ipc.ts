@@ -135,6 +135,19 @@ export type PlayerSource =
 
 export type PlayerTriggerMode = "oneShot" | "gate" | "loop";
 
+/** When a press takes effect (Plan V — V3, V-21). Everything but `"off"`
+ * names a division of the ARRANGEMENT's grid, so a quantized pad fires
+ * immediately while the transport is stopped — there is no grid to land
+ * on. `"whole"` is four quarters wherever the meter sits; `"bar"` is what
+ * the meter says. */
+export type PlayerQuantize =
+  | "off"
+  | "sixteenth"
+  | "eighth"
+  | "quarter"
+  | "whole"
+  | "bar";
+
 export interface PlayerInfo {
   id: string;
   name: string;
@@ -145,7 +158,22 @@ export interface PlayerInfo {
    * always carries it (Rust's `#[serde(default)]` mirrors the same
    * default). */
   raw?: boolean;
-  trigger?: { mode: PlayerTriggerMode };
+  trigger?: { mode: PlayerTriggerMode; quantize?: PlayerQuantize };
+  /** V3, V-20: pads sharing a group cut each other. `null`/absent is "in
+   * no group", which is what every player migrated from V2 has. */
+  chokeGroup?: number | null;
+  /** V3, V-18: how much of a press's velocity reaches the output, 0..=1.
+   * Optional for the same reason `raw` is — the wire form always carries
+   * it, and its Rust default is 1.0. */
+  velocityToGain?: number;
+}
+
+/** Payload of `player://stolen` (V-19): the deck ran out of voices and this
+ * pad — the one that had been sounding longest — gave one up. Emitted so
+ * stealing is VISIBLE, which is half of the owner's answer to the design
+ * doc's §8 question 1. */
+export interface PlayerStolen {
+  playerId: string;
 }
 
 export type LaunchFireOrigin = "hardware" | "drive" | "preview";

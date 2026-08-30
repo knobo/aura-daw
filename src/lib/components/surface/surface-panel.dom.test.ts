@@ -67,6 +67,18 @@ vi.mock("../../tauri", () => ({
       calls.push(`player_set_trigger_mode:${id}:${mode}`);
       return Promise.resolve();
     },
+    playerSetQuantize: (id: string, quantize: string) => {
+      calls.push(`player_set_quantize:${id}:${quantize}`);
+      return Promise.resolve();
+    },
+    playerSetChokeGroup: (id: string, group: number | null) => {
+      calls.push(`player_set_choke_group:${id}:${group}`);
+      return Promise.resolve();
+    },
+    playerSetVelocityToGain: (id: string, depth: number) => {
+      calls.push(`player_set_velocity_to_gain:${id}:${depth}`);
+      return Promise.resolve();
+    },
   },
 }));
 
@@ -495,6 +507,73 @@ describe("a player pad", () => {
     // that would double-trigger the very press this test presses once.
     await fireEvent.click(pad);
     expect(calls).toEqual(["player_fire:p1", "player_stop:p1"]);
+  });
+
+  // ── Plan V — V3 ─────────────────────────────────────────────────────
+  // The pad chips are the ONLY thing that makes quantize, choke groups and
+  // velocity depth reachable before V7's inspector. Reachability is what a
+  // frontend review owes (STANDING-CONSTRAINTS), so these assert both that
+  // the chip is visible in edit mode and that clicking it emits.
+
+  const V3_PAD = {
+    id: "p1",
+    name: "KICK",
+    source: { kind: "audioClip" as const, clipId: "c1" },
+    raw: true,
+    trigger: { mode: "oneShot" as const },
+  };
+
+  it("hides the V3 pad chips outside edit mode", async () => {
+    players.list = [V3_PAD];
+    surface.setEdit(false);
+    await renderWithPlayerPad({ playerId: "p1" });
+    expect(screen.queryByTestId("pad-p1-quantize")).toBeNull();
+    expect(screen.queryByTestId("pad-p1-choke")).toBeNull();
+    expect(screen.queryByTestId("pad-p1-velocity")).toBeNull();
+  });
+
+  it("cycles quantize, choke group and velocity depth from the pad", async () => {
+    players.list = [V3_PAD];
+    surface.setEdit(true);
+    await renderWithPlayerPad({ playerId: "p1" });
+
+    // A pad with none of the V3 fields set reads as the V2 defaults, and
+    // each chip's first click is the first step past that default.
+    expect(screen.getByTestId("pad-p1-quantize").textContent).toContain("Q OFF");
+    expect(screen.getByTestId("pad-p1-choke").textContent).toContain("CHK —");
+    expect(screen.getByTestId("pad-p1-velocity").textContent).toContain("VEL 100%");
+
+    await fireEvent.click(screen.getByTestId("pad-p1-quantize"));
+    await fireEvent.click(screen.getByTestId("pad-p1-choke"));
+    await fireEvent.click(screen.getByTestId("pad-p1-velocity"));
+    expect(calls).toEqual([
+      "player_set_quantize:p1:sixteenth",
+      "player_set_choke_group:p1:1",
+      "player_set_velocity_to_gain:p1:0.5",
+    ]);
+    surface.setEdit(false);
+  });
+
+  it("cycles the velocity depth from the NEAREST step, not from the first", async () => {
+    // The depth is a number the command takes anywhere in 0..=1, so a
+    // document written by anything but this chip (an agent, a hand edit)
+    // would otherwise fall off the cycle and always jump back to step one.
+    players.list = [{ ...V3_PAD, velocityToGain: 0.55 }];
+    surface.setEdit(true);
+    await renderWithPlayerPad({ playerId: "p1" });
+    await fireEvent.click(screen.getByTestId("pad-p1-velocity"));
+    expect(calls).toEqual(["player_set_velocity_to_gain:p1:0"]);
+    surface.setEdit(false);
+  });
+
+  it("wraps the choke group back out of every group", async () => {
+    players.list = [{ ...V3_PAD, chokeGroup: 4 }];
+    surface.setEdit(true);
+    await renderWithPlayerPad({ playerId: "p1" });
+    expect(screen.getByTestId("pad-p1-choke").textContent).toContain("CHK 4");
+    await fireEvent.click(screen.getByTestId("pad-p1-choke"));
+    expect(calls).toEqual(["player_set_choke_group:p1:null"]);
+    surface.setEdit(false);
   });
 
   it("degrades a dead player id to the pad's own label, never throws", async () => {

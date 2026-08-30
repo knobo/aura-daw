@@ -516,9 +516,9 @@ npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```
 
-- **Counts, measured 2026-08-28:** 1459 backend (1409 lib + 50 integration,
-  2 `#[ignore]`d plugin repros, 16 plugin-gated tests skipped) and 1383
-  frontend across 126 files. A Bluetooth default sink fails 18 engine tests
+- **Counts, measured 2026-08-30:** 1664 backend (1603 lib + 61 integration,
+  3 `#[ignore]`d, 16 plugin-gated tests skipped) and 1466
+  frontend across 129 files. A Bluetooth default sink fails 18 engine tests
   in a way that does not look like an audio problem; `PULSE_SINK` does NOT
   redirect them — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ALSA
   config override that does.

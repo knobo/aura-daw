@@ -139,11 +139,11 @@ handler calls `exit(1)` when we restack an already-closed plugin window
 (item 5's open list). Single-threaded remains the gate.
 `backlog/ci-hardening.md` items 4–5 have the measurements.
 
-Counts, measured 2026-08-28 on `fix/parallel-test-sigsegv`: **1459 backend**
-(1409 lib + 50 integration, 2 `#[ignore]`d plugin repros, 16 plugin-gated
-tests skipped politely) — 64 s for the lib half plus 70 s for the
+Counts, measured 2026-08-30 on `feat/plan-v3-polyphony`: **1664 backend**
+(1603 lib + 61 integration, 3 `#[ignore]`d, 16 plugin-gated
+tests skipped politely) — 111 s for the lib half plus 71 s for the
 integration half, the latter including the link of its eleven binaries —
-and **1383 frontend** across 126 files in ~5 s.
+and **1466 frontend** across 129 files in ~5 s.
 
 The lib half needs `-- --test-threads=1` to be measured at all: the
 `midi_out::tests` race below flakes 2–5 names out of a parallel run, and

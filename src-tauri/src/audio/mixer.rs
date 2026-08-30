@@ -531,13 +531,13 @@ fn node_playhead(
     base_pos: u64,
     lp: &LoopSpec,
     discontinuity: bool,
-) -> (u64, LoopSpec, bool, bool, bool, bool) {
+) -> (u64, LoopSpec, bool, bool, bool, bool, f32) {
     let ph = clocks.playhead(slot, base_pos, discontinuity);
     if ph.is_transport {
-        return (ph.pos, *lp, ph.discontinuity, ph.on, false, false);
+        return (ph.pos, *lp, ph.discontinuity, ph.on, false, false, 1.0);
     }
     if ph.on {
-        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true, true, false);
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true, true, false, ph.gain);
     }
     if ph.exclusive {
         // Plan V — V-2: a PLAYER's slot has no arrangement to rejoin. Its row
@@ -565,7 +565,7 @@ fn node_playhead(
         // channel. A sounding pad is unaffected either way: it takes the
         // `ph.on` branch above, which does NOT OR the transport's in, so a
         // seek can never cut a pad mid-press.
-        return (ph.pos, LoopSpec::OFF, ph.discontinuity || discontinuity, false, true, true);
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity || discontinuity, false, true, true, ph.gain);
     }
     (
         base_pos,
@@ -574,6 +574,7 @@ fn node_playhead(
         clocks.transport_on(),
         true,
         false,
+        1.0,
     )
 }
 
@@ -737,6 +738,12 @@ fn render_impl(
     // pending discontinuity. A scene clock is bound to MANY slots, and a
     // per-reader consume would hand the jump to whichever track read first
     // and hang a note on all the others — see `ClockTable::begin_block`.
+    //
+    // `arm_pending` runs FIRST, so a quantized fire (V-21) that starts in
+    // this block has its own discontinuity latched by this block's latch
+    // rather than the next one's — one block, one jump, exactly what an
+    // immediate fire from the control thread gets.
+    clocks.arm_pending(base_pos, frames as u64);
     clocks.begin_block();
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
@@ -785,7 +792,7 @@ fn render_impl(
         if tr.slot >= n_slots {
             continue;
         }
-        let (_, _, track_disc, _, _, _) =
+        let (_, _, track_disc, _, _, _, _) =
             node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
         tr.win.disc = track_disc;
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
@@ -838,7 +845,7 @@ fn render_impl(
                  call RtTrack::recompute_tail_frames after changing them",
                 tr.slot
             );
-            let (track_base, track_lp, _, clock_on, own_clock, exclusive_idle) =
+            let (track_base, track_lp, _, clock_on, own_clock, exclusive_idle, voice_gain) =
                 node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
             // Plan V — V-2, the cost half (fix round 1, finding 1). An
             // exclusive-and-off slot is a pad nobody is pressing, and it can
@@ -907,7 +914,20 @@ fn render_impl(
                 continue;
             }
             let flushing = exclusive_idle;
-            let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
+            // V-18: the press's velocity, folded into the fader. This is the
+            // one place an audio pad and a MIDI pad converge, and the only
+            // one that reaches a RAW pad at all — `raw` compiles to an empty
+            // node, so `params.gain` for it is a fixed unity that no
+            // per-press value could live in.
+            //
+            // The LIMIT that comes with the choice: a non-raw pad's own
+            // inserts and its PRE-fader sends see the unscaled signal, so a
+            // soft press does not hit its own compressor any softer. Making
+            // velocity a property of the SOURCE instead would need two
+            // mechanisms (a per-sample multiply in `clip_sample` for audio, a
+            // note-velocity scale for MIDI) where this is one; per-voice
+            // modulation is modulation §8.8's business, and V4's.
+            let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed)) * voice_gain;
             let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
             let flags = params.flags[tr.slot].load(Relaxed);
             // Two gates, and they used to be three. `clock_on` false is a
@@ -1436,7 +1456,7 @@ mod tests {
         );
 
         let clocks = scene_clocks(&g, true);
-        clocks.fire(1, 100, 10_000, false);
+        clocks.fire(1, 100, 10_000, false, 1.0);
         clocks.bind_slot(0, 1);
         g.clocks = Arc::new(clocks);
         let mut out = vec![0.0f32; 8];
@@ -1466,7 +1486,7 @@ mod tests {
         );
 
         let clocks = scene_clocks(&g, false);
-        clocks.fire(1, 0, 10_000, false);
+        clocks.fire(1, 0, 10_000, false, 1.0);
         clocks.bind_slot(0, 1);
         g.clocks = Arc::new(clocks);
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
@@ -1486,7 +1506,7 @@ mod tests {
         let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
         g.params.set_pan(0, -1.0);
         let clocks = scene_clocks(&g, true);
-        clocks.fire(1, 500, 10_000, false); // far from the clip
+        clocks.fire(1, 500, 10_000, false, 1.0); // far from the clip
         clocks.bind_slot(0, 1);
         g.clocks = Arc::new(clocks);
 
@@ -1501,7 +1521,7 @@ mod tests {
         // clock reads it, which is what makes the live node all-notes-off in
         // `render_impl`'s prologue instead of hanging the cut voice.
         g.clocks.begin_block();
-        let (pos, _, disc, on, own, _) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
+        let (pos, _, disc, on, own, _, _) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
         assert!(own, "still bound to the scene clock, so still past a solo");
         assert_eq!(pos, 0, "back on the arrangement playhead");
         assert!(on, "and audible: the transport is still running");
@@ -2163,16 +2183,16 @@ mod tests {
     fn a_rejoined_node_still_hears_the_transports_own_discontinuity() {
         let g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
         let clocks = scene_clocks(&g, true);
-        clocks.fire(1, 500, 10_000, false);
+        clocks.fire(1, 500, 10_000, false, 1.0);
         clocks.bind_slot(0, 1);
         clocks.stop(1);
         clocks.begin_block(); // consumes the stop's own flush
         assert!(node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false).2, "the flush");
 
         clocks.begin_block(); // a later block: nothing pending on the clock
-        let (_, _, disc, _, _, _) = node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false);
+        let (_, _, disc, _, _, _, _) = node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false);
         assert!(!disc, "nothing jumped");
-        let (_, _, disc, _, _, _) = node_playhead(&clocks, 0, 7_000, &LoopSpec::OFF, true);
+        let (_, _, disc, _, _, _, _) = node_playhead(&clocks, 0, 7_000, &LoopSpec::OFF, true);
         assert!(disc, "but the transport's seek is this node's seek too");
     }
 
@@ -2221,7 +2241,7 @@ mod tests {
         let mut out = vec![0.0f32; FRAMES * 2];
 
         // PRESS 1 — one block long, so the clock ends under a held note.
-        g.clocks.fire(1, 0, FRAMES as u64, false);
+        g.clocks.fire(1, 0, FRAMES as u64, false, 1.0);
         render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
         let first_press = out.clone();
         assert!(peak(&first_press) > 0.0, "the press has to sound at all");
@@ -2239,7 +2259,7 @@ mod tests {
         }
 
         // PRESS 2 — identical clock, identical events, from zero.
-        g.clocks.fire(1, 0, FRAMES as u64, false);
+        g.clocks.fire(1, 0, FRAMES as u64, false, 1.0);
         out.fill(0.0);
         render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
         assert_eq!(out[0], 0.0, "press 2 attacks from silence too, with no click");
@@ -2318,7 +2338,7 @@ mod tests {
         let press = |g: &mut RtGraph| -> Vec<f32> {
             let mut all = Vec::with_capacity(BLOCKS * FRAMES * 2);
             let mut out = vec![0.0f32; FRAMES * 2];
-            g.clocks.fire(1, 0, FRAMES as u64, false);
+            g.clocks.fire(1, 0, FRAMES as u64, false, 1.0);
             for _ in 0..BLOCKS {
                 out.fill(0.0);
                 render(g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
@@ -2434,7 +2454,7 @@ mod tests {
         };
         let mut g = RtGraph::new(vec![tr], 1, Arc::new(ParamTable::default()));
         let clocks = scene_clocks(&g, true);
-        clocks.fire(1, 0, 10_000, false);
+        clocks.fire(1, 0, 10_000, false, 1.0);
         clocks.bind_slot(0, 1);
         g.clocks = Arc::new(clocks);
 
@@ -2461,7 +2481,7 @@ mod tests {
         g.params.set_pan(0, -1.0);
         insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), false);
         let clocks = scene_clocks(&g, true);
-        clocks.fire(1, 100, 10_000, false);
+        clocks.fire(1, 100, 10_000, false, 1.0);
         clocks.bind_slot(0, 1);
         g.clocks = Arc::new(clocks);
         let mut out = vec![0.0f32; 8];

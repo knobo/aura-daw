@@ -16,8 +16,16 @@
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
   import { ui } from "../../state/ui.svelte";
-  import { firePlayer, playerById, setTriggerMode, stopPlayer } from "../../state/players.svelte";
-  import type { PlayerTriggerMode } from "../../types/ipc";
+  import {
+    firePlayer,
+    playerById,
+    setChokeGroup,
+    setQuantize,
+    setTriggerMode,
+    setVelocityToGain,
+    stopPlayer,
+  } from "../../state/players.svelte";
+  import type { PlayerQuantize, PlayerTriggerMode } from "../../types/ipc";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import Knob from "../controls/Knob.svelte";
   import Fader from "../controls/Fader.svelte";
@@ -104,6 +112,76 @@
     const cur = triggerMode(playerId);
     const next = TRIGGER_MODES[(TRIGGER_MODES.indexOf(cur) + 1) % TRIGGER_MODES.length];
     void setTriggerMode(playerId, next);
+  }
+
+  // ── Plan V — V3 ───────────────────────────────────────────────────────
+  // Three more cycling chips, the same shape as the trigger-mode one above
+  // and for the same reason: a document property nothing can reach is the
+  // defect V2's own fix round caught with Gate and Loop. The full inspector
+  // — a real control for a continuous depth included — is V7's.
+
+  const QUANTIZE: readonly PlayerQuantize[] = [
+    "off",
+    "sixteenth",
+    "eighth",
+    "quarter",
+    "whole",
+    "bar",
+  ];
+  /** What each division reads as on a chip a few characters wide. */
+  const QUANTIZE_LABEL: Record<PlayerQuantize, string> = {
+    off: "Q OFF",
+    sixteenth: "Q 1/16",
+    eighth: "Q 1/8",
+    quarter: "Q 1/4",
+    whole: "Q 1/1",
+    bar: "Q BAR",
+  };
+  /** Four groups is what a hand reaches on one deck; `null` is out of every
+   * group, and is where the cycle starts and returns. */
+  const CHOKE_GROUPS: readonly (number | null)[] = [null, 1, 2, 3, 4];
+  /** OFF / half / full, because a pad chip cannot carry a continuous
+   * control — the depth itself is a `number` and the command takes any
+   * value in 0..=1. */
+  const VELOCITY_DEPTHS: readonly number[] = [1, 0.5, 0];
+
+  function quantizeOf(playerId: string): PlayerQuantize {
+    return playerById(playerId)?.trigger?.quantize ?? "off";
+  }
+
+  function chokeOf(playerId: string): number | null {
+    return playerById(playerId)?.chokeGroup ?? null;
+  }
+
+  function velocityDepthOf(playerId: string): number {
+    return playerById(playerId)?.velocityToGain ?? 1;
+  }
+
+  function cycleQuantize(playerId: string) {
+    const next = QUANTIZE[(QUANTIZE.indexOf(quantizeOf(playerId)) + 1) % QUANTIZE.length];
+    void setQuantize(playerId, next);
+  }
+
+  function cycleChokeGroup(playerId: string) {
+    const at = CHOKE_GROUPS.indexOf(chokeOf(playerId));
+    void setChokeGroup(playerId, CHOKE_GROUPS[(at + 1) % CHOKE_GROUPS.length]);
+  }
+
+  /** Nearest step, not `indexOf`: the depth is a number the command accepts
+   * anywhere in 0..=1, so a document written by anything but this chip
+   * would otherwise fall off the cycle and always jump to the first step. */
+  function cycleVelocityDepth(playerId: string) {
+    const cur = velocityDepthOf(playerId);
+    let at = 0;
+    for (let i = 1; i < VELOCITY_DEPTHS.length; i += 1) {
+      if (Math.abs(VELOCITY_DEPTHS[i] - cur) < Math.abs(VELOCITY_DEPTHS[at] - cur)) at = i;
+    }
+    void setVelocityToGain(playerId, VELOCITY_DEPTHS[(at + 1) % VELOCITY_DEPTHS.length]);
+  }
+
+  function velocityLabel(playerId: string): string {
+    const d = velocityDepthOf(playerId);
+    return d === 0 ? "VEL OFF" : `VEL ${Math.round(d * 100)}%`;
   }
 
   /** Lit = actually sounding (or actually muted). Never a local guess. */
@@ -223,6 +301,36 @@
                         onclick={() => cycleTriggerMode(playerId)}
                       >
                         {triggerMode(playerId)}
+                      </button>
+                      <button
+                        class="silk mode"
+                        type="button"
+                        data-testid="pad-{playerId}-quantize"
+                        title="Quantize the press to the arrangement's grid — click to cycle"
+                        aria-label="{padLabel} quantize: {quantizeOf(playerId)}"
+                        onclick={() => cycleQuantize(playerId)}
+                      >
+                        {QUANTIZE_LABEL[quantizeOf(playerId)]}
+                      </button>
+                      <button
+                        class="silk mode"
+                        type="button"
+                        data-testid="pad-{playerId}-choke"
+                        title="Choke group — pads in one group cut each other"
+                        aria-label="{padLabel} choke group: {chokeOf(playerId) ?? 'none'}"
+                        onclick={() => cycleChokeGroup(playerId)}
+                      >
+                        {chokeOf(playerId) === null ? "CHK —" : `CHK ${chokeOf(playerId)}`}
+                      </button>
+                      <button
+                        class="silk mode"
+                        type="button"
+                        data-testid="pad-{playerId}-velocity"
+                        title="How much of a press's velocity reaches the output"
+                        aria-label="{padLabel} velocity depth: {velocityLabel(playerId)}"
+                        onclick={() => cycleVelocityDepth(playerId)}
+                      >
+                        {velocityLabel(playerId)}
                       </button>
                     {/if}
                   </div>

@@ -329,6 +329,9 @@ pub fn run() {
             control::player_fire,
             control::player_stop,
             control::player_set_trigger_mode,
+            control::player_set_quantize,
+            control::player_set_choke_group,
+            control::player_set_velocity_to_gain,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,

@@ -5,6 +5,42 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## Plan V — V3: the deck is polyphonic
+
+Eight pads at once was already true after V2 — each player owns a clock —
+so V3 is the four things that make many pads a DECK rather than eight
+independent one-shots: a voice cap, choke groups, quantized start, and
+velocity.
+
+The owner answered the design doc's §8 questions 1, 2 and 4 (32 voices
+stealing oldest-first; one `chokeGroup` per player; retrospective capture
+as its own cut after V6), which is what made the cut sizeable at all.
+
+Four rulings came out of building it, V-18…V-21, and two of them are the
+kind that only appear once the code exists:
+
+* a choke has to fire when the choker STARTS, not when it is pressed, or a
+  quantized choke silences its sibling early and leaves a hole until the
+  beat;
+* a quantized press resolves to a BLOCK, not a sample, because a clock has
+  one position per block — and with the transport stopped there is no grid
+  at all, so such a press fires now, and stopping the transport cancels one
+  still waiting.
+
+Velocity is folded into the fader: the one point an audio pad and a MIDI
+pad converge, and the only one that reaches a RAW pad, whose node compiles
+to a fixed unity. The gap that comes with the choice — a non-raw pad's own
+inserts see the unscaled signal — is written down, as is the bigger one:
+hardware velocity is not plumbed, because `on_incoming` carries no velocity
+and threading one through the fire queue is V8's, the cut that owns the
+hardware map.
+
+Gate: 1603 lib + 61 integration + 1465 frontend, single-threaded. Perf,
+same sitting: `origin/main` 564.7 µs, branch 462.4 µs.
+
+PR: `feat/plan-v3-polyphony` → #137.
+→ [`docs/backlog/plan-v-players.md`](backlog/plan-v-players.md)
+
 ## A pad sounded when you let go of it
 
 `Pad.svelte` wired `onpress` to the button's `onclick`. A `click` does not

@@ -13,10 +13,15 @@
  */
 
 import { backend } from "../tauri";
-import type { PlayerInfo, PlayerSource, PlayerTriggerMode } from "../types/ipc";
+import type {
+  PlayerInfo,
+  PlayerQuantize,
+  PlayerSource,
+  PlayerTriggerMode,
+} from "../types/ipc";
 
 export type Player = PlayerInfo;
-export type { PlayerSource, PlayerTriggerMode };
+export type { PlayerQuantize, PlayerSource, PlayerTriggerMode };
 
 export const players = $state<{ list: Player[] }>({ list: [] });
 
@@ -39,6 +44,13 @@ export async function firePlayer(id: string): Promise<void> {
   await backend.playerFire?.(id);
 }
 
+/** Fire with the press's velocity (V3, V-18). A pointer has none, so the
+ * pad keeps calling `firePlayer`; this is the seam a velocity-sensitive
+ * controller uses, and the backend's own `player_fire` is this at 127. */
+export async function firePlayerWithVelocity(id: string, velocity: number): Promise<void> {
+  await backend.playerFireWithVelocity?.(id, velocity);
+}
+
 export async function stopPlayer(id: string): Promise<void> {
   await backend.playerStop?.(id);
 }
@@ -49,6 +61,24 @@ export async function stopPlayer(id: string): Promise<void> {
  * invent one. */
 export async function setTriggerMode(id: string, mode: PlayerTriggerMode): Promise<void> {
   await backend.playerSetTriggerMode?.(id, mode);
+  await refreshPlayers();
+}
+
+/** The V3 trio, relayed on the same terms as `setTriggerMode`: invoke, then
+ * re-read the registry, because the document is the authority on what the
+ * pad now says (ADR 0006 — the renderer holds no state of its own). */
+export async function setQuantize(id: string, quantize: PlayerQuantize): Promise<void> {
+  await backend.playerSetQuantize?.(id, quantize);
+  await refreshPlayers();
+}
+
+export async function setChokeGroup(id: string, group: number | null): Promise<void> {
+  await backend.playerSetChokeGroup?.(id, group);
+  await refreshPlayers();
+}
+
+export async function setVelocityToGain(id: string, depth: number): Promise<void> {
+  await backend.playerSetVelocityToGain?.(id, depth);
   await refreshPlayers();
 }
 
