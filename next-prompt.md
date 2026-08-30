@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Launch quantize — a scene fires on the beat | `feat/launch-quantize` | 2026-08-30 | V3 gave players a quantized start; a launch-bound pad still fires on the press. Owner asked for it while ear-checking V3. |
 
 ## Next up — unclaimed
 
