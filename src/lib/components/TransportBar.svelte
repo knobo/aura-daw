@@ -38,18 +38,33 @@
   // rAF timecode — writes textContent directly, outside reactivity
   $effect(() => {
     let raf = 0;
+    let clockShown = "";
+    let barsShown = "";
     const tick = (now: number) => {
       raf = requestAnimationFrame(tick);
       if (!clockEl || !barsEl) return;
       const pos = transport.positionAt(now);
-      clockEl.textContent = formatClock(pos, transport.snap.sampleRate);
-      barsEl.textContent = formatBarsBeats(
+      // Skip the DOM write once stopped at a fixed position — an
+      // unconditional textContent write every frame was found still
+      // invalidating layout on WebKitGTK even while nothing on screen was
+      // actually changing (STANDING-CONSTRAINTS.md "No continuously-
+      // animated SVG" section).
+      const clockText = formatClock(pos, transport.snap.sampleRate);
+      if (clockText !== clockShown) {
+        clockEl.textContent = clockText;
+        clockShown = clockText;
+      }
+      const barsText = formatBarsBeats(
         pos,
         transport.snap.sampleRate,
         project.tempoBpm,
         project.timeSignature[0],
         project.timeSignature[1],
       );
+      if (barsText !== barsShown) {
+        barsEl.textContent = barsText;
+        barsShown = barsText;
+      }
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);

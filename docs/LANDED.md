@@ -5,6 +5,50 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## The WebKitGTK full-viewport repaint, closed out: one real bug, one accepted platform limit
+
+Direct follow-up to #131's "duplicate meter rendering" entry below — that
+PR's `contain`/canvas work cut paint duration ~3.8× (611ms → 161ms avg)
+but every paint still covered the exact full viewport, and the question
+left open was why.
+
+**The real bug, found and fixed:** `TransportBar.svelte`'s clock/bars and
+`MasterBar.svelte`'s dB readout wrote `textContent` unconditionally on
+every rAF tick, unlike `Meter.svelte`/`Gauge.svelte` which already guard
+against writing an unchanged value. While transport is `"stopped"`,
+`positionAt()` returns a fixed value, so this wrote the identical string
+60×/sec forever, even fully idle. A WebKit Timelines capture with the app
+sitting still (no playback, no interaction) showed a full-viewport
+invalidate-styles → recalculate-styles → layout → paint cycle repeating
+at ~160ms regardless — this was the entire cause. Fixed with the same
+`if (text !== shown)` guard the other two already use; idle re-capture
+afterward showed zero non-paint layout events.
+
+**The platform limit, measured and accepted:** full-viewport paint under
+real interaction (resizing the Surface panel, with and without playback)
+persists, and its duration scales with window pixel area almost exactly
+(2× the area measured as 1.94× the duration across two window sizes) —
+not with how much content actually changed. That's WebKitGTK doing a
+full-surface raster on any invalidation rather than an incremental/
+tile-based repaint of the damaged region, and it isn't reachable from
+application code. WebAssembly/SIMD was raised and ruled out in the same
+sitting: script execution was already under 5% of total time in every
+capture across this whole investigation (idle, resize, resize+play) —
+the cost is entirely in rasterization, which happens identically no
+matter what issued the draw calls. A `Forced Layout` also turned up
+(`TransportBar.svelte`'s `recompute()` reading `offsetWidth` right after
+the clock tick left layout dirty) — sub-millisecond, 17 times over
+14.6s, not worth chasing next to the paint cost. All three findings are
+in `STANDING-CONSTRAINTS.md`'s "No continuously-animated SVG" section,
+which is now the first place to look if a WebKit Timelines capture ever
+shows a full-page quad again.
+
+Reaching further than this needs WebKitGTK's own compositing/GPU-
+acceleration configuration — an environment-level investigation, not an
+application-code one.
+
+PR: `investigate/surface-repaint` → #132.
+
 ## Pointer/zoom drift and duplicate meter rendering, found by profiling the real app under load
 
 Not from the backlog — surfaced by asking "why does the native build feel

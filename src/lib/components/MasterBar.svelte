@@ -70,13 +70,23 @@
   $effect(() => {
     let raf = 0;
     let shown = -100;
+    let shownText = "";
     const tick = () => {
       raf = requestAnimationFrame(tick);
       if (!dbEl) return;
       const m = latestMeter("master");
       const db = m ? Math.max(linToDb(m.peakL), linToDb(m.peakR)) : -100;
       shown = db > shown ? db : Math.max(db, shown - 0.5);
-      dbEl.textContent = formatDb(shown);
+      // Skip the DOM write once the reading settles (e.g. at rest,
+      // decayed to the floor) — an unconditional textContent write every
+      // frame was found still invalidating layout on WebKitGTK even with
+      // nothing audible changing (STANDING-CONSTRAINTS.md "No
+      // continuously-animated SVG" section).
+      const text = formatDb(shown);
+      if (text !== shownText) {
+        dbEl.textContent = text;
+        shownText = text;
+      }
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
