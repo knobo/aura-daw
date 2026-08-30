@@ -363,11 +363,20 @@ model stacks.
 
 When the GPU that drives your desktop is saturated (e.g. ACE-Step generating),
 WebKitGTK's DMA-BUF renderer can white-flash or reload the AURA webview
-mid-session. AURA works around this at startup by setting
-`WEBKIT_DISABLE_DMABUF_RENDERER=1` (the accepted Tauri workaround,
-[tauri#9304](https://github.com/tauri-apps/tauri/issues/9304)) — unless you
-have already set that variable yourself, which always wins. To opt back into
-WebKit's default renderer: `export WEBKIT_DISABLE_DMABUF_RENDERER=0`.
+mid-session ([tauri#9304](https://github.com/tauri-apps/tauri/issues/9304)).
+If you see that, turn the renderer off:
+
+```sh
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+```
+
+AURA used to set that itself, for everyone, always. It no longer does,
+because of what it costs: disabling the renderer denies the web process a GL
+context, so Skia rasters every frame in software. Idle with the transport
+stopped, on the WebKitGTK 2.52.3 Ubuntu 24.04 ships, that measured **101% of
+a core against 4.8%** — paid continuously, against a bug that only appears
+under heavy GPU load. The measurements are in
+[`docs/backlog/webview-rendering.md`](docs/backlog/webview-rendering.md).
 
 ---
 
