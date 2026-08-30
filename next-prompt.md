@@ -55,9 +55,17 @@ sentence got written — if you find a row whose branch is gone from
 |---|---|---|---|
 | _(none)_ | | | |
 
+## Read this first if you are picking up mid-stream
+
+[`docs/handoff/2026-08-30-launch-quantize.md`](docs/handoff/2026-08-30-launch-quantize.md)
+— PR #141 is open and finished (it needs a review, not more work), and
+one bug is open and **blocked on a single question to the owner**. Ask
+that question before reading any code.
+
 ## Next up — unclaimed
 
-1. **Owner ear-checks** are owed on several landed tracks. No suite
+1. **Owner ear-checks** are owed on several landed tracks — including
+   V3's and #141's, neither of which has been done. No suite
    substitutes for them; each backlog file lists its own. The newest two
    are the control surface's (open SURFACE, add two LPD8
    racks and a channel strip side by side, drag a fader, tap a pad) and
