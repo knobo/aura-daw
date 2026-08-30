@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Meter idle canvas redraw | `fix/meter-idle-redraw` | 2026-08-30 | `Meter.svelte` redraws its canvas every frame even when the picture is identical. Found while profiling the webview; independent of any WebKitGTK version. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
