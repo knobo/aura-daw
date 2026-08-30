@@ -41,35 +41,32 @@ same sitting: `origin/main` 564.7 µs, branch 462.4 µs.
 PR: `feat/plan-v3-polyphony` → #137.
 → [`docs/backlog/plan-v-players.md`](backlog/plan-v-players.md)
 
-## The DMA-BUF workaround is gone, and hardware rendering is the default
+## The DMA-BUF workaround was removed, and put straight back
+
+Landed as #138 and reverted the same day in #139. Recorded here because the
+reason is the answer to a question this project had been carrying open.
 
 `main.rs` set `WEBKIT_DISABLE_DMABUF_RENDERER=1` at startup for everyone —
-the accepted Tauri workaround ([tauri#9304]) for the renderer white-flashing
-or killing the web process when the GPU is saturated by ACE-Step inference.
+the accepted Tauri workaround ([tauri#9304]) for the DMA-BUF renderer
+white-flashing or killing the web process when the GPU is saturated. #136
+measured its cost on the WebKitGTK 2.52.3 Ubuntu 24.04 ships: idle web-process
+CPU of **101% of a core against 4.8%** without it, because disabling the
+renderer denies the web process a GL context and Skia rasters every frame in
+software.
 
-#136 measured what that cost. Disabling the renderer denies the web process
-a GL context, so Skia falls back to its CPU raster pipeline and every frame
-of every session is rastered in software. Idle, transport stopped, on the
-WebKitGTK 2.52.3 Ubuntu 24.04 ships: **101% of a core with the workaround,
-4.8% without**. Paid continuously, against a bug that only appears under
-heavy GPU load.
+#138 removed it on that evidence, with the honest caveat that the heavy case
+was never reached — no ACE-Step job ran during the verification session, so
+the load the workaround exists for was untested. That caveat turned out to be
+the whole story: **the owner hit real breakage in ordinary use and had to set
+`WEBKIT_DISABLE_DMABUF_RENDERER=1` by hand to get a working app.** So the bug
+is not only an under-load phenomenon on this hardware, and the workaround
+earns its place.
 
-The block is deleted rather than inverted, so WebKit reads the environment
-itself and the escape hatch is the plain one: a user who does hit the flash
-sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` and has the old behaviour back.
-README's Linux/GPU troubleshooting section now leads with that instead of
-explaining how to opt out of the workaround.
-
-**What was and was not verified.** The app was run in exactly this
-configuration (stock 2.52.3, renderer enabled, hardware GL and
-`SkiaGPUWorker` threads both confirmed in the running process) through
-several minutes of ordinary use with no flash and no web-process respawn.
-The heavy case was **not** reached: no ACE-Step job ran, so the load the
-workaround exists for is still untested. That is the known gap, and the
-escape hatch is what covers it.
-
-PR: `fix/dmabuf-renderer-default` → #138.
-→ [`docs/backlog/webview-rendering.md`](backlog/webview-rendering.md)
+What survives is the price tag. The workaround costs roughly 20x idle CPU, and
+that is now measured rather than assumed — so it is worth revisiting if the
+underlying WebKit/Mesa/NVIDIA bug is ever fixed, or if a narrower trigger can
+be found. It is not worth revisiting by simply deleting the block again; that
+has now been tried.
 
 [tauri#9304]: https://github.com/tauri-apps/tauri/issues/9304
 
