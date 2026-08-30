@@ -16,6 +16,8 @@
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
   import { ui } from "../../state/ui.svelte";
+  import { firePlayer, playerById, setTriggerMode, stopPlayer } from "../../state/players.svelte";
+  import type { PlayerTriggerMode } from "../../types/ipc";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import Knob from "../controls/Knob.svelte";
   import Fader from "../controls/Fader.svelte";
@@ -71,6 +73,37 @@
       const tr = project.trackById(t.trackId);
       if (tr) void surface.writeMute(t.trackId, !tr.muted);
     }
+    if (t.kind === "player") {
+      // Gate fires on the pointer pair (see padPointerDown/Up below), never
+      // on click — a real <button> also delivers click for the pointerup
+      // half of the SAME press, which would double-fire the pad.
+      if (triggerMode(t.playerId) === "gate") return;
+      void firePlayer(t.playerId);
+    }
+  }
+
+  function triggerMode(playerId: string): PlayerTriggerMode {
+    return playerById(playerId)?.trigger?.mode ?? "oneShot";
+  }
+
+  function padPointerDown(widget: SurfaceWidget) {
+    const t = widget.target;
+    if (t?.kind === "player" && triggerMode(t.playerId) === "gate") void firePlayer(t.playerId);
+  }
+
+  function padPointerUp(widget: SurfaceWidget) {
+    const t = widget.target;
+    if (t?.kind === "player" && triggerMode(t.playerId) === "gate") void stopPlayer(t.playerId);
+  }
+
+  const TRIGGER_MODES: readonly PlayerTriggerMode[] = ["oneShot", "gate", "loop"];
+
+  /** V-12's pad inspector, kept to what the pad itself can show: cycling
+   * mode is the only control this task adds, on the pad that owns it. */
+  function cycleTriggerMode(playerId: string) {
+    const cur = triggerMode(playerId);
+    const next = TRIGGER_MODES[(TRIGGER_MODES.indexOf(cur) + 1) % TRIGGER_MODES.length];
+    void setTriggerMode(playerId, next);
   }
 
   /** Lit = actually sounding (or actually muted). Never a local guess. */
@@ -161,14 +194,38 @@
                   <span class="silk ghost">{w.label}</span>
                 {/if}
               {:else if w.kind === "pad"}
+                {@const pt = w.target?.kind === "player" ? playerById(w.target.playerId) : null}
+                {@const padLabel = w.target?.kind === "player" ? (pt?.name ?? w.label) : w.label}
                 <Pad
-                  label={w.label}
+                  label={padLabel}
                   meterTrackId={meterTrackId(w, midi.clips)}
                   lit={padLit(w)}
                   disabled={!w.target}
-                  ariaLabel={w.label}
+                  ariaLabel={padLabel}
                   onpress={() => pressPad(w)}
+                  onpointerdown={() => padPointerDown(w)}
+                  onpointerup={() => padPointerUp(w)}
                 />
+                {#if w.target?.kind === "player"}
+                  {@const playerId = w.target.playerId}
+                  <div class="player-tags">
+                    <span class="silk source" data-testid="pad-{playerId}-source">{padLabel}</span>
+                    {#if pt?.raw}
+                      <span class="silk raw" data-testid="pad-{playerId}-raw">RAW</span>
+                    {/if}
+                    {#if surface.editMode}
+                      <button
+                        class="silk mode"
+                        type="button"
+                        title="Trigger mode — click to cycle"
+                        aria-label="{padLabel} trigger mode: {triggerMode(playerId)}"
+                        onclick={() => cycleTriggerMode(playerId)}
+                      >
+                        {triggerMode(playerId)}
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
               {:else if w.kind === "lamp"}
                 {@const tr = trackOf(w)}
                 <Lamp
@@ -309,6 +366,36 @@
   }
   .cell {
     position: relative;
+  }
+  .player-tags {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    margin-top: 2px;
+  }
+  .source {
+    color: var(--text-dim);
+    max-width: 56px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .raw {
+    color: var(--amber);
+    letter-spacing: 0.1em;
+  }
+  .mode {
+    border: none;
+    background: transparent;
+    padding: 0;
+    color: var(--text-faint);
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .mode:hover {
+    color: var(--cyan);
   }
   .kill {
     position: absolute;

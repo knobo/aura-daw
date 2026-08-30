@@ -13,10 +13,10 @@
  */
 
 import { backend } from "../tauri";
-import type { PlayerInfo, PlayerSource } from "../types/ipc";
+import type { PlayerInfo, PlayerSource, PlayerTriggerMode } from "../types/ipc";
 
 export type Player = PlayerInfo;
-export type { PlayerSource };
+export type { PlayerSource, PlayerTriggerMode };
 
 export const players = $state<{ list: Player[] }>({ list: [] });
 
@@ -27,12 +27,29 @@ export async function refreshPlayers(): Promise<void> {
   players.list = await backend.playersGet();
 }
 
+/** A dead player id (project switched, player removed) degrades to
+ * `null` here exactly as `launch.clipIdForPlayer` degrades — never throws,
+ * so a surface pad naming a player that is gone falls back to its own
+ * stored label instead of crashing the deck. */
+export function playerById(id: string): Player | null {
+  return players.list.find((p) => p.id === id) ?? null;
+}
+
 export async function firePlayer(id: string): Promise<void> {
   await backend.playerFire?.(id);
 }
 
 export async function stopPlayer(id: string): Promise<void> {
   await backend.playerStop?.(id);
+}
+
+/** Reachability for Gate/Loop (V-12): the pad itself is the only place
+ * trigger mode is exposed, per the ledger's Task 11 ruling — there is no
+ * separate pad-inspector panel in this codebase, and this task does not
+ * invent one. */
+export async function setTriggerMode(id: string, mode: PlayerTriggerMode): Promise<void> {
+  await backend.playerSetTriggerMode?.(id, mode);
+  await refreshPlayers();
 }
 
 /**

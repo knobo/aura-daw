@@ -18,6 +18,11 @@
     disabled?: boolean;
     ariaLabel: string;
     onpress?: () => void;
+    /** Raw press/release, ahead of the click a pointer pair also produces —
+     * a gate-mode player needs the release itself, not the synthetic click
+     * a `<button>` fires afterwards. */
+    onpointerdown?: () => void;
+    onpointerup?: () => void;
   }
 
   const {
@@ -28,6 +33,8 @@
     disabled = false,
     ariaLabel,
     onpress,
+    onpointerdown,
+    onpointerup,
   }: Props = $props();
 
   let ledEl: HTMLElement | undefined = $state();
@@ -65,11 +72,13 @@
     if (e.button !== 0 || disabled) return;
     pressed = true;
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    onpointerdown?.();
   }
   function up(e: PointerEvent) {
     if (!pressed) return;
     pressed = false;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+    onpointerup?.();
   }
   function fire() {
     if (disabled) return;

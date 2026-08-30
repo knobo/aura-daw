@@ -59,6 +59,7 @@ import type {
   OpenSidecarEvent,
   PlayerInfo,
   PlayerSource,
+  PlayerTriggerMode,
   PluginCatalog,
   PluginCatalogPatch,
   PluginDescriptor,
@@ -528,6 +529,11 @@ export interface Backend {
   playerStop?(playerId: string): Promise<void>;
   /** Create a player — undoable, journaled (frozen name, Task 9). */
   playerAdd?(source: PlayerSource, raw?: boolean, name?: string | null): Promise<PlayerInfo>;
+  /** Set a player's trigger mode — undoable, journaled (frozen name,
+   * Task 11's `player_set_trigger_mode`; the reachability seam Task 13's
+   * pad wires up, per the ledger's ruling that a pad inspector for this
+   * belongs here and not to a later task). */
+  playerSetTriggerMode?(playerId: string, mode: PlayerTriggerMode): Promise<void>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -1191,6 +1197,9 @@ class TauriBackend implements Backend {
   }
   playerAdd(source: PlayerSource, raw = false, name: string | null = null) {
     return invoke<PlayerInfo>("player_add", { source, raw, name });
+  }
+  async playerSetTriggerMode(playerId: string, mode: PlayerTriggerMode) {
+    await invoke("player_set_trigger_mode", { playerId, mode });
   }
 
   libraryScan(dir: string) {
