@@ -1,7 +1,7 @@
 # Backlog: Plan V — players (a pad that is an instrument)
 
 **Opened 2026-08-26.** V1 landed 2026-08-27 (PR #118). V2 landed 2026-08-30
-(PR #121, open — not yet merged) — V3 is unclaimed.
+(PR #121) — V3 is unclaimed.
 
 Design + rulings V-1…V-12: [`docs/superpowers/specs/2026-08-26-plan-v-players-design.md`](../superpowers/specs/2026-08-26-plan-v-players-design.md).
 Audit of what the engine already has: [`docs/research/13-players-and-performance.md`](../research/13-players-and-performance.md).
@@ -25,7 +25,7 @@ tracks (§8.5) and per-voice modulation (§8.8). Plan V builds those arms.
 | Cut | What | State |
 |---|---|---|
 | **V1** | `MixNode` as the compiler's input; tracks and buses become producers. Behaviour-neutral. | landed — PR #118 |
-| **V2** | One player, real: document + ops, graph slot, audio/MIDI sources, own playhead, one-shot/gate/loop, `player_fire`/`player_stop`. Retires the overlay; migrates launch bindings. | complete, PR #121 open |
+| **V2** | One player, real: document + ops, graph slot, audio/MIDI sources, own playhead, one-shot/gate/loop, `player_fire`/`player_stop`. Retires the overlay; migrates launch bindings. | landed — PR #121 |
 | V3 | Polyphony: voice cap, choke groups, quantized start, velocity → gain. | **unblocked — start here** |
 | V4 | Per-node automation clock; modulation §8.1 ports. | blocked on V2 (V3 not required) |
 | V5 | Macros (§8.3): document rows, cycle check, surface knobs bound through them. | blocked on V4 |
@@ -71,7 +71,7 @@ clips, arm) that `MixNode` must not inherit — it does not: no `clips`
 field, no serde. If a later cut adds one, V1's guarantee is broken and V2
 inherits the hidden-track trap (research §4).
 
-## V2 — one player, real (complete; PR #121 open)
+## V2 — one player, real (landed, PR #121)
 
 **Goal.** `session.players[]`, ops, a graph slot, and two sources: an audio
 clip (raw or processed) and a MIDI clip with its own instrument. One
@@ -89,12 +89,18 @@ playhead per player, `player_fire` / `player_stop`. The launch overlay is
   and the same pads fire the same material.
 - Undo of "add player" / "change player source" restores byte-identically.
 
-### Owner ear-check
+### Owner ear-check — done 2026-08-30
 
 Open SURFACE, put a WAV on a pad with `raw` ticked, start the arrangement,
 hit the pad. The pad must sound bit-identical to auditioning that file in
 the browser, and the arrangement's playhead must not move. Anything else
 means V-6/V-16 is not implemented as designed.
+
+The owner confirmed the pad fires and sounds **while the arrangement is
+playing** — which is the design §2.2 defect this cut exists to kill, and the
+half no test can stand in for. The bit-identity half rests on V-16 and on
+`raw`'s own tests; if a future ear ever disagrees with them, believe the ear
+and start at `Player::chain_applies()`.
 
 ### Rulings V-13…V-16 (full text and V-17 in the design doc's ruling table, §5)
 

@@ -58,15 +58,13 @@ sentence got written — if you find a row whose branch is gone from
 ## Next up — unclaimed
 
 1. **Owner ear-checks** are owed on several landed tracks. No suite
-   substitutes for them; each backlog file lists its own. The newest three
-   are Plan V — V2's (open SURFACE, put a WAV on a pad with `raw` ticked,
-   start the arrangement, hit the pad — bit-identical to browser audition,
-   playhead unmoved), the control surface's (open SURFACE, add two LPD8
+   substitutes for them; each backlog file lists its own. The newest two
+   are the control surface's (open SURFACE, add two LPD8
    racks and a channel strip side by side, drag a fader, tap a pad) and
    G2's: one reverb on a bus, several tracks sent into it, one room — then
    export and confirm the WAV has it.
 2. **Plan V — V3: polyphony.** Voice cap, choke groups, quantized start,
-   velocity → gain. V2 (PR #121, open) built one player real — document, ops,
+   velocity → gain. V2 (PR #121) landed one player real — document, ops,
    graph slot, `player_fire`/`player_stop`, the launch overlay retired —
    so V3 is unblocked.
    → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md)
