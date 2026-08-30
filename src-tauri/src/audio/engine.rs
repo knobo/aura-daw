@@ -2310,6 +2310,14 @@ impl Control {
             // single atomic write: `player_fire` finds a lane that already
             // exists, so it never rebuilds the graph (the RT contract).
             for (id, &clock) in player_clocks.iter() {
+                // V-20: the choke group travels with the graph, not with the
+                // press. A quantized fire chokes when it STARTS, and that
+                // happens on the audio thread, where the document is not
+                // reachable — so the group has to already be in the table.
+                clocks.set_choke_group(
+                    clock,
+                    store.players.iter().find(|p| &p.id == id).and_then(|p| p.choke_group),
+                );
                 let Some(&slot) = slots.get(&crate::ids::TrackId::from(id.as_str())) else {
                     continue;
                 };
@@ -4654,7 +4662,7 @@ mod tests {
 
         let mut graph = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(1)));
         let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(1, 2);
-        clocks.fire(1, 0, 64, false); // ends inside the very first block
+        clocks.fire(1, 0, 64, false, 1.0); // ends inside the very first block
         clocks.bind_slot(0, 1);
         graph.clocks = Arc::new(clocks);
         peers
@@ -5722,7 +5730,7 @@ mod tests {
         {
             let t = ctl.tables.lock();
             assert_eq!(t.player_clocks[&crate::ids::PlayerId::from("p-late")], 1);
-            t.clocks.fire(1, 0, 100_000, false);
+            t.clocks.fire(1, 0, 100_000, false, 1.0);
             t.clocks.advance(64);
         }
 
@@ -5787,13 +5795,100 @@ mod tests {
             "V-2: the arrangement rolled over position 0 and the pad stayed silent"
         );
 
-        g.clocks.fire(1, 0, c.length_samples, false);
+        g.clocks.fire(1, 0, c.length_samples, false, 1.0);
         mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
         for i in 0..64 {
             let want = source.data[c.offset_samples as usize + i] * K;
             assert!(
                 (out[i * 2] - want).abs() < 1e-6 && (out[i * 2 + 1] - want).abs() < 1e-6,
                 "frame {i}: got {}, want {want} (the source's own samples, at unity)",
+                out[i * 2]
+            );
+        }
+    }
+
+    /// V-18, through the real render path rather than through the clock's
+    /// own accessor: a press at a velocity attenuates what reaches the
+    /// master, and it does so for a RAW pad — the one case no `ParamTable`
+    /// value could reach, because `From<&Player>` compiles a raw pad's node
+    /// to a fixed unity.
+    #[test]
+    fn a_raw_pads_press_velocity_scales_what_reaches_the_master() {
+        use crate::audio::transport::LoopSpec;
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2; // centre pan
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let cache = cache_with(&sid, source.clone());
+        let row = player_clip_row(&c, true, &cache);
+
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        // The gain `Player::gain_for_velocity` returns for velocity 64 at
+        // full depth.
+        let gain = (64.0f32 / 127.0).powi(2);
+        g.clocks.fire(1, 0, c.length_samples, false, gain);
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        for i in 0..64 {
+            let want = source.data[c.offset_samples as usize + i] * K * gain;
+            assert!(
+                (out[i * 2] - want).abs() < 1e-6,
+                "frame {i}: got {}, want {want} (the source at the press's velocity)",
+                out[i * 2]
+            );
+        }
+    }
+
+    /// V-21, through the real render path: a quantized press renders NOTHING
+    /// until the block that contains its target, and then renders the pad
+    /// from its own sample 0. `render_impl` calls `arm_pending` itself, so
+    /// this drives only `mixer::render` — which is the point, since a test
+    /// that armed the clock by hand would prove the clock and not the
+    /// engine.
+    #[test]
+    fn a_quantized_press_renders_silence_until_the_block_that_holds_its_beat() {
+        use crate::audio::transport::LoopSpec;
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let cache = cache_with(&sid, source.clone());
+        let row = player_clip_row(&c, true, &cache);
+
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        // Armed for transport sample 100, pressed while the transport is at 0.
+        g.clocks.fire_at(1, 100, 0, c.length_samples, false, 1.0);
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert_eq!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            0.0,
+            "the beat has not come, so the pad is silent"
+        );
+
+        // The next block covers 64..128, which contains sample 100.
+        mixer::render(&mut g, 64, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        for i in 0..64 {
+            let want = source.data[c.offset_samples as usize + i] * K;
+            assert!(
+                (out[i * 2] - want).abs() < 1e-6,
+                "frame {i}: got {}, want {want} (the pad from its OWN sample 0)",
                 out[i * 2]
             );
         }
@@ -5866,7 +5961,7 @@ mod tests {
         let t = ctl.tables.lock();
         let clock = t.player_clocks[&crate::ids::PlayerId::from("p-1")];
         let slot = t.slots[&crate::ids::TrackId::from("p-1")];
-        t.clocks.fire(clock, 0, 64, false);
+        t.clocks.fire(clock, 0, 64, false, 1.0);
         t.clocks.begin_block();
         // Run the one-shot off its end: the clock stops itself and leaves a
         // flush behind, which is precisely the state a scene gets released in.
@@ -5914,7 +6009,7 @@ mod tests {
         clocks.bind_slot(1, 1);
         g.clocks = Arc::new(clocks);
 
-        g.clocks.fire(1, 0, c.length_samples, false);
+        g.clocks.fire(1, 0, c.length_samples, false, 1.0);
         let mut out = vec![0.0f32; 64 * 2];
         mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
         assert!(
@@ -5988,7 +6083,7 @@ mod tests {
 
         // ...and the row is not merely muted: firing it still works, so the
         // early-out skipped a row that had nothing to give, not a live one.
-        g.clocks.fire(1, 0, c.length_samples, false);
+        g.clocks.fire(1, 0, c.length_samples, false, 1.0);
         out.fill(0.0);
         mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
         assert!(
@@ -6040,7 +6135,7 @@ mod tests {
     fn press_and_collect(g: &mut RtGraph, len: u64, blocks: usize) -> Vec<Vec<f32>> {
         use crate::audio::transport::LoopSpec;
         const FRAMES: usize = 64;
-        g.clocks.fire(1, 0, len, false);
+        g.clocks.fire(1, 0, len, false, 1.0);
         let mut out = vec![0.0f32; FRAMES * 2];
         let mut blocks_out = Vec::with_capacity(blocks);
         for _ in 0..blocks {
@@ -6217,7 +6312,7 @@ mod tests {
             let mut out = vec![0.0f32; FRAMES * 2];
             let mut sum = 0.0f64;
             for _press in 0..2 {
-                g.clocks.fire(1, 0, len, false);
+                g.clocks.fire(1, 0, len, false, 1.0);
                 for b in 0..10 {
                     out.fill(0.0);
                     mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
@@ -6334,7 +6429,7 @@ mod tests {
         let flush_blocks = window / FRAMES;
 
         let mut out = vec![0.0f32; FRAMES * 2];
-        g.clocks.fire(1, 0, 10_000, false);
+        g.clocks.fire(1, 0, 10_000, false, 1.0);
         for b in 0..flush_blocks + 5 {
             out.fill(0.0);
             mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
@@ -6715,7 +6810,7 @@ mod tests {
             let clock = t.scene_clocks["b-late"];
             let slot = t.slots[&crate::ids::TrackId::from("t-1")];
             t.clocks.bind_slot(slot, clock);
-            t.clocks.fire(clock, 1_000, 9_000, false);
+            t.clocks.fire(clock, 1_000, 9_000, false, 1.0);
             t.clocks.advance(64);
             (slot, clock)
         };
@@ -6780,7 +6875,7 @@ mod tests {
             let clock = t.scene_clocks["b1"];
             let slot = t.slots[&crate::ids::TrackId::from("t-1")];
             t.clocks.bind_slot(slot, clock);
-            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.fire(clock, 0, 100_000, false, 1.0);
             t.clocks.begin_block(); // the fire's own jump, delivered
             slot
         };
@@ -6832,7 +6927,7 @@ mod tests {
             let clock = t.scene_clocks["b1"];
             let slot = t.slots[&crate::ids::TrackId::from("t-1")];
             t.clocks.bind_slot(slot, clock);
-            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.fire(clock, 0, 100_000, false, 1.0);
             t.clocks.begin_block(); // the fire's own jump, delivered
             assert!(t.clocks.stop(clock), "Escape, mid-clip");
             assert!(!t.clocks.is_on(clock));
@@ -6871,7 +6966,7 @@ mod tests {
             let clock = t.scene_clocks["b1"];
             let slot = t.slots[&crate::ids::TrackId::from("t-1")];
             t.clocks.bind_slot(slot, clock);
-            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.fire(clock, 0, 100_000, false, 1.0);
             t.clocks.begin_block();
             slot
         };
@@ -6912,7 +7007,7 @@ mod tests {
             let clock = t.scene_clocks["b1"];
             let slot = t.slots[&crate::ids::TrackId::from("t-1")];
             t.clocks.bind_slot(slot, clock);
-            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.fire(clock, 0, 100_000, false, 1.0);
             t.clocks.begin_block();
             slot
         };
@@ -6957,7 +7052,7 @@ mod tests {
             let clock = t.scene_clocks["b1"];
             let slot = t.slots[&crate::ids::TrackId::from("t-1")];
             t.clocks.bind_slot(slot, clock);
-            t.clocks.fire(clock, 0, 100, false);
+            t.clocks.fire(clock, 0, 100, false, 1.0);
             t.clocks.advance(128); // past its end: stops itself, owing a jump
             t.clocks.begin_block(); // and the node reads it
             assert!(!t.clocks.is_on(clock));
@@ -7032,7 +7127,7 @@ mod tests {
             let clock = t.scene_clocks["b1"];
             let slot = t.slots[&crate::ids::TrackId::from("t-1")];
             t.clocks.bind_slot(slot, clock);
-            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.fire(clock, 0, 100_000, false, 1.0);
         }));
         ctl.rebuild();
         ctl.after_assembly = None;

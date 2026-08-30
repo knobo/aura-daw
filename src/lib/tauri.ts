@@ -59,6 +59,7 @@ import type {
   OpenSidecarEvent,
   PlayerInfo,
   PlayerSource,
+  PlayerQuantize,
   PlayerTriggerMode,
   PluginCatalog,
   PluginCatalogPatch,
@@ -534,6 +535,16 @@ export interface Backend {
    * pad wires up, per the ledger's ruling that a pad inspector for this
    * belongs here and not to a later task). */
   playerSetTriggerMode?(playerId: string, mode: PlayerTriggerMode): Promise<void>;
+  /** Fire a player with the press's velocity (Plan V — V3, V-18). The
+   * velocity-less `playerFire` is this at 127, which is unity at every
+   * depth — so a mouse press sounds exactly as it did in V2. */
+  playerFireWithVelocity?(playerId: string, velocity: number): Promise<void>;
+  /** Set a pad's quantize division — undoable, journaled (V3, V-21). */
+  playerSetQuantize?(playerId: string, quantize: PlayerQuantize): Promise<void>;
+  /** Set a pad's choke group, `null` for none — undoable (V3, V-20). */
+  playerSetChokeGroup?(playerId: string, group: number | null): Promise<void>;
+  /** Set a pad's velocity-to-gain depth, 0..=1 — undoable (V3, V-18). */
+  playerSetVelocityToGain?(playerId: string, depth: number): Promise<void>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -1200,6 +1211,18 @@ class TauriBackend implements Backend {
   }
   async playerSetTriggerMode(playerId: string, mode: PlayerTriggerMode) {
     await invoke("player_set_trigger_mode", { playerId, mode });
+  }
+  async playerFireWithVelocity(playerId: string, velocity: number) {
+    await invoke("player_fire_with_velocity", { playerId, velocity });
+  }
+  async playerSetQuantize(playerId: string, quantize: PlayerQuantize) {
+    await invoke("player_set_quantize", { playerId, quantize });
+  }
+  async playerSetChokeGroup(playerId: string, group: number | null) {
+    await invoke("player_set_choke_group", { playerId, group });
+  }
+  async playerSetVelocityToGain(playerId: string, depth: number) {
+    await invoke("player_set_velocity_to_gain", { playerId, depth });
   }
 
   libraryScan(dir: string) {

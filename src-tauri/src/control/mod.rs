@@ -154,6 +154,16 @@ pub type EventEmitter = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
 /// The shared control-plane facade. Managed by Tauri (constructed in setup,
 /// after `audio::init`), and handed as an `Arc` to the MCP server.
+/// V-19's voice cap: how many pads may be sounding, or waiting on a beat
+/// to sound, at once. The owner's answer to the design doc's §8 question 1,
+/// with stealing oldest-first.
+///
+/// A cap is what makes the deck honest: each voice is a clock and a mixer
+/// slot, and "unbounded" would mean a press that allocates. Counted over
+/// PLAYER clocks only — a scene is a region of the arrangement that a pad
+/// borrowed, not a voice on the deck.
+pub const VOICE_CAP: usize = 32;
+
 pub struct ControlPlane {
     session: Arc<Mutex<Session>>,
     shared: Arc<SharedRt>,
@@ -531,7 +541,10 @@ impl Committer {
                     | op::PropPath::Param { .. }
                     | op::PropPath::Raw
                     | op::PropPath::TriggerMode
-                    | op::PropPath::PlayerSource => {}
+                    | op::PropPath::PlayerSource
+                    | op::PropPath::Quantize
+                    | op::PropPath::ChokeGroup
+                    | op::PropPath::VelocityToGain => {}
                 }
             }
             // Plan G2: send amounts, resolved through the CURRENT
@@ -1834,7 +1847,8 @@ impl ControlPlane {
                 tables.clocks.bind_slot(slot, clock);
             }
         }
-        tables.clocks.fire(clock, start, end, false);
+        // A scene carries no velocity: unity, as V2 fired it.
+        tables.clocks.fire(clock, start, end, false, 1.0);
         true
     }
 
@@ -1885,6 +1899,13 @@ impl ControlPlane {
         for &clock in tables.scene_clocks.values() {
             tables.clocks.stop(clock);
         }
+        // A pad quantized to a beat is waiting for a transport position that
+        // is not coming any more (V-21). Cancelling is the only alternative
+        // to a press that sounds whenever the song is next played past that
+        // point — which is not "the deck kept playing", it is a pad that
+        // fires on its own, minutes later. A pad already SOUNDING is
+        // untouched: that is the ruling this method exists for.
+        tables.clocks.cancel_pending();
     }
 
     /// Cut everything sounding — every scene AND every player (Escape /
@@ -2014,9 +2035,30 @@ impl ControlPlane {
     /// scene's clock — which is what lets a pad fire under a rolling
     /// arrangement, and two pads sound at once (V-4).
     pub fn player_fire(&self, id: &str) -> Result<(), String> {
+        self.player_fire_with_velocity(id, crate::audio::player::FULL_VELOCITY)
+    }
+
+    /// [`ControlPlane::player_fire`] with the press's velocity (V-18). The
+    /// no-velocity entry point above is this one at
+    /// [`crate::audio::player::FULL_VELOCITY`], which is unity at every
+    /// depth — so a mouse press, and every V2-era caller, sounds exactly as
+    /// it did.
+    ///
+    /// V3 adds three things to V2's two atomic stores, and all three are
+    /// resolved HERE, off the live document, not off the compiled graph
+    /// (which is why none of them rebuilds):
+    ///
+    /// * the **choke group** — but the cut itself is `ClockTable`'s, because
+    ///   a quantized press has to choke when it STARTS, not when it is
+    ///   pressed (V-20);
+    /// * the **voice cap** (V-19) — 32 sounding-or-pending pads, and the
+    ///   33rd press steals the oldest;
+    /// * the **quantize division** (V-21) — with a grid to land on, the fire
+    ///   is armed for a transport position instead of taken now.
+    pub fn player_fire_with_velocity(&self, id: &str, velocity: u8) -> Result<(), String> {
         // Read before the lock: an atomic load has no business under it.
         let rate = self.shared.sample_rate.load(Relaxed);
-        let (len, looping) = {
+        let (len, looping, gain, quantize) = {
             let session = self.session.lock();
             let p = session
                 .store
@@ -2032,6 +2074,8 @@ impl ControlPlane {
                 // a pointerup, not anything the engine can see — so this is
                 // the one and only place trigger mode does anything at all.
                 p.trigger.mode == crate::audio::player::TriggerMode::Loop,
+                p.gain_for_velocity(velocity) as f32,
+                p.trigger.quantize,
             )
         };
         // BEFORE the clock lookup, and that order is the whole point (fix
@@ -2046,14 +2090,106 @@ impl ControlPlane {
         if len == 0 {
             return Ok(());
         }
-        let tables = self.tables.lock();
-        let clock = tables
-            .player_clocks
-            .get(&PlayerId::from(id))
-            .copied()
-            .ok_or_else(|| format!("player has no clock yet: {id}"))?;
-        tables.clocks.fire(clock, 0, len, looping);
+        // V-21. Computed BEFORE the tables lock — it reads the session and
+        // the tempo map, and session-under-tables is the wrong lock order
+        // [C1]. `None` is "there is no grid to wait for": quantize off, or
+        // the transport stopped.
+        let at = self.quantize_target(quantize);
+        let stolen = {
+            let tables = self.tables.lock();
+            let clock = tables
+                .player_clocks
+                .get(&PlayerId::from(id))
+                .copied()
+                .ok_or_else(|| format!("player has no clock yet: {id}"))?;
+            // V-19. A pad that is already sounding is RETRIGGERED, not a
+            // second voice — the clock it would take is the one it already
+            // holds — so the cap only bites when the press needs a voice
+            // that is not already spent. Without this a 32-pad deck could
+            // steal a pad to make room for itself.
+            let stolen = if tables.clocks.holds_voice(clock)
+                || tables.clocks.voices_in_use() < VOICE_CAP
+            {
+                None
+            } else {
+                // `oldest_voice` cannot answer `clock` here: that branch is
+                // the one above.
+                tables.clocks.oldest_voice().inspect(|&victim| {
+                    tables.clocks.stop(victim);
+                })
+            };
+            match at {
+                Some(at) => tables.clocks.fire_at(clock, at, 0, len, looping, gain),
+                None => tables.clocks.fire(clock, 0, len, looping, gain),
+            }
+            stolen.and_then(|victim| {
+                tables
+                    .player_clocks
+                    .iter()
+                    .find(|(_, &c)| c == victim)
+                    .map(|(id, _)| id.to_string())
+            })
+        };
+        // Outside the lock: an emit is a frontend round trip, and V-19 asks
+        // for stealing to be VISIBLE, not for it to be visible from under
+        // the tables lock.
+        if let Some(stolen) = stolen {
+            (self.emit)("player://stolen", serde_json::json!({ "playerId": stolen }));
+        }
         Ok(())
+    }
+
+    /// The transport position a press quantized to `quantize` should start
+    /// at, or `None` for "start now" (V-21).
+    ///
+    /// `None` covers three cases that are one case musically — there is no
+    /// grid to land on:
+    ///
+    /// * `Quantize::Off`, the default and V2's only behaviour;
+    /// * the transport is STOPPED, so `base_pos` is never going to reach any
+    ///   target and the alternative to firing now is a pad that never sounds;
+    /// * the tempo map cannot be built (no device, so no rate), or the
+    ///   boundary converts back to a position that is not actually ahead of
+    ///   the playhead.
+    fn quantize_target(&self, quantize: crate::audio::player::Quantize) -> Option<u64> {
+        if quantize == crate::audio::player::Quantize::Off {
+            return None;
+        }
+        if !matches!(self.transport_state().state.as_str(), "playing" | "recording") {
+            return None;
+        }
+        let rate = self.shared.sample_rate.load(Relaxed);
+        if rate == 0 {
+            return None;
+        }
+        let pos = self.shared.position.load(Relaxed);
+        let session = self.session.lock();
+        let ppq = session.midi.ppq;
+        let map = crate::midi::TempoMap::new(ppq, session.midi.tempo_events.clone(), rate).ok()?;
+        let tick = map.samples_to_tick(pos);
+        // A bar's length is the METER's, and it is measured from the
+        // signature change that governs it — the one thing here that cannot
+        // be anchored at tick 0. Every other division is a fixed number of
+        // quarters, and quarters line up with tick 0 wherever the meter
+        // sits.
+        let (origin, grid) = match quantize.quarters() {
+            Some(q) => (0u64, ((q * f64::from(ppq)).round() as u64).max(1)),
+            None => {
+                let e = session
+                    .midi
+                    .meter_events
+                    .iter()
+                    .filter(|e| e.tick <= tick)
+                    .max_by_key(|e| e.tick)
+                    .copied()
+                    .unwrap_or(crate::midi::MeterEvent { tick: 0, num: 4, den: 4 });
+                let bar = (u64::from(e.num) * u64::from(ppq) * 4 / u64::from(e.den).max(1)).max(1);
+                (e.tick, bar)
+            }
+        };
+        let next = origin + ((tick.saturating_sub(origin)) / grid + 1) * grid;
+        let target = map.tick_to_samples(next);
+        (target > pos).then_some(target)
     }
 
     /// Cut a player: stop its clock, leaving one discontinuity behind for the
@@ -2111,6 +2247,63 @@ impl ControlPlane {
             })
         })?;
         Ok(())
+    }
+
+    /// Set one V3 player property through the transaction channel. Same
+    /// shape and same reasoning as [`ControlPlane::set_trigger_mode`]: all
+    /// three are read off the live document on every press
+    /// ([`ControlPlane::player_fire_with_velocity`]), never off the
+    /// compiled graph, so none of them rebuilds and none of them touches
+    /// `GraphTables`.
+    fn set_player_prop(
+        &self,
+        id: &str,
+        path: op::PropPath,
+        to: serde_json::Value,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::Set {
+                object: op::ObjectRef::Player(PlayerId::from(id)),
+                path,
+                from: serde_json::Value::Null,
+                to,
+            })
+        })?;
+        Ok(())
+    }
+
+    pub fn set_quantize(
+        &self,
+        id: &str,
+        quantize: crate::audio::player::Quantize,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.set_player_prop(id, op::PropPath::Quantize, serde_json::to_value(quantize).unwrap(), meta)
+    }
+
+    /// `None` takes the pad out of every group — the state a migrated V2
+    /// player has, and the only way back to it.
+    pub fn set_choke_group(
+        &self,
+        id: &str,
+        group: Option<u8>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let to = match group {
+            Some(g) => serde_json::json!(g),
+            None => serde_json::Value::Null,
+        };
+        self.set_player_prop(id, op::PropPath::ChokeGroup, to, meta)
+    }
+
+    pub fn set_velocity_to_gain(
+        &self,
+        id: &str,
+        depth: f64,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.set_player_prop(id, op::PropPath::VelocityToGain, serde_json::json!(depth), meta)
     }
 
     /// Add a player through the transaction channel (`Op::PlayerAdd`), so it
@@ -6057,6 +6250,39 @@ pub fn player_set_trigger_mode(
     control.set_trigger_mode(&player_id, mode, op::TxMeta::user("set trigger mode"))
 }
 
+/// Set a pad's quantize division (Plan V — V3) — thin delegate over
+/// [`ControlPlane::set_quantize`].
+#[tauri::command]
+pub fn player_set_quantize(
+    player_id: String,
+    quantize: crate::audio::player::Quantize,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.set_quantize(&player_id, quantize, op::TxMeta::user("set quantize"))
+}
+
+/// Set a pad's choke group, `null` for none (Plan V — V3) — thin delegate
+/// over [`ControlPlane::set_choke_group`].
+#[tauri::command]
+pub fn player_set_choke_group(
+    player_id: String,
+    group: Option<u8>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.set_choke_group(&player_id, group, op::TxMeta::user("set choke group"))
+}
+
+/// Set a pad's velocity-to-gain depth, 0..=1 (Plan V — V3) — thin delegate
+/// over [`ControlPlane::set_velocity_to_gain`].
+#[tauri::command]
+pub fn player_set_velocity_to_gain(
+    player_id: String,
+    depth: f64,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.set_velocity_to_gain(&player_id, depth, op::TxMeta::user("set velocity depth"))
+}
+
 /// Open a gesture boundary (Plan E Task 14 — round-2 inventory row 31, ADR
 /// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. Returns the
 /// new gesture's id so a later `gesture_end` can refuse to close a
@@ -6439,6 +6665,13 @@ mod tests {
             .map(|(i, p)| (p.id.clone(), 1 + i as u32))
             .collect();
         for (id, &clock) in player_clocks.iter() {
+            // Mirrors `engine::rebuild`: the choke group is a document
+            // property that has to be IN the table, because a quantized fire
+            // chokes from the audio thread (V-20).
+            clocks.set_choke_group(
+                clock,
+                store.players.iter().find(|p| &p.id == id).and_then(|p| p.choke_group),
+            );
             if let Some(&slot) = slots.get(&TrackId::from(id.as_str())) {
                 clocks.bind_slot(slot, clock);
             }
@@ -6754,6 +6987,281 @@ mod tests {
             cp.player_stop("ghost").unwrap_err().contains("unknown player"),
             "and a pad that is not in the document at all still says that"
         );
+    }
+
+    // ---- Plan V — V3: polyphony (V-18…V-21) ---------------------------
+
+    fn set_player(cp: &ControlPlane, id: &str, path: PropPath, to: serde_json::Value) {
+        cp.commit(TxMeta::user("v3"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Player(PlayerId::from(id)),
+                path,
+                from: serde_json::Value::Null,
+                to,
+            })
+        })
+        .unwrap();
+    }
+
+    /// The gate's first line: eight pads sounding at once. Each owns its own
+    /// clock and its own slot, so this costs eight atomic writes and no
+    /// allocation, and nothing about the eighth press differs from the first.
+    #[test]
+    fn eight_pads_sound_simultaneously() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let ids: Vec<String> = (0..8).map(|_| add_audio_player(&cp, "c1", true)).collect();
+        for id in &ids {
+            cp.player_fire(id).unwrap();
+        }
+        // Clocks resolved BEFORE the guard: `player_clock_for` takes the
+        // same lock, and `parking_lot::Mutex` is not reentrant.
+        let clocks: Vec<u32> = ids.iter().map(|id| cp.player_clock_for(id).unwrap()).collect();
+        let tables = cp.tables_for_tests();
+        for (id, &clock) in ids.iter().zip(&clocks) {
+            assert!(tables.clocks.is_on(clock), "pad {id} is silent");
+        }
+        assert_eq!(tables.clocks.voices_in_use(), 8);
+    }
+
+    /// V-19. The 33rd press takes the oldest pad's voice, and says so — the
+    /// "visible" half of the owner's answer to design §8 question 1.
+    #[test]
+    fn the_press_past_the_voice_cap_steals_the_oldest_pad_and_announces_it() {
+        let (cp, _rx, events) = test_plane_with_tracks(&["t-1"]);
+        cp.session.lock().store.clips.push(test_clip("c1", "t-1"));
+        republish_tables(&cp);
+        let ids: Vec<String> =
+            (0..=VOICE_CAP).map(|_| add_audio_player(&cp, "c1", true)).collect();
+        for id in ids.iter().take(VOICE_CAP) {
+            cp.player_fire(id).unwrap();
+        }
+        assert_eq!(cp.tables_for_tests().clocks.voices_in_use(), VOICE_CAP);
+
+        cp.player_fire(&ids[VOICE_CAP]).unwrap();
+        let oldest = cp.player_clock_for(&ids[0]).unwrap();
+        let newest = cp.player_clock_for(&ids[VOICE_CAP]).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_on(oldest), "the pad pressed first gave up its voice");
+        assert!(tables.clocks.is_on(newest));
+        assert_eq!(tables.clocks.voices_in_use(), VOICE_CAP, "the cap holds");
+        drop(tables);
+
+        let stolen: Vec<_> = events
+            .lock()
+            .iter()
+            .filter(|(name, _)| name == "player://stolen")
+            .map(|(_, v)| v["playerId"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(stolen, vec![ids[0].clone()], "and the deck was told which pad went");
+    }
+
+    /// A pad that is already sounding is RETRIGGERED, not a second voice —
+    /// the clock it would take is the one it already holds. Without that
+    /// check a full deck would steal a pad to make room for itself, which at
+    /// the cap means every press cutting some other pad for no reason.
+    #[test]
+    fn retriggering_a_sounding_pad_at_the_cap_steals_nothing() {
+        let (cp, _rx, events) = test_plane_with_tracks(&["t-1"]);
+        cp.session.lock().store.clips.push(test_clip("c1", "t-1"));
+        republish_tables(&cp);
+        let ids: Vec<String> = (0..VOICE_CAP).map(|_| add_audio_player(&cp, "c1", true)).collect();
+        for id in &ids {
+            cp.player_fire(id).unwrap();
+        }
+        cp.player_fire(&ids[5]).unwrap();
+
+        let clocks: Vec<u32> = ids.iter().map(|id| cp.player_clock_for(id).unwrap()).collect();
+        let tables = cp.tables_for_tests();
+        for (id, &clock) in ids.iter().zip(&clocks) {
+            assert!(tables.clocks.is_on(clock), "pad {id} was cut");
+        }
+        drop(tables);
+        assert!(
+            !events.lock().iter().any(|(name, _)| name == "player://stolen"),
+            "nothing was stolen, so nothing was announced"
+        );
+    }
+
+    /// V-20's gate: a choke group of two, and the second press cuts the
+    /// first inside one block — `ClockTable::stop`, so the cut pad's
+    /// `all_notes_off` rides the path an ending already uses.
+    #[test]
+    fn a_choke_group_cuts_the_pad_that_was_sounding() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let open = add_audio_player(&cp, "c1", true);
+        let closed = add_audio_player(&cp, "c1", true);
+        let other = add_audio_player(&cp, "c1", true);
+        set_player(&cp, &open, PropPath::ChokeGroup, serde_json::json!(1));
+        set_player(&cp, &closed, PropPath::ChokeGroup, serde_json::json!(1));
+        republish_tables(&cp); // the group reaches the table at graph build
+
+        cp.player_fire(&open).unwrap();
+        cp.player_fire(&other).unwrap();
+        cp.player_fire(&closed).unwrap();
+
+        let (c_open, c_closed, c_other) = (
+            cp.player_clock_for(&open).unwrap(),
+            cp.player_clock_for(&closed).unwrap(),
+            cp.player_clock_for(&other).unwrap(),
+        );
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_on(c_open), "cut by its group");
+        assert!(tables.clocks.is_on(c_closed));
+        assert!(tables.clocks.is_on(c_other), "a pad in no group is untouched");
+    }
+
+    /// V-18. The press's velocity reaches the clock every slot bound to it
+    /// reads, and a press with no velocity is unity — which is what leaves
+    /// every V2 caller, and the V-16 ear-check, exactly where they were.
+    #[test]
+    fn velocity_reaches_the_clock_and_a_plain_press_is_unity() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        let clock = cp.player_clock_for(&id).unwrap();
+        let slot = cp.tables_for_tests().slots[&TrackId::from(id.as_str())];
+
+
+        cp.player_fire(&id).unwrap();
+        assert_eq!(cp.tables_for_tests().clocks.playhead(slot, 0, false).gain, 1.0);
+
+        cp.player_fire_with_velocity(&id, 64).unwrap();
+        let g = cp.tables_for_tests().clocks.playhead(slot, 0, false).gain;
+        assert!((g - (64.0f32 / 127.0).powi(2)).abs() < 1e-6, "got {g}");
+        assert!(cp.tables_for_tests().clocks.is_on(clock));
+    }
+
+    /// Depth 0 is "a press is a press": the pad sounds at unity however hard
+    /// it was hit. It is the one setting that makes a velocity-sensitive
+    /// controller behave like V2's mouse click.
+    #[test]
+    fn a_zero_depth_pad_ignores_velocity() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        set_player(&cp, &id, PropPath::VelocityToGain, serde_json::json!(0.0));
+        let slot = cp.tables_for_tests().slots[&TrackId::from(id.as_str())];
+        cp.player_fire_with_velocity(&id, 1).unwrap();
+        assert_eq!(cp.tables_for_tests().clocks.playhead(slot, 0, false).gain, 1.0);
+    }
+
+    /// V-21. With the arrangement running, a quantized press is ARMED, not
+    /// taken: nothing sounds until the transport reaches the boundary.
+    #[test]
+    fn a_quantized_press_waits_for_the_beat_with_the_arrangement_running() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        set_player(&cp, &id, PropPath::Quantize, serde_json::json!("quarter"));
+        cp.transport(TransportAction::Play).unwrap();
+        // A quarter at 120 bpm / 48 kHz is 24 000 samples; press a third of
+        // the way into the second beat.
+        cp.shared.position.store(32_000, Relaxed);
+        cp.player_fire(&id).unwrap();
+
+        let clock = cp.player_clock_for(&id).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_on(clock), "the press has not sounded yet");
+        assert!(tables.clocks.is_pending(clock));
+        assert!(!tables.clocks.arm_pending(32_000, 512), "still short of the beat");
+        assert!(
+            tables.clocks.arm_pending(47_800, 512),
+            "the block containing sample 48 000 is the one that starts it"
+        );
+        assert!(tables.clocks.is_on(clock), "and it lands on the beat, not on the press");
+    }
+
+    /// The other half of V-21, and the one a user meets first: with the
+    /// transport STOPPED there is no grid, so a quantized pad sounds now.
+    /// Waiting would be a pad that never fires.
+    #[test]
+    fn a_quantized_press_sounds_now_when_the_transport_is_stopped() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        set_player(&cp, &id, PropPath::Quantize, serde_json::json!("bar"));
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+        assert!(cp.tables_for_tests().clocks.is_on(clock));
+        assert!(!cp.tables_for_tests().clocks.is_pending(clock));
+    }
+
+    /// Stopping the song drops a press that is still waiting for a beat: the
+    /// grid it was queued against has stopped existing, and the alternative
+    /// is a pad that fires on its own whenever the song is next played past
+    /// that point. A pad already SOUNDING is left alone — that is V-2, and
+    /// `stopping_the_transport_leaves_a_sounding_pad_alone` pins it.
+    #[test]
+    fn stopping_the_transport_drops_a_press_that_was_waiting_for_a_beat() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let waiting = add_audio_player(&cp, "c1", true);
+        let sounding = add_audio_player(&cp, "c1", true);
+        set_player(&cp, &waiting, PropPath::Quantize, serde_json::json!("quarter"));
+        cp.transport(TransportAction::Play).unwrap();
+        cp.shared.position.store(32_000, Relaxed);
+        cp.player_fire(&waiting).unwrap();
+        cp.player_fire(&sounding).unwrap();
+
+        cp.transport(TransportAction::Stop).unwrap();
+        let (c_waiting, c_sounding) = (
+            cp.player_clock_for(&waiting).unwrap(),
+            cp.player_clock_for(&sounding).unwrap(),
+        );
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_pending(c_waiting));
+        assert!(!tables.clocks.arm_pending(0, 10_000_000), "nothing is left queued");
+        assert!(tables.clocks.is_on(c_sounding), "the song stopped; the performance did not");
+    }
+
+    /// The three V3 properties are document state like any other: undoable,
+    /// and byte-identical on the way back. `chokeGroup`'s `null` is a real
+    /// value, not a missing one — it is how a pad leaves its group.
+    #[test]
+    fn the_v3_player_properties_undo_to_what_they_were() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        let before = serde_json::to_value(cp.players()).unwrap();
+
+        cp.set_quantize(&id, crate::audio::player::Quantize::Bar, TxMeta::user("q")).unwrap();
+        cp.set_choke_group(&id, Some(7), TxMeta::user("c")).unwrap();
+        cp.set_velocity_to_gain(&id, 0.25, TxMeta::user("v")).unwrap();
+        let p = cp.players().into_iter().find(|p| p.id.as_str() == id).unwrap();
+        assert_eq!(p.trigger.quantize, crate::audio::player::Quantize::Bar);
+        assert_eq!(p.choke_group, Some(7));
+        assert_eq!(p.velocity_to_gain, 0.25);
+
+        cp.undo().unwrap();
+        cp.undo().unwrap();
+        cp.undo().unwrap();
+        assert_eq!(serde_json::to_value(cp.players()).unwrap(), before);
+
+        // Distinct LABELS, because the history merges same-label edits to
+        // one entry inside `COALESCE_WINDOW` (the knob-drag rule), and this
+        // test is about the inverse, not about that merge.
+        cp.set_choke_group(&id, Some(7), TxMeta::user("join")).unwrap();
+        cp.set_choke_group(&id, None, TxMeta::user("leave")).unwrap();
+        let p = cp.players().into_iter().find(|p| p.id.as_str() == id).unwrap();
+        assert_eq!(p.choke_group, None, "null takes the pad out of its group");
+        cp.undo().unwrap();
+        let p = cp.players().into_iter().find(|p| p.id.as_str() == id).unwrap();
+        assert_eq!(p.choke_group, Some(7), "and undo puts it back");
+    }
+
+    /// A depth outside 0..=1 is clamped on WRITE, so the inverse an undo
+    /// records observes what the document holds rather than what the caller
+    /// asked for — the round-trip rule `Gain`'s clamp established. Undoing
+    /// a clamped write must land on 0.25, never on the 4.0 nobody stored.
+    #[test]
+    fn an_out_of_range_velocity_depth_is_clamped_where_the_inverse_can_see_it() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        let depth = |cp: &ControlPlane| {
+            cp.players().into_iter().find(|p| p.id.as_str() == id).unwrap().velocity_to_gain
+        };
+        cp.set_velocity_to_gain(&id, 0.25, TxMeta::user("quarter")).unwrap();
+        cp.set_velocity_to_gain(&id, 4.0, TxMeta::user("over")).unwrap();
+        assert_eq!(depth(&cp), 1.0);
+        cp.undo().unwrap();
+        assert_eq!(depth(&cp), 0.25);
+
+        cp.set_velocity_to_gain(&id, -1.0, TxMeta::user("under")).unwrap();
+        assert_eq!(depth(&cp), 0.0);
     }
 
     /// `TriggerMode::Loop` is what `ClockTable::fire`'s `looping` flag is

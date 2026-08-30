@@ -956,11 +956,12 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // set of inserts, sends and clips the assembly emits — so they
             // rebuild. Nothing else here does. `Name` is a pure label
             // (document-only, same as the Track arm's `Name`/`Group`
-            // treatment above) and `TriggerMode` is read off the live
-            // document per-trigger, not off the compiled graph. Written as an
-            // explicit allow-list, not a negation, so a player path added
-            // later defaults to NOT rebuilding until this is looked at,
-            // rather than silently forcing one.
+            // treatment above); `TriggerMode`, and V3's `Quantize`,
+            // `ChokeGroup` and `VelocityToGain` with it, are read off the
+            // live document per-trigger, not off the compiled graph. Written
+            // as an explicit allow-list, not a negation, so a player path
+            // added later defaults to NOT rebuilding until this is looked
+            // at, rather than silently forcing one.
             effect.rebuild = matches!(path, PropPath::Raw | PropPath::PlayerSource);
             // Plan V — V2 (Task 9): the strip fields are PARAM WRITES now
             // that a player owns a mixer slot (`engine::rebuild`'s
@@ -2184,6 +2185,9 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         | PropPath::Raw
         | PropPath::TriggerMode
         | PropPath::PlayerSource
+        | PropPath::Quantize
+        | PropPath::ChokeGroup
+        | PropPath::VelocityToGain
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin/Player path)"))
         }
@@ -2289,6 +2293,9 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
         | PropPath::Raw
         | PropPath::TriggerMode
         | PropPath::PlayerSource
+        | PropPath::Quantize
+        | PropPath::ChokeGroup
+        | PropPath::VelocityToGain
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin/Player path)"))
         }
@@ -2305,6 +2312,12 @@ fn read_player_prop(p: &crate::audio::player::Player, path: PropPath) -> Result<
         PropPath::Raw => Ok(serde_json::json!(p.raw)),
         PropPath::TriggerMode => Ok(serde_json::to_value(p.trigger.mode).unwrap()),
         PropPath::PlayerSource => Ok(serde_json::to_value(&p.source).unwrap()),
+        PropPath::Quantize => Ok(serde_json::to_value(p.trigger.quantize).unwrap()),
+        PropPath::ChokeGroup => Ok(match p.choke_group {
+            Some(g) => serde_json::json!(g),
+            None => serde_json::Value::Null,
+        }),
+        PropPath::VelocityToGain => Ok(serde_json::json!(p.velocity_to_gain)),
         PropPath::Name => Ok(serde_json::json!(p.name)),
         PropPath::Gain => Ok(serde_json::json!(p.node.gain_db)),
         PropPath::Pan => Ok(serde_json::json!(p.node.pan)),
@@ -2356,6 +2369,34 @@ fn write_player_prop(
             p.source = serde_json::from_value(to.clone())
                 .map_err(|e| format!("source: {e}"))?;
             Ok(serde_json::to_value(&p.source).unwrap())
+        }
+        PropPath::Quantize => {
+            p.trigger.quantize =
+                serde_json::from_value(to.clone()).map_err(|e| format!("quantize: {e}"))?;
+            Ok(serde_json::to_value(p.trigger.quantize).unwrap())
+        }
+        // `null` is a real value here, not a missing one: it is how a pad
+        // leaves its group, and the only way back to what every migrated
+        // V2 player has.
+        PropPath::ChokeGroup => {
+            p.choke_group = match to {
+                serde_json::Value::Null => None,
+                v => Some(
+                    u8::try_from(v.as_u64().ok_or("chokeGroup must be 0..=255 or null")?)
+                        .map_err(|_| "chokeGroup must be 0..=255 or null")?,
+                ),
+            };
+            Ok(match p.choke_group {
+                Some(g) => serde_json::json!(g),
+                None => serde_json::Value::Null,
+            })
+        }
+        // Clamped on write, like `Gain`, so the inverse observes what the
+        // document holds rather than what the caller asked for.
+        PropPath::VelocityToGain => {
+            p.velocity_to_gain =
+                to.as_f64().ok_or("velocityToGain must be a number")?.clamp(0.0, 1.0);
+            Ok(serde_json::json!(p.velocity_to_gain))
         }
         PropPath::Name => {
             let n = to.as_str().ok_or("name must be a string")?.trim().to_string();
@@ -2436,6 +2477,9 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         | PropPath::Raw
         | PropPath::TriggerMode
         | PropPath::PlayerSource
+        | PropPath::Quantize
+        | PropPath::ChokeGroup
+        | PropPath::VelocityToGain
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a MidiClip property"))
         }
@@ -2515,6 +2559,9 @@ fn write_midi_prop(
         | PropPath::Raw
         | PropPath::TriggerMode
         | PropPath::PlayerSource
+        | PropPath::Quantize
+        | PropPath::ChokeGroup
+        | PropPath::VelocityToGain
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a MidiClip property"))
         }
@@ -2556,6 +2603,9 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::Raw
         | PropPath::TriggerMode
         | PropPath::PlayerSource
+        | PropPath::Quantize
+        | PropPath::ChokeGroup
+        | PropPath::VelocityToGain
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
@@ -2633,6 +2683,9 @@ fn write_transport_prop(
         | PropPath::Raw
         | PropPath::TriggerMode
         | PropPath::PlayerSource
+        | PropPath::Quantize
+        | PropPath::ChokeGroup
+        | PropPath::VelocityToGain
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }

@@ -481,6 +481,13 @@ pub enum PropPath {
     Raw,
     /// Player: `"oneShot" | "gate" | "loop"` (wire: JSON string).
     TriggerMode,
+    /// Player: `"off" | "sixteenth" | "eighth" | "quarter" | "whole" |
+    /// "bar"` (wire: JSON string). V3.
+    Quantize,
+    /// Player: the choke group, `0..=255` or JSON `null` for none. V3.
+    ChokeGroup,
+    /// Player: velocity-to-gain depth, `0.0..=1.0` (wire: JSON number). V3.
+    VelocityToGain,
     /// Player: the whole tagged `PlayerSource` object. One path rather than
     /// three, because changing a pad's source changes `kind` and its fields
     /// together — two ops could leave a `midiClip` source carrying an
