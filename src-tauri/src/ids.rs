@@ -74,6 +74,26 @@ impl LaneId {
     }
 }
 
+/// Namespace for a player minted BY THE LAUNCH MIGRATION, so re-running it
+/// on the same clip yields the same id.
+const AURA_MIGRATED_PLAYER_NS: uuid::Uuid = uuid::uuid!("1f7b3c92-8e04-4a6d-9c15-2b8de6417a03");
+
+impl PlayerId {
+    /// The player the launch migration mints for a clip. Derived from the
+    /// clip id rather than random, because the migration is **in-memory
+    /// only** — it re-runs on every open until the project is saved, and a
+    /// random id would be a different player each time.
+    ///
+    /// What that costs if it is random: a control-surface pad bound to a
+    /// migrated player stores `player:<id>` in localStorage, which outlives
+    /// the session. Close without saving, reopen, and the pad points at an
+    /// id nothing has any more — a dead pad, silently. Deriving the id makes
+    /// the migration idempotent in IDENTITY, not merely in count.
+    pub fn for_migrated_clip(clip_id: &str) -> Self {
+        Self(uuid::Uuid::new_v5(&AURA_MIGRATED_PLAYER_NS, clip_id.as_bytes()).to_string())
+    }
+}
+
 /// Per-content sequential note id (round-2 §2.1). `0` is the wire sentinel
 /// for "not yet assigned" — every note inside the document has id >= 1,
 /// minted from its clip's persisted watermark. Values above `i32::MAX` must

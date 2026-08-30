@@ -185,7 +185,10 @@ pub fn migrate_clip_targets_to_players(
             let player_id = by_clip
                 .entry(clip_id)
                 .or_insert_with(|| {
-                    let mut p = Player::new(crate::ids::PlayerId::mint(), b.name.clone());
+                    let mut p = Player::new(
+                        crate::ids::PlayerId::for_migrated_clip(clip.id.as_str()),
+                        b.name.clone(),
+                    );
                     p.source = PlayerSource::MidiClip {
                         clip_id: clip.id.clone(),
                         instrument_id: instrument_of_track(tracks, &clip.track_id),
@@ -2228,6 +2231,37 @@ mod tests {
             maps[0].bindings[0].target,
             LaunchTarget::Player { player_id: player_id_after_first },
             "and it is still the SAME player, not a fresh one"
+        );
+    }
+
+    /// The close-without-saving case, which the two-runs test above cannot
+    /// see: the migration is IN-MEMORY ONLY, so an unsaved project arrives
+    /// at the next open with its `Clip` targets intact and no players — a
+    /// fresh run over fresh maps, not a second run over migrated ones.
+    ///
+    /// A control-surface pad bound to a migrated player stores
+    /// `player:<id>` in localStorage, which outlives the session. If the id
+    /// were random the pad would point at nothing after that reopen, and
+    /// would be silently dead.
+    #[test]
+    fn migrating_the_same_unsaved_project_twice_mints_the_same_player_id() {
+        let clips = vec![test_midi_clip("mc1", "t1")];
+
+        let run = || {
+            let mut players = Vec::new();
+            let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+            migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+            match &maps[0].bindings[0].target {
+                LaunchTarget::Player { player_id } => player_id.clone(),
+                other => panic!("expected a Player target, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            run(),
+            run(),
+            "an unsaved project reopened must land on the SAME player id, or every \
+             surface pad bound to it dies"
         );
     }
 
