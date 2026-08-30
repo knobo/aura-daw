@@ -190,17 +190,23 @@ negotiable — each cut is a foundation, not a feature.
 Answers change the size of V3 and V6. Recorded here unanswered rather than
 guessed at.
 
+**1, 2 and 4 were answered on 2026-08-30, each as recommended** — that is
+what unblocked V3 (PR #137). 3 and 5 are still open and block nothing.
+
 1. **Voice cap** — 8, 16, 32? Each sounding player costs a slot and a
    playhead. A fixed cap is RT-friendly and honest; "unbounded" is neither.
    *Recommendation: 32, with visible voice stealing (oldest first).*
+   **Answered 2026-08-30: yes — `ControlPlane::VOICE_CAP`, ruling V-19.**
 2. **Choke groups** — one group per pad (classic hi-hat), or arbitrary sets?
    *Recommendation: one `chokeGroup: u8?` per player; sets can wait.*
+   **Answered 2026-08-30: yes — `Player::choke_group`, ruling V-20.**
 3. **Are players visible in the mixer** alongside tracks and buses, or only
    on the surface? *Recommendation: visible, collapsed under one "DECK"
    group — a player with sends and an output belongs where routing is read.*
 4. **Retrospective capture** ("I just played something good, keep it") — own
    cut after V6, or part of it? *Recommendation: own cut; it needs a rolling
    buffer decision of its own.*
+   **Answered 2026-08-30: yes — its own cut, after V6.**
 5. **Does a raw audio player ignore the deck's master gain too**, or only
    the source track's chain? *Recommendation: only the source track's — the
    deck's own output stage is still a mixer node like any other.*

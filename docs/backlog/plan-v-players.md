@@ -1,7 +1,7 @@
 # Backlog: Plan V — players (a pad that is an instrument)
 
 **Opened 2026-08-26.** V1 landed 2026-08-27 (PR #118). V2 landed 2026-08-30
-(PR #121) — V3 is unclaimed.
+(PR #121). V3 landed 2026-08-30 (PR #137) — V4 is unblocked.
 
 Design + rulings V-1…V-12: [`docs/superpowers/specs/2026-08-26-plan-v-players-design.md`](../superpowers/specs/2026-08-26-plan-v-players-design.md).
 Audit of what the engine already has: [`docs/research/13-players-and-performance.md`](../research/13-players-and-performance.md).
@@ -26,8 +26,8 @@ tracks (§8.5) and per-voice modulation (§8.8). Plan V builds those arms.
 |---|---|---|
 | **V1** | `MixNode` as the compiler's input; tracks and buses become producers. Behaviour-neutral. | landed — PR #118 |
 | **V2** | One player, real: document + ops, graph slot, audio/MIDI sources, own playhead, one-shot/gate/loop, `player_fire`/`player_stop`. Retires the overlay; migrates launch bindings. | landed — PR #121 |
-| V3 | Polyphony: voice cap, choke groups, quantized start, velocity → gain. | **unblocked — start here** |
-| V4 | Per-node automation clock; modulation §8.1 ports. | blocked on V2 (V3 not required) |
+| **V3** | Polyphony: voice cap, choke groups, quantized start, velocity → gain. | landed — PR #137 |
+| V4 | Per-node automation clock; modulation §8.1 ports. | **unblocked — start here** |
 | V5 | Macros (§8.3): document rows, cycle check, surface knobs bound through them. | blocked on V4 |
 | V6 | Recording: elements + automation, V-9 target rule, V-10 lane rule, V-11 deck arm. | blocked on V3 + V4 |
 | V7 | Pad inspector, per-pad record display, `Op::ControlSurfaceSet` (was control-surface v0.3). | blocked on V6 |
@@ -168,17 +168,100 @@ produced.
   Neither is created or worsened by V2; both are candidates for a future
   cut that revisits the stop/release paths.
 
-## V3 — polyphony
+## V3 — polyphony (landed, PR #137)
 
-Voice cap (open question 1 — recommendation 32), voice stealing oldest-first
-and visible, `chokeGroup`, quantized start (off / 1/16 / 1/8 / 1/4 / 1/1 /
-bar), velocity → gain.
+Voice cap 32 with visible stealing, `chokeGroup`, quantized start (off /
+1/16 / 1/8 / 1/4 / 1/1 / bar), velocity → gain. The owner answered the
+design doc's §8 questions 1, 2 and 4 on 2026-08-30 — 32 with oldest-first
+stealing, one `chokeGroup` per player, and retrospective capture as its own
+cut after V6 — which is what made this cut sizeable at all.
 
-**Gate.** Eight pads sounding simultaneously with no allocation on the RT
-thread (the existing RT-safety discipline applies: fixed-size state,
-preallocated scratch). A choke group of two: the second press cuts the first
-inside one block. Quantize 1/4 with the arrangement running: the fire lands
-on the beat, not on the press.
+**Gate — met.** Eight pads sounding simultaneously with no RT allocation
+(`eight_pads_sound_simultaneously`). A choke group of two, the second press
+cutting the first inside one block
+(`a_choke_group_cuts_the_pad_that_was_sounding`, and the clock's own
+`a_choke_group_cuts_its_siblings_when_the_next_one_starts`). Quantize 1/4
+with the arrangement running landing on the beat
+(`a_quantized_press_waits_for_the_beat_with_the_arrangement_running`, and
+through `mixer::render` itself in
+`a_quantized_press_renders_silence_until_the_block_that_holds_its_beat`).
+
+Perf, same sitting on the same machine: `origin/main` 564.7 µs, this branch
+462.4 µs (bare, 32 tracks, best of 3; main's spread was 29.2%, so read this
+as "unmoved", not as "faster").
+
+### Rulings V-18…V-21
+
+| Ruling | What it says |
+|---|---|
+| **V-18** | Velocity scales a pad's output whatever `raw` says. Velocity is a property of the PRESS, not of the chain, so V-6 has no opinion on it and V-16's "unity" reads as unity at full velocity — which is the velocity the owner's ear-check press carries. The curve is squared (`v/127` alone spends most of a pad's travel in the top few dB), and `velocityToGain` is a 0..=1 depth defaulting to 1.0. |
+| **V-19** | The deck holds 32 voices, counted over PLAYER clocks only — a scene is a region of the arrangement, not a voice. A pad that is armed but not sounding (V-21) counts. Stealing is oldest-first, by PRESS order rather than clock index, and is announced on `player://stolen`. A retrigger of a sounding pad is not a second voice: without that, a full deck would steal a pad to make room for itself. |
+| **V-20** | A choke cuts through `ClockTable::stop`, so the choked pad's `all_notes_off` rides the path an ending already delivers, and it fires when the choker STARTS, not when it is pressed — which is what lets a quantized choke land on the beat instead of silencing its sibling early and leaving a hole. One group per pad; a pad in no group chokes nothing and is choked by nothing, which is every V2-era player. |
+| **V-21** | A quantized press resolves to a BLOCK, not a sample: a clock has one position per block, so "start 143 frames in" is not expressible without a second playhead concept. It starts on the block that CONTAINS its target (half a block early on average rather than a whole block late). With the transport STOPPED there is no grid, so the press sounds now; and stopping the transport cancels a press still waiting, because `base_pos` is never reaching that target again. |
+
+### Where each piece lives
+
+* **Document** — `audio/player.rs`: `Quantize`, `Trigger::quantize`,
+  `Player::choke_group`, `Player::velocity_to_gain`,
+  `Player::gain_for_velocity`. All `#[serde(default)]`, no format bump; a
+  V2 project opens unmoved (`a_v2_player_deserializes_with_v3_defaults`).
+* **Ops** — `PropPath::{Quantize, ChokeGroup, VelocityToGain}`, three
+  commands, and NOT in the rebuild allow-list: like `TriggerMode`, all
+  three are read off the live document on every press.
+* **Clock** — `audio/clock.rs`: per-clock `gain`, `pending_at`,
+  `choke_group` and `seq`, plus `fire_at` / `arm_pending` /
+  `cancel_pending` / `voices_in_use` / `oldest_voice`. `arm_pending` is the
+  one V3 addition that runs on the AUDIO thread, called by
+  `mixer::render_impl` immediately before `begin_block` so a fire that
+  starts in a block has its discontinuity latched by that same block.
+* **Press** — `ControlPlane::player_fire_with_velocity`, with
+  `player_fire` as it at full velocity.
+* **UI** — three cycling chips on the pad in edit mode, beside the
+  trigger-mode one.
+
+### Owner ear-check — OWED
+
+No test in this cut can hear a click. Two things to listen for:
+
+1. **A choke group of two.** Put the same open-hat sample on two pads, give
+   both `chokeGroup 1`, and press them alternately. The cut must be clean —
+   the choke runs `ClockTable::stop`, which is the same hard cut reaching a
+   clip's end takes, so a sample with body rather than a decay tail may
+   click. If it does, the fix is a short release ramp on the cut path, and
+   it is a real finding, not a tuning preference.
+2. **Quantize 1/4 with the arrangement rolling.** Press deliberately off
+   the beat. It must land ON the beat. V-21 makes it block-accurate, so it
+   can be up to ~5 ms early or late at 512 frames / 48 kHz; against a
+   metronome that should read as tight, not as a flam. If it flams, the
+   block granularity is not good enough and V4's per-node clock is where a
+   sample-accurate start would live.
+
+### Known gaps
+
+* **Velocity is applied at the FADER, so a non-raw pad's own inserts and
+  its PRE-fader sends see the unscaled signal.** A soft press does not hit
+  its own compressor any softer. The fader is where an audio pad and a MIDI
+  pad converge and the only point that reaches a raw pad at all; doing it
+  at the source would need two mechanisms (a per-sample multiply in
+  `clip_sample`, a note-velocity scale for MIDI) where this is one.
+  Per-voice modulation is §8.8's business, and V4's.
+* **Hardware velocity is not plumbed.** `LaunchRuntime::on_incoming(on,
+  note, channel)` carries no velocity at all, and neither does
+  `FireCmd::Start`, so a pad fired from a controller or from the drive
+  clip still presses at full velocity. The mechanism and the seam are
+  here (`player_fire_with_velocity`, `backend.playerFireWithVelocity`);
+  threading a velocity through the MIDI-in callback and the fire queue is
+  V8's, which is the cut that owns the hardware map. The drive path has
+  `ev.velocity` in hand at `launch.rs`'s `enqueue_fire` call and is the
+  cheapest half to do first.
+* **A quantized press is block-accurate, not sample-accurate** (V-21). At
+  512 frames / 48 kHz the worst case is ~5 ms early or late. Sample
+  accuracy needs a sub-block start offset the clock model does not have.
+* **The voice cap counts pads, not sounding voices inside a pad.** One
+  player is one voice, because one player owns one clock and one slot. A
+  pad that could sound two overlapping copies of itself is a different
+  design (a per-player voice pool), and nothing in V1–V3 assumes it away —
+  but nothing provides it either.
 
 ## V4 — per-node automation clock
 
@@ -257,7 +340,13 @@ own.
 
 ## Open questions (owner)
 
-Recorded in the design doc §8 with recommendations: voice cap, choke-group
-shape, whether players appear in the mixer, retrospective capture as its own
-cut, and whether a raw player ignores the deck's output stage. V3 and V6
-cannot be sized until 1, 2 and 4 are answered.
+Recorded in the design doc §8 with recommendations. **Answered 2026-08-30**
+(all three as recommended): 1 voice cap — 32, stealing oldest-first and
+visible; 2 choke groups — one `chokeGroup` per player, arbitrary sets wait;
+4 retrospective capture — its own cut after V6.
+
+Still open, and neither blocks V4: **3** whether players appear in the mixer
+alongside tracks and buses (recommendation: visible, collapsed under one
+"DECK" group), and **5** whether a raw audio player ignores the deck's
+master gain too (recommendation: only the source track's chain — the deck's
+own output stage is a mixer node like any other).
