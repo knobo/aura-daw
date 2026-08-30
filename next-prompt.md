@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| WebKitGTK 2.53.91 repaint re-measure | `exp/webkitgtk-2.53` | 2026-08-30 | Environment-level, not app code. Builds WebKitGTK 2.53.91 outside the repo and re-runs the #132 repaint measurement against it. |
 
 ## Next up — unclaimed
 
