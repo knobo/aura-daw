@@ -296,6 +296,17 @@ session burns an hour on something a sentence would have prevented.
 
 ## Tooling and gates
 
+- **Every worktree shares one Cargo target directory.** `~/.bashrc` on the
+  dev machine exports `CARGO_TARGET_DIR=/home/knobo/prog/dav/target`, so
+  every shell inherits it and `CLAUDE.md`'s worktree-per-branch isolation
+  does not extend to build artifacts: two agents running `npm run tauri
+  dev` from different worktrees write the same `target/debug/aura`. On
+  2026-08-30 that had two of us overwriting each other's binary and
+  forcing rebuilds of the gtk/webkit sys crates, with nothing failing
+  loudly to say so. A `${CARGO_TARGET_DIR:-…}` default in a script cannot
+  fix it — an exported value always wins. Set it unconditionally, as
+  `scripts/run-with-webkit.sh` does.
+
 - **Several clippy lints are deny-by-default and CI did not catch them**
   until the `engine` job existed. `approx_constant` is the one that bites:
   writing `0.7071` for a centre-pan gain is an *error*, not a warning, and it
