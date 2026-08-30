@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Plan V — V3: polyphony | `feat/plan-v3-polyphony` | 2026-08-30 | Voice cap 32 (steal oldest), one `chokeGroup` per player, quantized start, velocity → gain. Owner answered design §8 Q1/Q2/Q4. |
 
 ## Next up — unclaimed
 
