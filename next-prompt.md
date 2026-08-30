@@ -66,7 +66,7 @@ sentence got written — if you find a row whose branch is gone from
    G2's: one reverb on a bus, several tracks sent into it, one room — then
    export and confirm the WAV has it.
 2. **Plan V — V3: polyphony.** Voice cap, choke groups, quantized start,
-   velocity → gain. V2 (PR #121) landed one player real — document, ops,
+   velocity → gain. V2 (PR #121, open) built one player real — document, ops,
    graph slot, `player_fire`/`player_stop`, the launch overlay retired —
    so V3 is unblocked.
    → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md)

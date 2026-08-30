@@ -366,7 +366,8 @@ PR, but two categories of tests are currently skipped rather than exercised:
    "clears it, which is what keeps these independent of each other's
    leftovers" — true only when nothing else can be mid-test at the same
    moment. Measured: `cargo test --lib midi::launch::tests` at default
-   parallelism failed 4 of 6 runs, a different test each time
+   parallelism failed 4 of 6 runs in one sitting and 5 of 6 in another, a
+   different test each time
    (`cutting_a_running_scene_keeps_its_tracks_bound_until_the_flush_is_read`,
    `the_drive_loops_release_edge_reads_the_ledger_and_the_clock_table`,
    `a_scene_ending_is_announced_once`); the same module at
