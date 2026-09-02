@@ -1870,10 +1870,7 @@ impl ControlPlane {
         // a PAD's, and a scene borrows real arrangement tracks — turning
         // those down because someone tapped softly is a different feature,
         // and not one anybody has asked for.
-        match at {
-            Some(at) => tables.clocks.fire_at(clock, at, start, end, false, 1.0),
-            None => tables.clocks.fire(clock, start, end, false, 1.0),
-        }
+        tables.clocks.fire_maybe_at(clock, at, start, end, false, 1.0);
         true
     }
 
@@ -2143,10 +2140,7 @@ impl ControlPlane {
                     tables.clocks.stop(victim);
                 })
             };
-            match at {
-                Some(at) => tables.clocks.fire_at(clock, at, 0, len, looping, gain),
-                None => tables.clocks.fire(clock, 0, len, looping, gain),
-            }
+            tables.clocks.fire_maybe_at(clock, at, 0, len, looping, gain);
             stolen.and_then(|victim| {
                 tables
                     .player_clocks

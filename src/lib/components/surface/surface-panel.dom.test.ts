@@ -594,7 +594,7 @@ describe("a player pad", () => {
   it("cycles quantize on a pad bound to a launcher row", async () => {
     surface.setEdit(true);
     await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
-    const chip = screen.getByTestId("pad-launch-quantize");
+    const chip = screen.getByTestId("pad-launchBinding:b1-quantize");
     expect(chip.textContent).toContain("Q OFF");
     await fireEvent.click(chip);
     expect(calls).toEqual(["launch_set_quantize:b1:sixteenth"]);
@@ -612,7 +612,7 @@ describe("a player pad", () => {
     ] as unknown as typeof launch.maps;
     surface.setEdit(true);
     await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
-    expect(screen.getByTestId("pad-launch-quantize").textContent).toContain("Q 1/4");
+    expect(screen.getByTestId("pad-launchBinding:b1-quantize").textContent).toContain("Q 1/4");
     surface.setEdit(false);
   });
 
@@ -632,7 +632,7 @@ describe("a player pad", () => {
     ] as unknown as typeof launch.maps;
     surface.setEdit(true);
     await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
-    await fireEvent.click(screen.getByTestId("pad-launch-quantize"));
+    await fireEvent.click(screen.getByTestId("pad-launchBinding:b1-quantize"));
     expect(calls).toEqual(["player_set_quantize:p1:sixteenth"]);
     surface.setEdit(false);
   });
@@ -640,7 +640,7 @@ describe("a player pad", () => {
   it("hides the launch quantize chip outside edit mode", async () => {
     surface.setEdit(false);
     await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
-    expect(screen.queryByTestId("pad-launch-quantize")).toBeNull();
+    expect(screen.queryByTestId("pad-launchBinding:b1-quantize")).toBeNull();
   });
 
   it("degrades a dead player id to the pad's own label, never throws", async () => {

@@ -921,20 +921,34 @@ impl crate::control::ControlPlane {
     ///
     /// The map is resolved from the binding, not passed in, because a pad
     /// knows which binding it fires and nothing about which map owns it.
+    ///
+    /// Read, mutate and `apply` all happen inside ONE `commit` closure — the
+    /// session lock `Session::transact` takes covers the whole thing — so a
+    /// second edit to the same binding (a double-click on the quantize chip,
+    /// or a concurrent rename) cannot land between this read and its write
+    /// and get silently clobbered by a stale clone.
     pub fn set_launch_quantize(
         &self,
         binding_id: &str,
         quantize: crate::audio::player::Quantize,
         meta: crate::control::op::TxMeta,
     ) -> Result<LaunchSnapshot, String> {
-        let (map_id, mut binding) = {
-            let s = self.session().lock();
-            let (m, b) = find_binding(&s.midi.launch_maps, binding_id)
-                .ok_or_else(|| format!("unknown launch binding: {binding_id}"))?;
-            (m.id.clone(), b.clone())
-        };
-        binding.quantize = quantize;
-        self.set_launch_binding(map_id, binding_id.to_string(), Some(binding), meta)
+        self.commit(meta, |tx| {
+            let (map_id, mut binding) = {
+                let (m, b) = find_binding(&tx.midi().launch_maps, binding_id)
+                    .ok_or_else(|| format!("unknown launch binding: {binding_id}"))?;
+                (m.id.clone(), b.clone())
+            };
+            binding.quantize = quantize;
+            tx.apply(crate::control::op::Op::LaunchBindingSet {
+                map_id,
+                id: binding_id.to_string(),
+                binding: Some(binding),
+            })?;
+            Ok(())
+        })?;
+        self.emit_launch_changed();
+        Ok(self.launch_snapshot())
     }
 
     pub fn set_launch_drive(

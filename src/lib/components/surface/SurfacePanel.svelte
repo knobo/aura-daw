@@ -10,6 +10,7 @@
     bindable,
     groupWidgets,
     meterTrackId,
+    targetKey,
     type SurfaceTarget,
     type SurfaceWidget,
   } from "../../utils/control-surface";
@@ -180,14 +181,21 @@
     return t?.kind === "player" || t?.kind === "launchBinding" || t?.kind === "clipLaunch";
   }
 
+  /** `null` unless `b` is a migrated binding — a shell over a player (V2)
+   * — in which case the player is what actually fires it and its id is
+   * the one to write or read quantize through. The one place this check
+   * lives; `launch_fire_from` (`control/mod.rs`) is the Rust side of the
+   * same rule, at fire time rather than at read/write time. */
+  function migratedPlayerId(b: LaunchBinding | null): string | null {
+    return b && b.target.kind === "player" ? b.target.playerId : null;
+  }
+
   function padQuantize(t: SurfaceTarget | null | undefined): PlayerQuantize {
     if (t?.kind === "player") return quantizeOf(t.playerId);
     const b = bindingOf(t);
     if (!b) return "off";
-    // The migrated case: the binding is a shell over a player, and the
-    // player is what fires.
-    if (b.target.kind === "player") return quantizeOf(b.target.playerId);
-    return b.quantize ?? "off";
+    const migrated = migratedPlayerId(b);
+    return migrated ? quantizeOf(migrated) : (b.quantize ?? "off");
   }
 
   /** Cycle it, writing wherever the press actually reads it from.
@@ -206,7 +214,8 @@
     let b = bindingOf(t);
     if (!b && t?.kind === "clipLaunch") b = await launch.mapClip(t.clipId);
     if (!b) return;
-    if (b.target.kind === "player") await setQuantize(b.target.playerId, next);
+    const migrated = migratedPlayerId(b);
+    if (migrated) await setQuantize(migrated, next);
     else await launch.setQuantize(b.id, next);
   }
 
@@ -245,6 +254,20 @@
     return surface.isLit(widget.target);
   }
 </script>
+
+{#snippet quantizeChip(target: SurfaceTarget, label: string, keySuffix: string)}
+  {@const q = padQuantize(target)}
+  <button
+    class="silk mode"
+    type="button"
+    data-testid="pad-{keySuffix}-quantize"
+    title="Quantize the press to the arrangement's grid — click to cycle"
+    aria-label="{label} quantize: {q}"
+    onclick={() => cyclePadQuantize(target)}
+  >
+    {QUANTIZE_LABEL[q]}
+  </button>
+{/snippet}
 
 <div class="surface glass" style:height="{ui.rollHeight}px">
   <PanelResizeHandle
@@ -343,16 +366,7 @@
                 />
                 {#if surface.editMode && w.target && w.target.kind !== "player" && padTakesQuantize(w.target)}
                   <div class="player-tags">
-                    <button
-                      class="silk mode"
-                      type="button"
-                      data-testid="pad-launch-quantize"
-                      title="Quantize the press to the arrangement's grid — click to cycle"
-                      aria-label="{padLabel} quantize: {padQuantize(w.target)}"
-                      onclick={() => cyclePadQuantize(w.target)}
-                    >
-                      {QUANTIZE_LABEL[padQuantize(w.target)]}
-                    </button>
+                    {@render quantizeChip(w.target, padLabel, targetKey(w.target) ?? w.id)}
                   </div>
                 {/if}
                 {#if w.target?.kind === "player"}
@@ -372,16 +386,7 @@
                       >
                         {triggerMode(playerId)}
                       </button>
-                      <button
-                        class="silk mode"
-                        type="button"
-                        data-testid="pad-{playerId}-quantize"
-                        title="Quantize the press to the arrangement's grid — click to cycle"
-                        aria-label="{padLabel} quantize: {padQuantize(w.target)}"
-                        onclick={() => cyclePadQuantize(w.target)}
-                      >
-                        {QUANTIZE_LABEL[padQuantize(w.target)]}
-                      </button>
+                      {@render quantizeChip(w.target, padLabel, playerId)}
                       <button
                         class="silk mode"
                         type="button"
