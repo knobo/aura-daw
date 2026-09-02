@@ -24,6 +24,27 @@ dropped, not queued and not re-armed; the first press of an arm-cycle
 still wins. Test: `a_repeat_press_on_an_armed_pad_is_dropped` in
 `clock.rs`. Found while ear-checking #141.
 
+**Follow-up (2026-09-02): the fix is per-arm-cycle, not per-burst, and
+that is by design — and it is now measurable.** The gate above allows at
+most ONE outstanding press per clock; it does not cap the fires for a
+whole spam burst. A burst that spans many quantize boundaries (a fast
+tempo, or the 0.26 s clip from the original report) still produces
+roughly one fire per boundary that elapses while pressing continues,
+because `arm_pending` clears `pending_at` the moment it fires, and the
+very next press is then free to re-arm the following boundary. The owner
+re-tested after the fix landed and could not tell whether this was the
+bug again or the intended behaviour, because the OLD trace could not
+either: `launch: fire` used to log on every PRESS, whether `fire_at`
+actually armed anything or silently dropped it as a double-tap.
+`ControlPlane::fire_scene` now returns `Option<bool>` — `None` for no
+clock (unchanged), `Some(armed)` carrying `ClockTable::fire_maybe_at`'s
+own answer — and `launch_fire_from` logs `launch: fire` only when
+`armed`, `launch: coalesced` otherwise. A trace can now be read for what
+it actually measures: count `launch: fire` lines against presses, not
+`launch: fire` lines against `launch: coalesced` lines combined. Test:
+`a_repeat_press_ahead_of_the_beat_reports_as_coalesced_not_armed` in
+`launch.rs`.
+
 ### What the owner reported
 
 Pressing a quantized launcher pad repeatedly "spreads the presses out over
@@ -96,6 +117,31 @@ The owner's two pads — "Drum 1" and "symbal" — both borrow the SAME track
 they tear the track away from each other on every press. That is
 as-designed, but it may be half of what "I cannot press anything else"
 feels like.
+
+## OPEN — a launcher pad silences the track it borrows, not just other scenes (2026-09-02)
+
+**Not scheduled. Noted, not fixed — the owner's call, after hearing what
+a fix would take.** He reported: pressing a pad bound to a launcher row
+("using a launcher as the pad's source") plays either the track's own
+arrangement content or the launched scene, never both at once.
+
+This is the SAME mechanism as the "second thing" above, one level down:
+`fire_scene` (`src-tauri/src/control/mod.rs`) binds every track the scene
+borrows to the scene's OWN clock (`tables.clocks.bind_slot(slot, clock)`),
+and a mixer slot holds exactly one clock (`ClockTable`'s `slot_clock`,
+`src-tauri/src/audio/clock.rs`) — never the arrangement's and a scene's
+both. Pressing a launcher pad therefore always steals the track's slot
+from whatever was playing it, arrangement included, for the scene's
+duration. V-14 (`docs/backlog/plan-v-players.md`) already rules this
+last-writer-wins for two SCENES sharing a track; this is the same ruling
+biting a scene against the arrangement itself.
+
+A real fix is a bigger job than the coalesce one above: the scene would
+need its own audio path instead of borrowing the track's slot outright
+(e.g. mixing the scene's content in alongside the slot's existing clock
+rather than replacing it), which is an architectural change to how a
+slot's clock binding works, not a one-line gate. Left open for a future
+decision on whether that is worth building.
 
 ## Launch quantize — landed 2026-08-30 (PR #141)
 

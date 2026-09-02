@@ -1845,6 +1845,12 @@ impl ControlPlane {
     /// is already in place when it does. Binding from `arm_pending` instead
     /// is not available: that runs on the audio thread, and which slots a
     /// scene names is a control-side map.
+    /// `None` — no clock for this binding yet (the graph has not been
+    /// rebuilt since it was added); `Some(armed)` — a clock exists and the
+    /// press was issued, `armed` being [`ClockTable::fire_maybe_at`]'s own
+    /// answer to whether it actually fired or was coalesced as a double-tap
+    /// on an already-armed pad. The caller needs that distinction to log
+    /// (and trace-count) a real fire separately from a dropped repeat.
     pub fn fire_scene(
         &self,
         binding_id: &str,
@@ -1852,11 +1858,11 @@ impl ControlPlane {
         start: u64,
         end: u64,
         at: Option<u64>,
-    ) -> bool {
+    ) -> Option<bool> {
         let tables = self.tables.lock();
         let Some(&clock) = tables.scene_clocks.get(binding_id) else {
             log::warn!("launch: no clock for binding {binding_id} — dropping the fire");
-            return false;
+            return None;
         };
         for slot in 0..tables.params.len() {
             tables.clocks.release_slot_if(slot, clock);
@@ -1870,8 +1876,7 @@ impl ControlPlane {
         // a PAD's, and a scene borrows real arrangement tracks — turning
         // those down because someone tapped softly is a different feature,
         // and not one anybody has asked for.
-        tables.clocks.fire_maybe_at(clock, at, start, end, false, 1.0);
-        true
+        Some(tables.clocks.fire_maybe_at(clock, at, start, end, false, 1.0))
     }
 
     /// Cut one scene: stop its clock, and leave every slot it owns bound.

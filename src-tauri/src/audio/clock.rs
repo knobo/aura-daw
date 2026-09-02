@@ -271,10 +271,13 @@ impl ClockTable {
     /// Start a clock at `start`, running to `end`. Retrigger rewinds THIS
     /// clock and nothing else — which is the whole difference from the
     /// overlay it replaces.
-    pub fn fire(&self, clock: u32, start: u64, end: u64, looping: bool, gain: f32) {
-        let Some(c) = self.clocks.get(clock as usize) else { return };
+    ///
+    /// Returns whether it actually fired, so a caller measuring presses
+    /// against actual retriggers (a trace, a test) has something to count.
+    pub fn fire(&self, clock: u32, start: u64, end: u64, looping: bool, gain: f32) -> bool {
+        let Some(c) = self.clocks.get(clock as usize) else { return false };
         if clock == TRANSPORT_CLOCK {
-            return; // the transport is driven by the callback, not fired
+            return false; // the transport is driven by the callback, not fired
         }
         // BUMPED FIRST, before the state it stands for, and that order is
         // load-bearing. Relaxed buys no happens-before, so the RT thread's
@@ -299,6 +302,7 @@ impl ClockTable {
         c.discont.store(true, Relaxed);
         c.on.store(true, Relaxed);
         self.choke_others(clock, c.choke_group.load(Relaxed));
+        true
     }
 
     /// Arm a fire for the moment the transport reaches `at` (V-21). The
@@ -309,10 +313,16 @@ impl ClockTable {
     /// The clock is NOT choked here and does not choke: both happen when it
     /// actually starts ([`ClockTable::arm_pending`]), which is the moment
     /// the group is about to be contested.
-    pub fn fire_at(&self, clock: u32, at: u64, start: u64, end: u64, looping: bool, gain: f32) {
-        let Some(c) = self.clocks.get(clock as usize) else { return };
+    ///
+    /// Returns whether this press actually armed the clock. `false` means
+    /// it was dropped as a double-tap on an already-armed pad (below) — a
+    /// caller measuring presses against actual fires (a trace, a test) has
+    /// to see the difference, or it counts every coalesced press as a fire
+    /// that never happened.
+    pub fn fire_at(&self, clock: u32, at: u64, start: u64, end: u64, looping: bool, gain: f32) -> bool {
+        let Some(c) = self.clocks.get(clock as usize) else { return false };
         if clock == TRANSPORT_CLOCK {
-            return;
+            return false;
         }
         // A double-tap on a pad that is already armed for a beat is a no-op,
         // not a re-arm: without this, N presses ahead of the boundary each
@@ -323,7 +333,7 @@ impl ClockTable {
         // they cannot starve the UI's other controls (2026-08-30 handoff,
         // docs/backlog/midi-launch.md).
         if c.pending_at.load(Relaxed) != NO_PENDING {
-            return;
+            return false;
         }
         // Same order and same argument as `fire`'s: the counter moves before
         // the state it stands for, so the only misreading available to
@@ -337,13 +347,15 @@ impl ClockTable {
         // boundary steal in the order they were pressed.
         c.seq.store(FIRE_SEQ.fetch_add(1, Relaxed), Relaxed);
         c.pending_at.store(at, Relaxed);
+        true
     }
 
     /// [`Self::fire_at`] when `at` is `Some`, [`Self::fire`] when it is
     /// `None` — the one dispatch both `fire_scene` and
     /// `player_fire_with_velocity` need, so a third state or a changed
-    /// `fire_at` signature only has one call site to update.
-    pub fn fire_maybe_at(&self, clock: u32, at: Option<u64>, start: u64, end: u64, looping: bool, gain: f32) {
+    /// `fire_at` signature only has one call site to update. Returns
+    /// whichever of the two's own "did it actually fire" answer applies.
+    pub fn fire_maybe_at(&self, clock: u32, at: Option<u64>, start: u64, end: u64, looping: bool, gain: f32) -> bool {
         match at {
             Some(at) => self.fire_at(clock, at, start, end, looping, gain),
             None => self.fire(clock, start, end, looping, gain),

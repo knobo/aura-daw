@@ -1048,9 +1048,6 @@ impl crate::control::ControlPlane {
         let end = map
             .tick_to_samples(start_ticks.saturating_add(length_ticks))
             .max(start + 1);
-        log::info!(
-            "launch: fire id={id} name={name} origin={origin:?} start={start} end={end} tracks={track_ids:?}"
-        );
         // Every origin now does the same thing, because the reason they
         // differed is gone: `Hardware` used to SetLoop + Seek + Play on the
         // arrangement transport (design §2.2), which moved the user's
@@ -1062,7 +1059,7 @@ impl crate::control::ControlPlane {
         // `fire_scene`: `quantize_target` reads the session itself, and
         // session-under-tables is the wrong lock order [C1].
         let at = self.quantize_target(quantize);
-        if !self.fire_scene(id, &track_ids, start, end, at) {
+        let Some(armed) = self.fire_scene(id, &track_ids, start, end, at) else {
             // Dropped, because the graph has not been rebuilt since this
             // binding was added. Say nothing to the frontend either: a
             // `LaunchFired { playing: true }` for a scene that is not
@@ -1070,6 +1067,18 @@ impl crate::control::ControlPlane {
             // off, since nothing releases a scene that never entered the
             // ledger. The warn in `fire_scene` is the whole report.
             return Ok(());
+        };
+        // Logged AFTER `fire_scene`, and split on its own answer, so a
+        // spam-burst is measurable: a repeat press ahead of the boundary is
+        // coalesced (2026-09-01, `ClockTable::fire_at`'s no-op-on-armed
+        // gate) and must not count as a fire nothing produced. Unconditional
+        // — not gated by `AURA_LAUNCH_TRACE` — the same as before this split.
+        if armed {
+            log::info!(
+                "launch: fire id={id} name={name} origin={origin:?} start={start} end={end} tracks={track_ids:?}"
+            );
+        } else {
+            log::info!("launch: coalesced id={id} name={name} origin={origin:?}");
         }
         // AFTER the clock is running: the drive thread's release edge is
         // "in the ledger, clock off", and marking first would let a poll
@@ -1888,6 +1897,26 @@ mod tests {
         assert!(!tables.clocks.arm_pending(32_000, 512), "still short of the beat");
         assert!(tables.clocks.arm_pending(47_800, 512), "the block holding sample 48 000 starts it");
         assert!(tables.clocks.is_on(clock));
+    }
+
+    /// `fire_scene`'s `Some(bool)` must carry `ClockTable::fire_maybe_at`'s
+    /// own answer through, not just "a clock existed": the owner's
+    /// 2026-09-01 report was that a spam burst is unmeasurable, because
+    /// `launch: fire` used to log on every press whether or not it actually
+    /// armed anything. A dropped double-tap has to read back `Some(false)`.
+    #[test]
+    fn a_repeat_press_ahead_of_the_beat_reports_as_coalesced_not_armed() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        set_q(&cp, "b1", crate::audio::player::Quantize::Quarter);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        cp.shared().position.store(32_000, Relaxed);
+
+        assert_eq!(cp.fire_scene("b1", &["t1".into()], 0, 1_000, Some(48_000)), Some(true));
+        assert_eq!(
+            cp.fire_scene("b1", &["t1".into()], 0, 1_000, Some(48_000)),
+            Some(false),
+            "already armed for 48_000 — this press must be dropped, not counted as a fire"
+        );
     }
 
     /// The tracks the scene borrows are bound at PRESS time even though the
