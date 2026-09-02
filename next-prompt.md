@@ -55,13 +55,6 @@ sentence got written — if you find a row whose branch is gone from
 |---|---|---|---|
 | _(none)_ | | | |
 
-## Read this first if you are picking up mid-stream
-
-[`docs/handoff/2026-08-30-launch-quantize.md`](docs/handoff/2026-08-30-launch-quantize.md)
-— PR #141 is open and finished (it needs a review, not more work), and
-one bug is open and **blocked on a single question to the owner**. Ask
-that question before reading any code.
-
 ## Next up — unclaimed
 
 1. **Owner ear-checks** are owed on several landed tracks — including

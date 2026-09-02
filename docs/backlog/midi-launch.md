@@ -11,10 +11,18 @@ do not drive.
 
 User-facing: `docs/midi-input.md` § Launch. Trace: `AURA_LAUNCH_TRACE=1`.
 
-## OPEN — a pad fires far more often than it looks pressed (2026-08-30)
+## RESOLVED — a pad fires far more often than it looks pressed (2026-08-30, closed 2026-09-01)
 
-**Unresolved. One question from the owner decides whether this is a bug at
-all, and nobody has answered it yet.** Found while ear-checking #141.
+**Owner's answer: ~40.** He confirmed pressing that fast is expected, and
+asked for the collapse-not-queue behaviour the "~40" branch below already
+named as the fix. Landed: `ClockTable::fire_at` (`src-tauri/src/audio/clock.rs`)
+now no-ops a press against a clock that is already armed (`pending_at !=
+NO_PENDING`) instead of overwriting `start`/`end`/`looping`/`gain`/`at` —
+one gate, shared by both `fire_scene` and `player_fire_with_velocity`
+since both call through `fire_at`. A double-tap ahead of the boundary is
+dropped, not queued and not re-armed; the first press of an arm-cycle
+still wins. Test: `a_repeat_press_on_an_armed_pad_is_dropped` in
+`clock.rs`. Found while ear-checking #141.
 
 ### What the owner reported
 
