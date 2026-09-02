@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Make a coalesced launch press measurable | `fix/launch-fire-measurable` | 2026-09-02 | Small follow-up to #141: `fire_scene`/`launch_fire_from` now log `launch: fire` only on an actual arm, `launch: coalesced` on a dropped double-tap. See OPEN/RESOLVED notes in `docs/backlog/midi-launch.md`. |
 
 ## Next up — unclaimed
 
