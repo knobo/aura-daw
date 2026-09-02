@@ -4229,6 +4229,7 @@ mod tests {
             name: "Scene 1".into(),
             note: 60,
             channel: None,
+            quantize: Default::default(),
             target: crate::midi::launch::LaunchTarget::Region {
                 start_ticks: 0,
                 length_ticks: 960,

@@ -50,6 +50,16 @@ pub struct LaunchBinding {
     /// `None` = any channel.
     pub channel: Option<u8>,
     pub target: LaunchTarget,
+    /// When the press takes effect, against the ARRANGEMENT's grid — the
+    /// same vocabulary and the same wire form a player's pad uses
+    /// (`audio::player::Quantize`), deliberately one type rather than two:
+    /// a deck has pads of both kinds side by side, and "Q 1/4" must mean
+    /// the same thing on either.
+    ///
+    /// `Off` is the default and is how every binding written before this
+    /// existed reads, so a saved project fires exactly as it did.
+    #[serde(default)]
+    pub quantize: crate::audio::player::Quantize,
 }
 
 impl LaunchBinding {
@@ -633,7 +643,11 @@ impl LaunchRuntime {
                     let sounding = runtime().sounding_ids();
                     for id in releases_to_enqueue(&mut release_sent, &sounding, |id| {
                         let t = tables.lock();
-                        t.scene_clocks.get(id).is_some_and(|&c| t.clocks.is_on(c))
+                        // LIVE, not `is_on`: a scene quantized to a beat is
+                        // off until that beat comes, and reading that as
+                        // "ended" announces an ending — and cuts the scene —
+                        // before it has begun.
+                        t.scene_clocks.get(id).is_some_and(|&c| t.clocks.is_live(c))
                     }) {
                         runtime().enqueue_release(id);
                     }
@@ -899,6 +913,44 @@ impl crate::control::ControlPlane {
         Ok(self.launch_snapshot())
     }
 
+    /// Set one binding's quantize division. Read-modify-write through
+    /// `Op::LaunchBindingSet`, so it is undoable, journaled and persisted
+    /// exactly as every other launch edit is — and so the frontend sends a
+    /// division rather than a whole binding it would otherwise have to hold
+    /// and echo back (ADR 0006: the renderer holds no authoritative state).
+    ///
+    /// The map is resolved from the binding, not passed in, because a pad
+    /// knows which binding it fires and nothing about which map owns it.
+    ///
+    /// Read, mutate and `apply` all happen inside ONE `commit` closure — the
+    /// session lock `Session::transact` takes covers the whole thing — so a
+    /// second edit to the same binding (a double-click on the quantize chip,
+    /// or a concurrent rename) cannot land between this read and its write
+    /// and get silently clobbered by a stale clone.
+    pub fn set_launch_quantize(
+        &self,
+        binding_id: &str,
+        quantize: crate::audio::player::Quantize,
+        meta: crate::control::op::TxMeta,
+    ) -> Result<LaunchSnapshot, String> {
+        self.commit(meta, |tx| {
+            let (map_id, mut binding) = {
+                let (m, b) = find_binding(&tx.midi().launch_maps, binding_id)
+                    .ok_or_else(|| format!("unknown launch binding: {binding_id}"))?;
+                (m.id.clone(), b.clone())
+            };
+            binding.quantize = quantize;
+            tx.apply(crate::control::op::Op::LaunchBindingSet {
+                map_id,
+                id: binding_id.to_string(),
+                binding: Some(binding),
+            })?;
+            Ok(())
+        })?;
+        self.emit_launch_changed();
+        Ok(self.launch_snapshot())
+    }
+
     pub fn set_launch_drive(
         &self,
         map_id: String,
@@ -954,11 +1006,12 @@ impl crate::control::ControlPlane {
             return self.player_fire(player_id.as_str());
         }
         let rate = self.transport_state().sample_rate;
-        let (start_ticks, length_ticks, ppq, events, track_ids, name) = {
+        let (start_ticks, length_ticks, ppq, events, track_ids, name, quantize) = {
             let s = self.session().lock();
             let (_, b) = find_binding(&s.midi.launch_maps, id)
                 .ok_or_else(|| format!("unknown launch binding: {id}"))?;
             let name = b.name.clone();
+            let quantize = b.quantize;
             let (start_ticks, length_ticks, track_ids) = match &b.target {
                 LaunchTarget::Region {
                     start_ticks,
@@ -987,6 +1040,7 @@ impl crate::control::ControlPlane {
                 s.midi.tempo_events.clone(),
                 track_ids,
                 name,
+                quantize,
             )
         };
         let map = crate::midi::TempoMap::new(ppq, events, rate.max(1))?;
@@ -1004,7 +1058,11 @@ impl crate::control::ControlPlane {
         // because there was ONE shadow playhead to share and the transport's
         // was it. A scene has its own clock now, so firing one is firing one,
         // whoever pressed it.
-        if !self.fire_scene(id, &track_ids, start, end) {
+        // Outside the session lock above, and before the tables lock inside
+        // `fire_scene`: `quantize_target` reads the session itself, and
+        // session-under-tables is the wrong lock order [C1].
+        let at = self.quantize_target(quantize);
+        if !self.fire_scene(id, &track_ids, start, end, at) {
             // Dropped, because the graph has not been rebuilt since this
             // binding was added. Say nothing to the frontend either: a
             // `LaunchFired { playing: true }` for a scene that is not
@@ -1114,6 +1172,21 @@ pub fn launch_set(
     }
 }
 
+/// Set a launch binding's quantize division (wire form: the same
+/// `"off" | "sixteenth" | ... | "bar"` a player's pad sends).
+#[tauri::command]
+pub fn launch_set_quantize(
+    binding_id: String,
+    quantize: crate::audio::player::Quantize,
+    control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
+) -> Result<LaunchSnapshot, String> {
+    control.set_launch_quantize(
+        &binding_id,
+        quantize,
+        crate::control::op::TxMeta::user("set launch quantize"),
+    )
+}
+
 #[tauri::command]
 pub fn launch_set_drive(
     clip_id: String,
@@ -1207,6 +1280,7 @@ mod tests {
             name: id.into(),
             note,
             channel,
+            quantize: Default::default(),
             target: LaunchTarget::Region {
                 start_ticks: 0,
                 length_ticks: 960,
@@ -1221,6 +1295,7 @@ mod tests {
             name: id.into(),
             note,
             channel: None,
+            quantize: Default::default(),
             target: LaunchTarget::Clip {
                 clip_id: clip_id.into(),
             },
@@ -1650,6 +1725,7 @@ mod tests {
             name: id.into(),
             note,
             channel: None,
+            quantize: Default::default(),
             target: LaunchTarget::Region {
                 start_ticks: 0,
                 length_ticks: 960,
@@ -1784,6 +1860,164 @@ mod tests {
             .map(|(_, p)| p["followView"].as_bool().unwrap_or(false))
             .collect();
         assert_eq!(fired, vec![true, false], "the hardware press moves the view; the drive fire does not");
+    }
+
+    // ---- launch quantize (V3's follow-up) -----------------------------
+
+    fn set_q(cp: &crate::control::ControlPlane, id: &str, q: crate::audio::player::Quantize) {
+        cp.set_launch_quantize(id, q, crate::control::op::TxMeta::user("q")).unwrap();
+    }
+
+    /// The whole point: with the arrangement running, a quantized scene is
+    /// ARMED, not started. Nothing sounds until the transport reaches the
+    /// boundary — which is what "fires on the beat, not on the press" means.
+    #[test]
+    fn a_quantized_scene_waits_for_the_beat_with_the_arrangement_running() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        set_q(&cp, "b1", crate::audio::player::Quantize::Quarter);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        // A quarter at 120 bpm / 48 kHz is 24 000 samples; press a third of
+        // the way into the second beat.
+        cp.shared().position.store(32_000, Relaxed);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        let clock = cp.scene_clock_for("b1").expect("b1 has a clock");
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_on(clock), "the press has not sounded yet");
+        assert!(tables.clocks.is_pending(clock));
+        assert!(!tables.clocks.arm_pending(32_000, 512), "still short of the beat");
+        assert!(tables.clocks.arm_pending(47_800, 512), "the block holding sample 48 000 starts it");
+        assert!(tables.clocks.is_on(clock));
+    }
+
+    /// The tracks the scene borrows are bound at PRESS time even though the
+    /// fire waits, and that is deliberate: a slot on a scene clock that is
+    /// off falls back to the arrangement, so the tracks keep playing the song
+    /// until the beat — and the binding is already there when it arrives.
+    /// Binding from `arm_pending` is not available: that runs on the audio
+    /// thread, and which slots a scene names is a control-side map.
+    #[test]
+    fn a_waiting_scene_holds_its_tracks_and_they_keep_playing_the_song() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        set_q(&cp, "b1", crate::audio::player::Quantize::Quarter);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        cp.shared().position.store(32_000, Relaxed);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        let clock = cp.scene_clock_for("b1").expect("b1 has a clock");
+        let slot = cp.tables_for_tests().slots[&crate::ids::TrackId::from("t1")];
+        assert_eq!(cp.tables_for_tests().clocks.clock_of(slot), clock, "bound already");
+
+        // The drive poll's other half. Before `is_live`, this handed the
+        // track straight back — and then the fire started with nothing bound
+        // to it, so the pad lit up and sounded nothing.
+        cp.tables_for_tests().release_finished_scenes();
+        assert_eq!(
+            cp.tables_for_tests().clocks.clock_of(slot),
+            clock,
+            "a scene waiting for its beat has NOT finished"
+        );
+
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.arm_pending(47_800, 512));
+        assert_eq!(tables.clocks.clock_of(slot), clock, "and it is still bound when it starts");
+    }
+
+    /// With the transport STOPPED there is no grid to land on, so the press
+    /// sounds now. Waiting would be a scene that never fires — `base_pos` is
+    /// not going anywhere.
+    #[test]
+    fn a_quantized_scene_sounds_now_when_the_transport_is_stopped() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        set_q(&cp, "b1", crate::audio::player::Quantize::Bar);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        let clock = cp.scene_clock_for("b1").expect("b1 has a clock");
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(clock));
+        assert!(!tables.clocks.is_pending(clock));
+    }
+
+    /// `Quantize::Off` is the default and every binding written before this
+    /// field existed reads as it — a saved project fires exactly as it did.
+    #[test]
+    fn an_unquantized_scene_still_fires_on_the_press() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        cp.shared().position.store(32_000, Relaxed);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+        let clock = cp.scene_clock_for("b1").expect("b1 has a clock");
+        assert!(cp.tables_for_tests().clocks.is_on(clock));
+    }
+
+    /// A binding written before the field existed must deserialize, and must
+    /// read as `Off`.
+    #[test]
+    fn a_binding_saved_without_quantize_reads_as_off() {
+        let json = serde_json::json!({
+            "id": "b1",
+            "name": "Scene",
+            "note": 60,
+            "channel": null,
+            "target": { "kind": "region", "startTicks": 0, "lengthTicks": 960, "trackIds": ["t1"] }
+        });
+        let b: LaunchBinding = serde_json::from_value(json).unwrap();
+        assert_eq!(b.quantize, crate::audio::player::Quantize::Off);
+    }
+
+    /// The division is document state: undoable, journaled, and on the wire
+    /// in the same vocabulary a player's pad uses.
+    #[test]
+    fn setting_a_scenes_quantize_is_undoable_and_camel_case() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        set_q(&cp, "b1", crate::audio::player::Quantize::Eighth);
+        let snap = cp.launch_snapshot();
+        let v = serde_json::to_value(&snap).unwrap();
+        assert_eq!(v["maps"][0]["bindings"][0]["quantize"], "eighth");
+
+        cp.undo().unwrap();
+        let q = {
+            let s = cp.session().lock();
+            find_binding(&s.midi.launch_maps, "b1").map(|(_, b)| b.quantize).unwrap()
+        };
+        assert_eq!(q, crate::audio::player::Quantize::Off);
+    }
+
+    /// Cutting a scene that is still waiting for its beat cancels the press,
+    /// rather than leaving one armed with nothing left to end it.
+    #[test]
+    fn cutting_a_waiting_scene_cancels_the_press() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        set_q(&cp, "b1", crate::audio::player::Quantize::Quarter);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        cp.shared().position.store(32_000, Relaxed);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        cp.cut_scene("b1");
+        let clock = cp.scene_clock_for("b1").expect("b1 has a clock");
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_pending(clock));
+        assert!(!tables.clocks.arm_pending(0, 10_000_000), "nothing is left queued");
+        assert!(!tables.clocks.is_on(clock));
+    }
+
+    /// Stopping the transport drops a scene still waiting for a beat — the
+    /// grid it was queued against has stopped existing, and the alternative
+    /// is a scene that fires on its own whenever the song is next played
+    /// past that point.
+    #[test]
+    fn stopping_the_transport_drops_a_scene_that_was_waiting_for_a_beat() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        set_q(&cp, "b1", crate::audio::player::Quantize::Quarter);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        cp.shared().position.store(32_000, Relaxed);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        cp.transport(crate::control::TransportAction::Stop).unwrap();
+        let clock = cp.scene_clock_for("b1").expect("b1 has a clock");
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_pending(clock));
+        assert!(!tables.clocks.arm_pending(0, 10_000_000));
     }
 
     /// Two scenes sounding at once is what the single overlay could never do
@@ -2423,6 +2657,7 @@ mod tests {
             name: "b1".into(),
             note: 36,
             channel: None,
+            quantize: Default::default(),
             target: LaunchTarget::Player { player_id: player_id.clone() },
         })];
 

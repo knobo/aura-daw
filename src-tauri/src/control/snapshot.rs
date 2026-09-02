@@ -1075,6 +1075,7 @@ mod tests {
                     name: "Scene".into(),
                     note: 60,
                     channel: None,
+                    quantize: Default::default(),
                     target: crate::midi::launch::LaunchTarget::Clip {
                         clip_id: "mc-a".into(),
                     },

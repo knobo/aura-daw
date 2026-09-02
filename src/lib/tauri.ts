@@ -516,6 +516,9 @@ export interface Backend {
   /** Cut whatever is on the launch overlay. Idempotent — safe to call with
    * nothing launched, which is what lets stop-all call it unconditionally. */
   launchStop?(): Promise<void>;
+  /** Set one launch binding's quantize division (Plan V follow-up). The
+   * scene half of `playerSetQuantize`. */
+  launchSetQuantize?(bindingId: string, quantize: PlayerQuantize): Promise<LaunchSnapshot>;
   launchLearnArm?(id: string | null): Promise<void>;
   launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
 
@@ -1195,6 +1198,9 @@ class TauriBackend implements Backend {
   }
   launchLearnTake() {
     return invoke<{ note: number; channel: number } | null>("launch_learn_take");
+  }
+  launchSetQuantize(bindingId: string, quantize: PlayerQuantize) {
+    return invoke<LaunchSnapshot>("launch_set_quantize", { bindingId, quantize });
   }
 
   playersGet() {

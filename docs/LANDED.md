@@ -5,6 +5,40 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## A launcher pad fires on the beat too
+
+V3 gave a PLAYER pad a quantized start. A pad bound to a launcher row still
+fired on the press, which is the half the owner met first when he sat down
+to ear-check V3.
+
+The clock machinery carried over untouched — `fire_at` and `arm_pending`
+live in `ClockTable` and were never bound to the player range — so the cut
+is about the scene path, and about two places where "off" had quietly been
+the same question as "over". A scene armed for a beat is off, so
+`release_finished_scenes` handed its borrowed tracks back before the beat
+came (the fire then started with nothing bound to it: a pad that lights up
+and sounds nothing), and the drive thread's release edge announced — and
+cut — a scene before it had begun. Both ask `ClockTable::is_live` now.
+
+The tracks are bound at PRESS time even though the fire waits: a slot on an
+off scene clock falls back to the arrangement, so the borrowed tracks keep
+playing the song until the beat and the binding is already there when it
+arrives. Binding from `arm_pending` is not available — that runs on the
+audio thread.
+
+One trap worth remembering: V2 migrated launch bindings onto players, and
+`launch_fire_from` returns early into `player_fire` for such a binding — so
+for those the division that governs the press is the PLAYER's, and writing
+the binding's own field sets a value nothing reads. The chip resolves
+through the binding's target.
+
+Choke and velocity on a scene are deliberately not here: a scene borrows
+real arrangement tracks, so both would reach into the song rather than into
+a pad.
+
+PR: `feat/launch-quantize` → #141.
+→ [`docs/backlog/midi-launch.md`](backlog/midi-launch.md)
+
 ## Plan V — V3: the deck is polyphonic
 
 Eight pads at once was already true after V2 — each player owns a clock —

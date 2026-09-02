@@ -1067,8 +1067,12 @@ impl GraphTables {
     ///
     /// Two conditions, and both are load-bearing:
     ///
-    /// * the clock is not running — the scene is over, so the node rejoins
-    ///   the arrangement (`mixer::node_playhead`'s third case);
+    /// * the clock is not LIVE — the scene is over, so the node rejoins the
+    ///   arrangement (`mixer::node_playhead`'s third case). Live, not
+    ///   running: a scene quantized to a beat is off until that beat comes
+    ///   (`ClockTable::is_live`), and releasing its tracks in the meantime
+    ///   leaves nothing bound when the fire finally starts — a pad that
+    ///   lights up and sounds nothing;
     /// * and the block that latches its parting discontinuity has BEGUN
     ///   (`ClockTable::flush_pending_for`). Releasing before that drops the
     ///   `all_notes_off` the cut left behind and the note hangs, and "the
@@ -1105,7 +1109,7 @@ impl GraphTables {
         for slot in 0..self.params.len() {
             let clock = self.clocks.clock_of(slot);
             let ours = scenes.contains(&clock) || self.orphan_clock == Some(clock);
-            if !ours || self.clocks.is_on(clock) || self.clocks.flush_pending_for(clock) {
+            if !ours || self.clocks.is_live(clock) || self.clocks.flush_pending_for(clock) {
                 continue;
             }
             self.clocks.release_slot_if(slot, clock);

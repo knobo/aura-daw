@@ -314,6 +314,17 @@ impl ClockTable {
         if clock == TRANSPORT_CLOCK {
             return;
         }
+        // A double-tap on a pad that is already armed for a beat is a no-op,
+        // not a re-arm: without this, N presses ahead of the boundary each
+        // overwrite `pending_at` with a slightly later target, which can
+        // walk the fire forward by a beat per extra tap and, on a fast
+        // repeat, park pending fires long after the finger left the pad.
+        // Only ONE press per arm-cycle should count; the rest are dropped so
+        // they cannot starve the UI's other controls (2026-08-30 handoff,
+        // docs/backlog/midi-launch.md).
+        if c.pending_at.load(Relaxed) != NO_PENDING {
+            return;
+        }
         // Same order and same argument as `fire`'s: the counter moves before
         // the state it stands for, so the only misreading available to
         // `reconcile_adoption` is the safe one.
@@ -326,6 +337,17 @@ impl ClockTable {
         // boundary steal in the order they were pressed.
         c.seq.store(FIRE_SEQ.fetch_add(1, Relaxed), Relaxed);
         c.pending_at.store(at, Relaxed);
+    }
+
+    /// [`Self::fire_at`] when `at` is `Some`, [`Self::fire`] when it is
+    /// `None` — the one dispatch both `fire_scene` and
+    /// `player_fire_with_velocity` need, so a third state or a changed
+    /// `fire_at` signature only has one call site to update.
+    pub fn fire_maybe_at(&self, clock: u32, at: Option<u64>, start: u64, end: u64, looping: bool, gain: f32) {
+        match at {
+            Some(at) => self.fire_at(clock, at, start, end, looping, gain),
+            None => self.fire(clock, start, end, looping, gain),
+        }
     }
 
     /// Is a quantized fire waiting on this clock? The control plane counts
@@ -423,9 +445,19 @@ impl ClockTable {
         1..=self.n_player_clocks
     }
 
-    /// Is this clock spending a voice — sounding, or waiting on a beat?
+    /// Is this clock LIVE — sounding, or waiting on a beat to sound?
+    ///
+    /// The distinction matters wherever "is it off?" was previously the same
+    /// question as "is it over?". It stopped being the same question when
+    /// `fire_at` arrived: an armed clock is off and has not started yet, and
+    /// reading that as "over" ends a scene before it ever begins (the launch
+    /// drive thread's release edge) or hands its borrowed tracks back
+    /// (`GraphTables::release_finished_scenes`).
+    ///
+    /// It is also V-19's voice question: a pad that will sound on the next
+    /// beat has already taken its voice.
     #[inline]
-    pub fn holds_voice(&self, clock: u32) -> bool {
+    pub fn is_live(&self, clock: u32) -> bool {
         self.is_on(clock) || self.is_pending(clock)
     }
 
@@ -433,7 +465,7 @@ impl ClockTable {
     /// count). A pending fire counts: a pad that will sound on the next beat
     /// has already taken its voice.
     pub fn voices_in_use(&self) -> usize {
-        self.player_clocks().filter(|&i| self.holds_voice(i)).count()
+        self.player_clocks().filter(|&i| self.is_live(i)).count()
     }
 
     /// The voice that has been sounding longest — what V-19 steals when the
@@ -443,7 +475,7 @@ impl ClockTable {
     /// never take the same number even from two threads.
     pub fn oldest_voice(&self) -> Option<u32> {
         self.player_clocks()
-            .filter(|&i| self.holds_voice(i))
+            .filter(|&i| self.is_live(i))
             .filter_map(|i| self.clocks.get(i as usize).map(|c| (c.seq.load(Relaxed), i)))
             .min()
             .map(|(_, i)| i)
@@ -1445,6 +1477,24 @@ mod tests {
         assert!(!t.is_pending(1), "but the queued press is gone");
         assert!(!t.arm_pending(0, 1_000_000));
         assert!(!t.is_on(1));
+    }
+
+    /// A repeat press on an already-armed pad is dropped, not re-armed: the
+    /// owner's 2026-08-30 report was rapid presses "spreading out" long
+    /// after the finger left the pad, because each one pushed `pending_at`
+    /// further out. Only the first press of the arm-cycle should count.
+    #[test]
+    fn a_repeat_press_on_an_armed_pad_is_dropped() {
+        let t = deck();
+        t.bind_slot(2, 1);
+        t.fire_at(1, 10_000, 0, 1_000, false, 1.0);
+        // Same clock, still armed: this press must be entirely ignored,
+        // start/end/gain included, not just its `at`.
+        t.fire_at(1, 10_000, 500, 900, true, 0.5);
+        assert!(t.arm_pending(9_999, 2), "the armed target still fires");
+        let ph = t.playhead(2, 0, false);
+        assert_eq!(ph.pos, 0, "the FIRST press's start, not the dropped second's");
+        assert_eq!(ph.gain, 1.0, "the first press's gain, not the dropped second's");
     }
 
     /// A press supersedes a press: firing a pad that has a quantized fire

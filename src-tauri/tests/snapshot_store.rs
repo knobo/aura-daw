@@ -602,6 +602,7 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
                 name: "Scene 1".into(),
                 note: 60,
                 channel: None,
+                quantize: Default::default(),
                 target: aura_lib::midi::launch::LaunchTarget::Region {
                     start_ticks: 0,
                     length_ticks: 960,

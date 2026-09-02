@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { TrackState } from "../../types/ipc";
+import type { SurfaceTarget } from "../../utils/control-surface";
 
 const calls: string[] = [];
 
@@ -66,6 +67,10 @@ vi.mock("../../tauri", () => ({
     playerSetTriggerMode: (id: string, mode: string) => {
       calls.push(`player_set_trigger_mode:${id}:${mode}`);
       return Promise.resolve();
+    },
+    launchSetQuantize: (bindingId: string, quantize: string) => {
+      calls.push(`launch_set_quantize:${bindingId}:${quantize}`);
+      return Promise.resolve({ maps: launch.maps });
     },
     playerSetQuantize: (id: string, quantize: string) => {
       calls.push(`player_set_quantize:${id}:${quantize}`);
@@ -574,6 +579,68 @@ describe("a player pad", () => {
     await fireEvent.click(screen.getByTestId("pad-p1-choke"));
     expect(calls).toEqual(["player_set_choke_group:p1:null"]);
     surface.setEdit(false);
+  });
+
+  // ── launch quantize (V3's follow-up) ─────────────────────────────────
+  // The owner met this half first: the chips only ever showed on a PLAYER
+  // pad, and a pad bound to a launcher row had none.
+
+  async function renderWithTarget(target: SurfaceTarget) {
+    render(SurfacePanel);
+    surface.layout = addWidget(emptyLayout(), unboundWidget("pad", { target }));
+    await tick();
+  }
+
+  it("cycles quantize on a pad bound to a launcher row", async () => {
+    surface.setEdit(true);
+    await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
+    const chip = screen.getByTestId("pad-launchBinding:b1-quantize");
+    expect(chip.textContent).toContain("Q OFF");
+    await fireEvent.click(chip);
+    expect(calls).toEqual(["launch_set_quantize:b1:sixteenth"]);
+    surface.setEdit(false);
+  });
+
+  it("reads a launcher row's stored division back onto the chip", async () => {
+    launch.maps = [
+      {
+        ...launch.maps[0],
+        bindings: [
+          { id: "b1", name: "Verse", target: { kind: "clip", clipId: "c1" }, quantize: "quarter" },
+        ],
+      },
+    ] as unknown as typeof launch.maps;
+    surface.setEdit(true);
+    await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
+    expect(screen.getByTestId("pad-launchBinding:b1-quantize").textContent).toContain("Q 1/4");
+    surface.setEdit(false);
+  });
+
+  it("writes to the PLAYER when the binding is a migrated player target", async () => {
+    // V2 migrated launch bindings onto players, and `launch_fire_from`
+    // returns early into `player_fire` for such a binding — so the division
+    // that governs the press is the player's. Writing the binding's field
+    // here would set a value nothing reads.
+    players.list = [
+      { id: "p1", name: "KICK", source: { kind: "audioClip", clipId: "c1" }, raw: true },
+    ];
+    launch.maps = [
+      {
+        ...launch.maps[0],
+        bindings: [{ id: "b1", name: "KICK", target: { kind: "player", playerId: "p1" } }],
+      },
+    ] as unknown as typeof launch.maps;
+    surface.setEdit(true);
+    await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
+    await fireEvent.click(screen.getByTestId("pad-launchBinding:b1-quantize"));
+    expect(calls).toEqual(["player_set_quantize:p1:sixteenth"]);
+    surface.setEdit(false);
+  });
+
+  it("hides the launch quantize chip outside edit mode", async () => {
+    surface.setEdit(false);
+    await renderWithTarget({ kind: "launchBinding", bindingId: "b1" });
+    expect(screen.queryByTestId("pad-launchBinding:b1-quantize")).toBeNull();
   });
 
   it("degrades a dead player id to the pad's own label, never throws", async () => {

@@ -104,6 +104,12 @@ export interface LaunchBinding {
   /** 0..=15, or null = any channel. */
   channel: number | null;
   target: LaunchTarget;
+  /** When the press takes effect, against the arrangement's grid. The same
+   * type a player's pad uses on purpose: a deck has pads of both kinds side
+   * by side and "Q 1/4" must mean the same thing on either. Optional
+   * (defaults `"off"`) so fixtures written before it keep type-checking —
+   * the wire form from `launch_get` always carries it. */
+  quantize?: PlayerQuantize;
 }
 
 export type LaunchPlayMode = "gate" | "oneShot";

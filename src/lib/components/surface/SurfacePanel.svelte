@@ -10,8 +10,11 @@
     bindable,
     groupWidgets,
     meterTrackId,
+    targetKey,
+    type SurfaceTarget,
     type SurfaceWidget,
   } from "../../utils/control-surface";
+  import { launch } from "../../state/launch.svelte";
   import { surface } from "../../state/surface.svelte";
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
@@ -25,7 +28,7 @@
     setVelocityToGain,
     stopPlayer,
   } from "../../state/players.svelte";
-  import type { PlayerQuantize, PlayerTriggerMode } from "../../types/ipc";
+  import type { LaunchBinding, PlayerQuantize, PlayerTriggerMode } from "../../types/ipc";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import Knob from "../controls/Knob.svelte";
   import Fader from "../controls/Fader.svelte";
@@ -149,17 +152,79 @@
     return playerById(playerId)?.trigger?.quantize ?? "off";
   }
 
+  // ── quantize on a LAUNCH pad ─────────────────────────────────────────
+  // A pad bound to a launch binding fires a SCENE, not a player, and the
+  // owner met that half first: the chips only ever showed on a player pad.
+  // Quantize is the one of the three that means the same thing on both —
+  // a choke or a velocity on a scene would cut or duck real arrangement
+  // tracks, which is a different feature and not this one.
+  //
+  // The lookup has to go through the binding's own target, not the pad's:
+  // V2 MIGRATED launch bindings onto players, so a `clipLaunch` pad can
+  // resolve to a binding whose target is a `player` — and then the
+  // division that governs the press is the player's, because
+  // `launch_fire_from` returns early into `player_fire` for exactly that
+  // case. Writing the binding's field there would set a value nothing
+  // reads.
+
+  /** The binding a pad fires, or `null` — no side effects, so it is safe
+   * to call while rendering. A `clipLaunch` pad has no binding until the
+   * first press mints one. */
+  function bindingOf(t: SurfaceTarget | null | undefined): LaunchBinding | null {
+    if (t?.kind === "launchBinding") return launch.bindings.find((b) => b.id === t.bindingId) ?? null;
+    if (t?.kind === "clipLaunch") return launch.existingBindingForClip(t.clipId);
+    return null;
+  }
+
+  /** Does this pad have a quantize division at all? */
+  function padTakesQuantize(t: SurfaceTarget | null | undefined): boolean {
+    return t?.kind === "player" || t?.kind === "launchBinding" || t?.kind === "clipLaunch";
+  }
+
+  /** `null` unless `b` is a migrated binding — a shell over a player (V2)
+   * — in which case the player is what actually fires it and its id is
+   * the one to write or read quantize through. The one place this check
+   * lives; `launch_fire_from` (`control/mod.rs`) is the Rust side of the
+   * same rule, at fire time rather than at read/write time. */
+  function migratedPlayerId(b: LaunchBinding | null): string | null {
+    return b && b.target.kind === "player" ? b.target.playerId : null;
+  }
+
+  function padQuantize(t: SurfaceTarget | null | undefined): PlayerQuantize {
+    if (t?.kind === "player") return quantizeOf(t.playerId);
+    const b = bindingOf(t);
+    if (!b) return "off";
+    const migrated = migratedPlayerId(b);
+    return migrated ? quantizeOf(migrated) : (b.quantize ?? "off");
+  }
+
+  /** Cycle it, writing wherever the press actually reads it from.
+   *
+   * A `clipLaunch` pad with no binding yet MINTS one, the same way its
+   * first press would (`surface.fireClip`) — so the chip works on a pad
+   * that has never been pressed instead of appearing only after it has.
+   * `mapClip` focuses the binding it creates, which is the same jump
+   * pressing the pad would have made. */
+  async function cyclePadQuantize(t: SurfaceTarget | null | undefined) {
+    const next = QUANTIZE[(QUANTIZE.indexOf(padQuantize(t)) + 1) % QUANTIZE.length];
+    if (t?.kind === "player") {
+      await setQuantize(t.playerId, next);
+      return;
+    }
+    let b = bindingOf(t);
+    if (!b && t?.kind === "clipLaunch") b = await launch.mapClip(t.clipId);
+    if (!b) return;
+    const migrated = migratedPlayerId(b);
+    if (migrated) await setQuantize(migrated, next);
+    else await launch.setQuantize(b.id, next);
+  }
+
   function chokeOf(playerId: string): number | null {
     return playerById(playerId)?.chokeGroup ?? null;
   }
 
   function velocityDepthOf(playerId: string): number {
     return playerById(playerId)?.velocityToGain ?? 1;
-  }
-
-  function cycleQuantize(playerId: string) {
-    const next = QUANTIZE[(QUANTIZE.indexOf(quantizeOf(playerId)) + 1) % QUANTIZE.length];
-    void setQuantize(playerId, next);
   }
 
   function cycleChokeGroup(playerId: string) {
@@ -189,6 +254,20 @@
     return surface.isLit(widget.target);
   }
 </script>
+
+{#snippet quantizeChip(target: SurfaceTarget, label: string, keySuffix: string)}
+  {@const q = padQuantize(target)}
+  <button
+    class="silk mode"
+    type="button"
+    data-testid="pad-{keySuffix}-quantize"
+    title="Quantize the press to the arrangement's grid — click to cycle"
+    aria-label="{label} quantize: {q}"
+    onclick={() => cyclePadQuantize(target)}
+  >
+    {QUANTIZE_LABEL[q]}
+  </button>
+{/snippet}
 
 <div class="surface glass" style:height="{ui.rollHeight}px">
   <PanelResizeHandle
@@ -285,6 +364,11 @@
                   onpointerdown={() => padPointerDown(w)}
                   onpointerup={() => padPointerUp(w)}
                 />
+                {#if surface.editMode && w.target && w.target.kind !== "player" && padTakesQuantize(w.target)}
+                  <div class="player-tags">
+                    {@render quantizeChip(w.target, padLabel, targetKey(w.target) ?? w.id)}
+                  </div>
+                {/if}
                 {#if w.target?.kind === "player"}
                   {@const playerId = w.target.playerId}
                   <div class="player-tags">
@@ -302,16 +386,7 @@
                       >
                         {triggerMode(playerId)}
                       </button>
-                      <button
-                        class="silk mode"
-                        type="button"
-                        data-testid="pad-{playerId}-quantize"
-                        title="Quantize the press to the arrangement's grid — click to cycle"
-                        aria-label="{padLabel} quantize: {quantizeOf(playerId)}"
-                        onclick={() => cycleQuantize(playerId)}
-                      >
-                        {QUANTIZE_LABEL[quantizeOf(playerId)]}
-                      </button>
+                      {@render quantizeChip(w.target, padLabel, playerId)}
                       <button
                         class="silk mode"
                         type="button"

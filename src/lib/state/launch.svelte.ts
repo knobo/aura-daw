@@ -8,7 +8,7 @@ import { backend } from "../tauri";
 import { midi } from "./midi.svelte";
 import { transport } from "./transport.svelte";
 import { view } from "./view.svelte";
-import type { LaunchFired, PlayerInfo } from "../types/ipc";
+import type { LaunchFired, PlayerInfo, PlayerQuantize } from "../types/ipc";
 import {
   bindingFocusSamples,
   clipWouldSelfTrigger,
@@ -286,6 +286,18 @@ class LaunchStore {
     if (!backend.launchStop) return;
     try {
       await backend.launchStop();
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  /** Set one binding's quantize division. The snapshot the command returns
+   * is the document's own, so this refreshes from it rather than guessing
+   * locally (ADR 0006). */
+  async setQuantize(id: string, quantize: PlayerQuantize) {
+    if (!backend.launchSetQuantize) return;
+    try {
+      this.accept(await backend.launchSetQuantize(id, quantize));
     } catch (err) {
       this.error = String(err);
     }
